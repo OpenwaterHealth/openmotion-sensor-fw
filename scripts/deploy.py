@@ -91,9 +91,15 @@ def _enter_dfu_sensor(device: str, timeout: float) -> bool:
     from omotion import MotionInterface
 
     interface = MotionInterface()
-    interface.start(wait=True, wait_timeout=timeout)
+    interface.start(wait=False)
     try:
         sensor = _sensor_handle(interface, device)
+        # start(wait=True) only blocks on already-CONNECTING handles, so it
+        # races against the connection monitor's first sweep. Poll the
+        # specific handle until CONNECTED or timeout.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not sensor.is_connected():
+            time.sleep(0.2)
         if not sensor.is_connected():
             print(f"❌ {device} sensor not connected — cannot trigger DFU.")
             return False
@@ -193,9 +199,12 @@ def main() -> int:
         "-D", str(bin_file),
     ]
     rc = _run(cmd)
+    # dfu-util exit 74 ("Error during download get_status") after a successful
+    # download is a known STM32 ROM bootloader quirk: the device jumps to user
+    # firmware on :leave before dfu-util can read its final status. Trust the
+    # device's comeback as the source of truth rather than the exit code.
     if rc != 0:
-        print(f"❌ dfu-util exited with {rc}. Device is still in DFU; rerun deploy.py to retry.")
-        return 1
+        print(f"[!] dfu-util exited {rc}; checking whether {args.device} sensor came back …")
 
     print(f"[*] leaveDFU sent. Waiting for {args.device} sensor to come back …")
     if _wait_for_sensor_comeback(args.device, timeout=COMEBACK_TIMEOUT_S):
