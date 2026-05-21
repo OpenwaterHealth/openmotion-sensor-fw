@@ -88,42 +88,42 @@ def _sensor_handle(interface, device: str):
 
 def _enter_dfu_sensor(device: str, timeout: float) -> bool:
     """Trigger the named sensor into DFU mode via omotion."""
-    from omotion.Interface import MOTIONInterface
+    from omotion import MotionInterface
 
-    interface, _, left_connected, right_connected = MOTIONInterface.acquire_motion_interface()
-    connected = left_connected if device == "left" else right_connected
-    if not connected:
-        print(f"❌ {device} sensor not connected — cannot trigger DFU.")
-        if interface is not None:
-            interface.disconnect()
-        return False
-
-    print(f"[*] Requesting DFU mode on {device} sensor …")
+    interface = MotionInterface()
+    interface.start(wait=True, wait_timeout=timeout)
     try:
         sensor = _sensor_handle(interface, device)
-        ok = sensor.enter_dfu()
-    except Exception as exc:
-        print(f"❌ enter_dfu raised: {exc}")
-        ok = False
+        if not sensor.is_connected():
+            print(f"❌ {device} sensor not connected — cannot trigger DFU.")
+            return False
+
+        print(f"[*] Requesting DFU mode on {device} sensor …")
+        try:
+            return bool(sensor.enter_dfu())
+        except Exception as exc:
+            print(f"❌ enter_dfu raised: {exc}")
+            return False
     finally:
-        interface.disconnect()
-    return bool(ok)
+        interface.stop()
 
 
 def _wait_for_sensor_comeback(device: str, timeout: float) -> bool:
-    """Poll omotion until the named sensor reports connected."""
-    from omotion.Interface import MOTIONInterface
+    """Construct the interface ONCE and poll the sensor handle."""
+    from omotion import MotionInterface
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        interface, _, left_connected, right_connected = MOTIONInterface.acquire_motion_interface()
-        if interface is not None:
-            interface.disconnect()
-        ok = left_connected if device == "left" else right_connected
-        if ok:
-            return True
-        time.sleep(0.5)
-    return False
+    interface = MotionInterface()
+    interface.start(wait=False)
+    try:
+        sensor = _sensor_handle(interface, device)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if sensor.is_connected():
+                return True
+            time.sleep(0.5)
+        return False
+    finally:
+        interface.stop()
 
 
 def main() -> int:
@@ -196,7 +196,7 @@ def main() -> int:
     if args.post_reset:
         print("   --post-reset: no additional automatic recovery is available "
               "for sensors; manual power cycle required.")
-    return 0
+    return 1
 
 
 if __name__ == "__main__":
