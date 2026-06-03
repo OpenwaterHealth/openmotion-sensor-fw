@@ -258,6 +258,46 @@ EMBED_TEMPLATES = {
             "command": "${KILL_OPENOCD_CMD}",
             "args": [${KILL_OPENOCD_ARGS}],
             "problemMatcher": []
+        },
+        {
+            "label": "Deploy Sensor Left",
+            "type": "shell",
+            "command": "python",
+            "args": [
+                "${workspaceFolder}/scripts/deploy.py",
+                "--device",
+                "left"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated"
+            },
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "Deploy Sensor Right",
+            "type": "shell",
+            "command": "python",
+            "args": [
+                "${workspaceFolder}/scripts/deploy.py",
+                "--device",
+                "right"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated"
+            },
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
         }
     ]
 }
