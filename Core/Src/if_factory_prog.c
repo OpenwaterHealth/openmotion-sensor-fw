@@ -1,6 +1,7 @@
 #include "main.h"
 #include "common.h"
 #include "crosslink.h"
+#include "camera_manager.h"
 #include "if_factory_prog.h"
 #include "i2c_master.h"
 #include "utils.h"
@@ -18,7 +19,8 @@ uint8_t i2c_write_buf[256] = {0};
 uint8_t i2c_read_buf[256] = {0};
 
 static int iRet;
-static uint32_t creset_state = 0;
+static uint32_t _creset_state = 0;
+static CameraDevice* _active_cam = NULL;
 
 _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
 {
@@ -37,8 +39,17 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
             {
                 case OW_FACTORY_I2C_SCAN:
                     response->command = OW_FACTORY_I2C_SCAN;
+                    _active_cam = get_active_cam();
+                    if(_active_cam == NULL) 
+                    {
+                        response->packet_type = OW_ERROR;
+                        response->data_len = 0;
+                        response->data = NULL;
+                        break;
+                    }
+
                     memset(i2c_list, 0, 128);
-                    iRet = I2C_scan(&hi2c1, i2c_list, 128, true);
+                    iRet = I2C_scan(_active_cam->pI2c, i2c_list, 128, true);
                     if (iRet < 0)
                     {
                         response->packet_type = OW_ERROR;
@@ -53,34 +64,51 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                     break;
                 case OW_FACTORY_CRESET:
                     response->command = OW_FACTORY_CRESET;
+                    _active_cam = get_active_cam();
+                    if(_active_cam == NULL) 
+                    {
+                        response->packet_type = OW_ERROR;
+                        response->data_len = 0;
+                        response->data = NULL;
+                        break;
+                    }
+
                     if(cmd->data_len == 1)
                     {
                         if(cmd->data[0] == 0x01){
-                            HAL_GPIO_WritePin(CRESET_1_GPIO_Port, CRESET_1_Pin, GPIO_PIN_SET);
-                            creset_state = 1;
+                            HAL_GPIO_WritePin(_active_cam->cresetb_port, _active_cam->cresetb_pin, GPIO_PIN_SET);
+                            _creset_state = 1;
                         }else{
-                            HAL_GPIO_WritePin(CRESET_1_GPIO_Port, CRESET_1_Pin, GPIO_PIN_RESET);
-                            creset_state = 0;
+                            HAL_GPIO_WritePin(_active_cam->cresetb_port, _active_cam->cresetb_pin, GPIO_PIN_RESET);
+                            _creset_state = 0;
                         }
                     }else{
-                        creset_state = HAL_GPIO_ReadPin(CRESET_1_GPIO_Port, CRESET_1_Pin);
+                        _creset_state = HAL_GPIO_ReadPin(_active_cam->cresetb_port, _active_cam->cresetb_pin);
                     }
                 
                     response->data_len = 1;
-                    response->data = (uint8_t*)&creset_state;
+                    response->data = (uint8_t*)&_creset_state;
 
                     break;
                 case OW_FACTORY_I2C_WR:
                     response->command = OW_FACTORY_I2C_WR;
-                    if (cmd->data_len < 5)
+                    _active_cam = get_active_cam();
+                    if(_active_cam == NULL) 
+                    {
+                        response->packet_type = OW_ERROR;
+                        response->data_len = 0;
+                        response->data = NULL;
+                        break;
+                    }
+
+                    if (cmd->data_len < 4)
                     {
                         response->packet_type = OW_ERROR;
                         response->data_len = 0;
                         response->data = NULL;
                     }else{
-                        uint8_t dev_addr = cmd->data[0];
-                        uint16_t write_len = cmd->data[1] << 8 | cmd->data[2];
-                        uint8_t *write_data = &cmd->data[3];
+                        uint16_t write_len = cmd->data[0] << 8 | cmd->data[1];
+                        uint8_t *write_data = &cmd->data[2];
                         memset(i2c_write_buf, 0, sizeof(i2c_write_buf));
                         if (write_len > sizeof(i2c_write_buf)) {
                             response->packet_type = OW_ERROR;
@@ -88,7 +116,7 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                             response->data = NULL;
                         } else {
                             memcpy(i2c_write_buf, write_data, write_len);
-                            iRet = xi2c_write_bytes(&hi2c1, dev_addr, i2c_write_buf, write_len);
+                            iRet = xi2c_write_bytes(_active_cam->pI2c, _active_cam->device_address, i2c_write_buf, write_len);
                             if (iRet != HAL_OK) {
                                 response->packet_type = OW_ERROR;
                                 response->data_len = 0;
@@ -99,17 +127,25 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                     break;
                 case OW_FACTORY_I2C_RD:
                     response->command = OW_FACTORY_I2C_RD;
-                    if (cmd->data_len < 3)
+                    _active_cam = get_active_cam();
+                    if(_active_cam == NULL) 
+                    {
+                        response->packet_type = OW_ERROR;
+                        response->data_len = 0;
+                        response->data = NULL;
+                        break;
+                    }
+
+                    if (cmd->data_len < 2)
                     {
                         response->packet_type = OW_ERROR;
                         response->data_len = 0;
                         response->data = NULL;
                     }else{                        
-                        uint8_t dev_addr = cmd->data[0];
-                        uint16_t read_len = cmd->data[1] << 8 | cmd->data[2];
+                        uint16_t read_len = cmd->data[0] << 8 | cmd->data[1];
                         
                         memset(i2c_read_buf, 0, sizeof(i2c_read_buf));
-                        iRet = xi2c_read_bytes(&hi2c1, dev_addr, i2c_read_buf, read_len);
+                        iRet = xi2c_read_bytes(_active_cam->pI2c, _active_cam->device_address, i2c_read_buf, read_len);
                         if (iRet != HAL_OK) {   
                             response->packet_type = OW_ERROR;
                             response->data_len = 0;
@@ -122,15 +158,23 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                     break;
                 case OW_FACTORY_I2C_WRRD:
                     response->command = OW_FACTORY_I2C_WRRD;
-                    if (cmd->data_len < 3)
+                    _active_cam = get_active_cam();
+                    if(_active_cam == NULL) 
+                    {
+                        response->packet_type = OW_ERROR;
+                        response->data_len = 0;
+                        response->data = NULL;
+                        break;
+                    }
+
+                    if (cmd->data_len < 2)
                     {
                         response->packet_type = OW_ERROR;
                         response->data_len = 0;
                         response->data = NULL;
                     }else{  
-                        uint8_t dev_addr = cmd->data[0];
-                        uint16_t write_len = cmd->data[1] << 8 | cmd->data[2];
-                        uint16_t read_len = cmd->data[3] << 8 | cmd->data[4];
+                        uint16_t write_len = cmd->data[0] << 8 | cmd->data[1];
+                        uint16_t read_len = cmd->data[2] << 8 | cmd->data[3];
                         uint8_t *write_data = &cmd->data[5];
                         memset(i2c_write_buf, 0, sizeof(i2c_write_buf));
                         memset(i2c_read_buf, 0, sizeof(i2c_read_buf));
@@ -140,7 +184,7 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                             response->data = NULL;
                         } else {
                             memcpy(i2c_write_buf, write_data, write_len);
-                            iRet = xi2c_write_and_read(&hi2c1, dev_addr, i2c_write_buf, write_len, i2c_read_buf, read_len);
+                            iRet = xi2c_write_and_read(_active_cam->pI2c, _active_cam->device_address, i2c_write_buf, write_len, i2c_read_buf, read_len);
                             if (iRet != HAL_OK) {
                                 response->packet_type = OW_ERROR;
                                 response->data_len = 0;
