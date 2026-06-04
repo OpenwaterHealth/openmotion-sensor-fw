@@ -1138,7 +1138,7 @@ UartPacket process_if_command(UartPacket cmd)
 			uartReturn.packet_type = OW_ERROR;
 		}
 		break;
-	case OW_FACTORY:
+	case OW_FPGA_PROG:
         process_factory_command(&uartReturn, &cmd);
 		break;
 	default:

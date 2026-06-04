@@ -33,7 +33,7 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
 
     switch (cmd->packet_type)
     {
-        case OW_FACTORY:
+        case OW_FPGA_PROG:
             response->command = cmd->command;
             switch (cmd->command)
             {
