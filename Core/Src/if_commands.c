@@ -8,6 +8,7 @@
 #include "version.h"
 #include "main.h"
 #include "if_commands.h"
+#include "if_factory_prog.h"
 #include "common.h"
 #include "jsmn.h"
 #include "i2c_master.h"
@@ -1136,6 +1137,9 @@ UartPacket process_if_command(UartPacket cmd)
 			// I2C operation failed
 			uartReturn.packet_type = OW_ERROR;
 		}
+		break;
+	case OW_FACTORY:
+        process_factory_command(&uartReturn, &cmd);
 		break;
 	default:
 		uartReturn.data_len = 0;

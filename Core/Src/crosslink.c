@@ -28,6 +28,8 @@
 #define CMD_VERIFY_USERCODE 0xC8
 #define CMD_DISABLE 0x26
 
+#define CROSSLINK_I2C_TIMEOUT_MS 1000U
+
 volatile uint8_t txComplete = 0;
 volatile uint8_t rxComplete = 0;
 volatile uint8_t i2cError = 0;
@@ -42,11 +44,15 @@ extern uint8_t bitstream_buffer[];
 extern uint32_t bitstream_len;
 
 
-static int xi2c_write_bytes(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *data, uint16_t length) {
-    return HAL_I2C_Master_Transmit(hi2c, DevAddress << 1, data, length, HAL_MAX_DELAY);
+int xi2c_write_bytes(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *data, uint16_t length) {
+    return HAL_I2C_Master_Transmit(hi2c, DevAddress << 1, data, length, CROSSLINK_I2C_TIMEOUT_MS);
 }
 
-static int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *wbuf, uint16_t wlen, uint8_t *rbuf, uint16_t rlen) {
+int xi2c_read_bytes(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *data, uint16_t length) {
+    return HAL_I2C_Master_Receive(hi2c, DevAddress << 1, data, length, CROSSLINK_I2C_TIMEOUT_MS);
+}
+
+int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *wbuf, uint16_t wlen, uint8_t *rbuf, uint16_t rlen) {
     txComplete = 0;
     rxComplete = 0;
     i2cError = 0;
