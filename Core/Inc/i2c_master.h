@@ -22,5 +22,7 @@ HAL_StatusTypeDef TCA9548A_SelectChannel(I2C_HandleTypeDef *hi2c, uint8_t addres
 HAL_StatusTypeDef TCA9548A_SelectBroadcast(I2C_HandleTypeDef *hi2c, uint8_t address);
 HAL_StatusTypeDef TCA9548A_EnableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel);
 HAL_StatusTypeDef TCA9548A_DisableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel);
+HAL_StatusTypeDef TCA9548A_DisableAll(I2C_HandleTypeDef *hi2c, uint8_t address);
+void I2C_BusRecovery(I2C_HandleTypeDef *hi2c);
 
 #endif /* INC_I2C_MASTER_H_ */

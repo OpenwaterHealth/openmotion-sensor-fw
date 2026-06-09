@@ -104,9 +104,10 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 {
 	GPIO_InitTypeDef gpio = {0};
 
-	/* Reconfigure detect pins as floating inputs. A booted FPGA actively
-	 * drives both CLK and MISO low; a blank FPGA leaves them high-Z.
-	 * No pull-up — the internal pull can overpower the FPGA's drive. */
+	/* Deselect all TCA channels before toggling CRESETB — a resetting FPGA
+	 * can glitch the I2C bus through an open mux channel. */
+	TCA9548A_DisableAll(&hi2c1, 0x70);
+
 	gpio.Mode = GPIO_MODE_INPUT;
 	gpio.Pull = GPIO_NOPULL;
 	gpio.Speed = GPIO_SPEED_FREQ_LOW;
