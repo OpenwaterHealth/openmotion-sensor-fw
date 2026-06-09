@@ -228,6 +228,156 @@ uint32_t fpga_read_usercode(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
     return 0;
 }
 
+/* Compact always-on hex log (USB routing still gated by DEBUG_FLAG_USB_PRINTF). */
+static void nvcm_log_buf(const char *label, const uint8_t *buf, int len)
+{
+    printf("NVCM %s:", label);
+    for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
+    printf("\r\n");
+}
+
+int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
+                    GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin,
+                    uint8_t isc_operand, uint8_t num_rows, uint8_t do_boot_test,
+                    fpga_nvcm_probe_t *out)
+{
+    uint8_t wbuf[4];
+
+    memset(out, 0, sizeof(*out));
+    if (num_rows > FPGA_NVCM_MAX_ROWS) num_rows = FPGA_NVCM_MAX_ROWS;
+
+    printf("NVCM probe: isc_operand=0x%02X num_rows=%u boot_test=%u addr=0x%02X\r\n",
+           isc_operand, (unsigned)num_rows, (unsigned)do_boot_test, (unsigned)DevAddress);
+
+    /* 1. Hold config port in SLAVE mode: CRESETB low, activation key, CRESETB
+     *    high.  Sending the key while/around the CRESETB transition declares the
+     *    slave port active so the device enters config mode instead of booting
+     *    from NVCM — exactly what fpga_configure() does for SRAM.  This keeps the
+     *    config I2C port at 0x40 alive throughout and never powers anything. */
+    HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);
+    delay_ms(1);
+    if (xi2c_write_bytes(hi2c, DevAddress, activation_key, 5) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_ACTIVATION;
+    } else {
+        printf("NVCM: activation key write FAILED\r\n");
+    }
+    HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
+    delay_ms(10);
+
+    /* 2. IDCODE (sanity: is the config port answering at all?) */
+    wbuf[0] = 0xE0; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4, out->idcode, 4) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_IDCODE;
+        out->idcode_ok = (memcmp(out->idcode, expected_idcode, 4) == 0) ? 1 : 0;
+        nvcm_log_buf("IDCODE", out->idcode, 4);
+        printf("NVCM IDCODE_OK: %u\r\n", (unsigned)out->idcode_ok);
+    } else {
+        printf("NVCM: IDCODE read FAILED\r\n");
+    }
+
+    /* 3. ISC_ENABLE — operand 0x08 = NVCM access, 0x00 = SRAM access. */
+    wbuf[0] = 0xC6; wbuf[1] = isc_operand; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    if (xi2c_write_bytes(hi2c, DevAddress, wbuf, 4) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_ISC_ENABLE;
+    } else {
+        printf("NVCM: ISC_ENABLE(0x%02X) FAILED\r\n", isc_operand);
+    }
+    delay_ms(5);
+
+    /* 4. Status register (0x3C): bit8 Done, bit6 OTP/NVCM-blank-check. */
+    wbuf[0] = 0x3C; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4, out->status, 4) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_STATUS;
+        nvcm_log_buf("STATUS", out->status, 4);
+    } else {
+        printf("NVCM: STATUS read FAILED\r\n");
+    }
+
+    /* 5. Feature Row (0xE7, 8 bytes): all-zero = blank, non-zero = programmed. */
+    wbuf[0] = 0xE7; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4, out->feature_row, 8) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_FEATROW;
+        nvcm_log_buf("FEATROW", out->feature_row, 8);
+    } else {
+        printf("NVCM: FEATROW read FAILED\r\n");
+    }
+
+    /* 6. Feature Bits (0xFB, 2 bytes). */
+    wbuf[0] = 0xFB; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4, out->feabits, 2) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_FEABITS;
+        nvcm_log_buf("FEABITS", out->feabits, 2);
+    } else {
+        printf("NVCM: FEABITS read FAILED\r\n");
+    }
+
+    /* 7. USERCODE (0xC0, 4 bytes): non-zero if the build programmed one. */
+    wbuf[0] = 0xC0; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4, out->usercode, 4) == HAL_OK) {
+        out->step_status |= FPGA_NVCM_STEP_USERCODE;
+        nvcm_log_buf("USERCODE", out->usercode, 4);
+    } else {
+        printf("NVCM: USERCODE read FAILED\r\n");
+    }
+
+    /* 8. NVCM array rows (0x73 LSC_READ_INCR_NV, 16 bytes/row).  Reset the
+     *    address counter first (0x46 LSC_INIT_ADDRESS), then read incrementally.
+     *    Blank rows read all-zero. */
+    if (num_rows > 0) {
+        wbuf[0] = 0x46; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+        xi2c_write_bytes(hi2c, DevAddress, wbuf, 4);
+        delay_ms(1);
+        for (uint8_t r = 0; r < num_rows; r++) {
+            wbuf[0] = 0x73; wbuf[1] = 0x21; wbuf[2] = 0x00; wbuf[3] = 0x00;
+            if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4,
+                                    &out->nvcm_rows[r * 16], 16) == HAL_OK) {
+                out->num_rows_read = r + 1;
+                char lbl[12];
+                snprintf(lbl, sizeof(lbl), "ROW%u", (unsigned)r);
+                nvcm_log_buf(lbl, &out->nvcm_rows[r * 16], 16);
+            } else {
+                printf("NVCM: ROW%u read FAILED\r\n", (unsigned)r);
+                break;
+            }
+            delay_ms(1);
+        }
+    }
+
+    /* 9. ISC_DISABLE — end the config-read phase cleanly. */
+    wbuf[0] = 0x26; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+    xi2c_write_bytes(hi2c, DevAddress, wbuf, 4);
+
+    /* 10. Boot-behavior test (behaviorally DEFINITIVE).  Release CRESETB WITHOUT
+     *     sending the activation key, so no slave port is declared active and the
+     *     device performs master auto-boot.  A programmed NVCM boots its user
+     *     design, which reassigns the config I2C pins (I2C_PORT=DISABLE by
+     *     default) so 0x40 stops ACKing.  A blank part has nothing to boot and
+     *     0x40 keeps ACKing.
+     *         0x40 ACKs  -> blank
+     *         0x40 gone  -> programmed
+     *     Ends by re-asserting CRESETB low to halt any booted user design and
+     *     free the shared I2C bus (TCA-safe). */
+    if (do_boot_test) {
+        HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);  /* assert reset */
+        delay_ms(5);
+        HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);    /* release, NO activation key */
+        delay_ms(150);                                       /* allow full auto-boot */
+
+        out->boot_probe_done = 1;
+        out->boot_0x40_responds =
+            (HAL_I2C_IsDeviceReady(hi2c, DevAddress << 1, 2, 50) == HAL_OK) ? 1 : 0;
+        printf("NVCM boot-test: 0x40 responds=%u (1=blank, 0=programmed)\r\n",
+               (unsigned)out->boot_0x40_responds);
+
+        HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);  /* halt: hold in reset, free bus */
+    }
+
+    printf("NVCM probe done: step_status=0x%02X rows=%u boot_done=%u boot_0x40=%u\r\n",
+           (unsigned)out->step_status, (unsigned)out->num_rows_read,
+           (unsigned)out->boot_probe_done, (unsigned)out->boot_0x40_responds);
+    return 0;
+}
+
 int fpga_erase_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
     // Step 4: Erase SRAM

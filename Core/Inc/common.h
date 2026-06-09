@@ -160,6 +160,7 @@ typedef enum {
 	OW_FACTORY_I2C_RD = 0x69,
 	OW_FACTORY_I2C_WR = 0x6A,
 	OW_FACTORY_I2C_WRRD = 0x6B,
+	OW_FACTORY_NVCM_CHECK = 0x6C,
 } MotionFactoryCommands;
 
 typedef enum {

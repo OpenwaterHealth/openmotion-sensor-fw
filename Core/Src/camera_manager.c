@@ -90,6 +90,78 @@ static bool camera_request_is_valid(uint8_t cam_id) {
 }
 
 
+/**
+ * Detect whether a CrossLink FPGA has been permanently programmed via NVCM.
+ *
+ * Method: enter forced slave config mode (activation key + CRESETB), read the
+ * STATUS register Done bit.  Done=1 means NVCM was fully programmed (the Done
+ * bit is the last step burned during NVCM programming and gates auto-boot).
+ *
+ * The slave I2C config port at 0x40 requires the activation key to become
+ * active — without it, 0x40 never responds regardless of NVCM state.
+ */
+static bool fpga_detect_nvcm(CameraDevice *cam)
+{
+	uint8_t wbuf[4], status[4];
+
+	HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET);
+
+	if (TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
+		return false;
+	}
+
+	/* Enter forced slave config: CRESETB low, activation key, CRESETB high. */
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	delay_ms(1);
+	if (fpga_send_activation(cam->pI2c, cam->device_address) != 0) {
+		/* No FPGA present or I2C failure — not programmed. */
+		return false;
+	}
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
+	delay_ms(10);
+
+	/* IDCODE check — verify an FPGA is actually there. */
+	if (fpga_checkid(cam->pI2c, cam->device_address) != 0) {
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+		return false;
+	}
+
+	/* ISC_ENABLE with NVCM operand (0x08 = NVCM, no read-enable needed). */
+	wbuf[0] = 0xC6; wbuf[1] = 0x08; wbuf[2] = 0x00; wbuf[3] = 0x00;
+	if (xi2c_write_bytes(cam->pI2c, cam->device_address, wbuf, 4) != HAL_OK) {
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+		return false;
+	}
+	delay_ms(5);
+
+	/* Read STATUS register (0x3C). Done = bit 8. */
+	wbuf[0] = 0x3C; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
+	if (xi2c_write_and_read(cam->pI2c, cam->device_address, wbuf, 4, status, 4) != HAL_OK) {
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+		return false;
+	}
+
+	/* ISC_DISABLE — clean exit from config mode. */
+	fpga_exit_prog_mode(cam->pI2c, cam->device_address);
+
+	/* STATUS is big-endian: status[0]=bits[31:24] .. status[1]=bits[23:16].
+	 * Done = bit 8 → status[2] bit 0. */
+	bool done = (status[2] & 0x01) != 0;
+
+	if (done) {
+		/* NVCM programmed — let the FPGA auto-boot its user design. */
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+		delay_ms(1);
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
+		TCA9548A_DisableChannel(&hi2c1, 0x70, cam->i2c_target);
+		return true;
+	}
+
+	/* NVCM blank — hold CRESETB low for subsequent SRAM programming. */
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	return false;
+}
+
 static void init_camera(CameraDevice *cam){
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -717,8 +789,13 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 	if(!force_update)
 	{
 		if(cam->isProgrammed) return true;
+		if(fpga_detect_nvcm(cam)){
+			cam->isProgrammed = true;
+			printf("NVCM programmed, skipping\r\n");
+			return true;
+		}
 	} else {
-		cam->isProgrammed = false; // set programmed to false and Program FPGA
+		cam->isProgrammed = false;
 	}
 
 	if(TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK)
@@ -752,11 +829,15 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 	if(!force_update)
 	{
 		if(cam->isProgrammed){
-			// printf("already programmed\r\n");
 			return true;
-		} 
+		}
+		if(fpga_detect_nvcm(cam)){
+			cam->isProgrammed = true;
+			printf("C%d: NVCM programmed, skipping SRAM load\r\n", cam_id+1);
+			return true;
+		}
 	} else {
-		cam->isProgrammed = false; // set isProgrammed to false and program FPGA
+		cam->isProgrammed = false;
 	}
 
 	if(TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK)
