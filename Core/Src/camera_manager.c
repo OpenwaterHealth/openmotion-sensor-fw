@@ -102,62 +102,45 @@ static bool camera_request_is_valid(uint8_t cam_id) {
  */
 static bool fpga_detect_nvcm(CameraDevice *cam)
 {
-	uint8_t wbuf[4], status[4];
+	GPIO_InitTypeDef gpio = {0};
 
-	HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET);
+	/* Reconfigure detect pins as floating inputs. A booted FPGA actively
+	 * drives both CLK and MISO low; a blank FPGA leaves them high-Z.
+	 * No pull-up — the internal pull can overpower the FPGA's drive. */
+	gpio.Mode = GPIO_MODE_INPUT;
+	gpio.Pull = GPIO_NOPULL;
+	gpio.Speed = GPIO_SPEED_FREQ_LOW;
 
-	if (TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
-		return false;
-	}
+	gpio.Pin = cam->detect_clk_pin;
+	HAL_GPIO_Init(cam->detect_clk_port, &gpio);
+	gpio.Pin = cam->detect_data_pin;
+	HAL_GPIO_Init(cam->detect_data_port, &gpio);
 
-	/* Enter forced slave config: CRESETB low, activation key, CRESETB high. */
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-	delay_ms(1);
-	if (fpga_send_activation(cam->pI2c, cam->device_address) != 0) {
-		/* No FPGA present or I2C failure — not programmed. */
-		return false;
-	}
-	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
-	delay_ms(10);
-
-	/* IDCODE check — verify an FPGA is actually there. */
-	if (fpga_checkid(cam->pI2c, cam->device_address) != 0) {
-		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-		return false;
-	}
-
-	/* ISC_ENABLE with NVCM operand (0x08 = NVCM, no read-enable needed). */
-	wbuf[0] = 0xC6; wbuf[1] = 0x08; wbuf[2] = 0x00; wbuf[3] = 0x00;
-	if (xi2c_write_bytes(cam->pI2c, cam->device_address, wbuf, 4) != HAL_OK) {
-		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-		return false;
-	}
 	delay_ms(5);
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
+	delay_ms(100);
 
-	/* Read STATUS register (0x3C). Done = bit 8. */
-	wbuf[0] = 0x3C; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
-	if (xi2c_write_and_read(cam->pI2c, cam->device_address, wbuf, 4, status, 4) != HAL_OK) {
-		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-		return false;
-	}
+	bool clk_low  = HAL_GPIO_ReadPin(cam->detect_clk_port, cam->detect_clk_pin) == GPIO_PIN_RESET;
+	bool data_low = HAL_GPIO_ReadPin(cam->detect_data_port, cam->detect_data_pin) == GPIO_PIN_RESET;
+	printf("C%d: NVCM detect clk=%d data=%d\r\n", cam->id + 1, !clk_low, !data_low);
 
-	/* ISC_DISABLE — clean exit from config mode. */
-	fpga_exit_prog_mode(cam->pI2c, cam->device_address);
+	/* Restore pins to their peripheral alternate function. */
+	gpio.Mode = GPIO_MODE_AF_PP;
+	gpio.Pull = GPIO_NOPULL;
+	gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
 
-	/* STATUS is big-endian: status[0]=bits[31:24] .. status[1]=bits[23:16].
-	 * Done = bit 8 → status[2] bit 0. */
-	bool done = (status[2] & 0x01) != 0;
+	gpio.Pin = cam->detect_clk_pin;
+	gpio.Alternate = cam->detect_clk_af;
+	HAL_GPIO_Init(cam->detect_clk_port, &gpio);
+	gpio.Pin = cam->detect_data_pin;
+	gpio.Alternate = cam->detect_data_af;
+	HAL_GPIO_Init(cam->detect_data_port, &gpio);
 
-	if (done) {
-		/* NVCM programmed — let the FPGA auto-boot its user design. */
-		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-		delay_ms(1);
-		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
-		TCA9548A_DisableChannel(&hi2c1, 0x70, cam->i2c_target);
+	if (clk_low && data_low) {
 		return true;
 	}
 
-	/* NVCM blank — hold CRESETB low for subsequent SRAM programming. */
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
 	return false;
 }
@@ -218,6 +201,12 @@ void init_camera_sensors() {
 	cam_array[0].pUart = &husart2;
 	cam_array[0].i2c_target = 0;
 	cam_array[0].pRecieveHistoBuffer = NULL;
+	cam_array[0].detect_clk_port = GPIOA;
+	cam_array[0].detect_clk_pin = GPIO_PIN_4;
+	cam_array[0].detect_clk_af = GPIO_AF7_USART2;
+	cam_array[0].detect_data_port = GPIOD;
+	cam_array[0].detect_data_pin = GPIO_PIN_6;
+	cam_array[0].detect_data_af = GPIO_AF7_USART2;
 
 	cam_array[1].id = 1;
 	cam_array[1].cresetb_port = CRESET_2_GPIO_Port;
@@ -236,6 +225,12 @@ void init_camera_sensors() {
 	cam_array[1].pUart = NULL;
 	cam_array[1].i2c_target = 1;
 	cam_array[1].pRecieveHistoBuffer = NULL;
+	cam_array[1].detect_clk_port = GPIOB;
+	cam_array[1].detect_clk_pin = GPIO_PIN_3;
+	cam_array[1].detect_clk_af = GPIO_AF8_SPI6;
+	cam_array[1].detect_data_port = GPIOA;
+	cam_array[1].detect_data_pin = GPIO_PIN_7;
+	cam_array[1].detect_data_af = GPIO_AF8_SPI6;
 
 	cam_array[2].id = 2;
 	cam_array[2].cresetb_port = CRESET_3_GPIO_Port;
@@ -254,6 +249,12 @@ void init_camera_sensors() {
 	cam_array[2].pUart = &husart3;
 	cam_array[2].i2c_target = 2;
 	cam_array[2].pRecieveHistoBuffer = NULL;
+	cam_array[2].detect_clk_port = GPIOD;
+	cam_array[2].detect_clk_pin = GPIO_PIN_10;
+	cam_array[2].detect_clk_af = GPIO_AF7_USART3;
+	cam_array[2].detect_data_port = GPIOD;
+	cam_array[2].detect_data_pin = GPIO_PIN_9;
+	cam_array[2].detect_data_af = GPIO_AF7_USART3;
 
 	cam_array[3].id = 3;
 	cam_array[3].cresetb_port = CRESET_4_GPIO_Port;
@@ -272,6 +273,12 @@ void init_camera_sensors() {
 	cam_array[3].pUart = &husart6;
 	cam_array[3].i2c_target = 3;
 	cam_array[3].pRecieveHistoBuffer = NULL;
+	cam_array[3].detect_clk_port = GPIOC;
+	cam_array[3].detect_clk_pin = GPIO_PIN_8;
+	cam_array[3].detect_clk_af = GPIO_AF7_USART6;
+	cam_array[3].detect_data_port = GPIOC;
+	cam_array[3].detect_data_pin = GPIO_PIN_7;
+	cam_array[3].detect_data_af = GPIO_AF7_USART6;
 
 	cam_array[4].id = 4;
 	cam_array[4].cresetb_port = CRESET_5_GPIO_Port;
@@ -290,6 +297,12 @@ void init_camera_sensors() {
 	cam_array[4].pUart = &husart1;
 	cam_array[4].i2c_target = 4;
 	cam_array[4].pRecieveHistoBuffer = NULL;
+	cam_array[4].detect_clk_port = GPIOA;
+	cam_array[4].detect_clk_pin = GPIO_PIN_8;
+	cam_array[4].detect_clk_af = GPIO_AF7_USART1;
+	cam_array[4].detect_data_port = GPIOB;
+	cam_array[4].detect_data_pin = GPIO_PIN_15;
+	cam_array[4].detect_data_af = GPIO_AF4_USART1;
 
 	cam_array[5].id = 5;
 	cam_array[5].cresetb_port = CRESET_6_GPIO_Port;
@@ -308,6 +321,12 @@ void init_camera_sensors() {
 	cam_array[5].pUart = NULL;
 	cam_array[5].i2c_target = 5;
 	cam_array[5].pRecieveHistoBuffer = NULL;
+	cam_array[5].detect_clk_port = GPIOC;
+	cam_array[5].detect_clk_pin = GPIO_PIN_10;
+	cam_array[5].detect_clk_af = GPIO_AF6_SPI3;
+	cam_array[5].detect_data_port = GPIOB;
+	cam_array[5].detect_data_pin = GPIO_PIN_2;
+	cam_array[5].detect_data_af = GPIO_AF7_SPI3;
 
 	cam_array[6].id = 6;
 	cam_array[6].cresetb_port = CRESET_7_GPIO_Port;
@@ -326,6 +345,12 @@ void init_camera_sensors() {
 	cam_array[6].pUart = NULL;
 	cam_array[6].i2c_target = 6;
 	cam_array[6].pRecieveHistoBuffer = NULL;
+	cam_array[6].detect_clk_port = GPIOA;
+	cam_array[6].detect_clk_pin = GPIO_PIN_9;
+	cam_array[6].detect_clk_af = GPIO_AF5_SPI2;
+	cam_array[6].detect_data_port = GPIOC;
+	cam_array[6].detect_data_pin = GPIO_PIN_1;
+	cam_array[6].detect_data_af = GPIO_AF5_SPI2;
 
 	cam_array[7].id = 7;
 	cam_array[7].cresetb_port = CRESET_8_GPIO_Port;
@@ -344,6 +369,12 @@ void init_camera_sensors() {
 	cam_array[7].pUart = NULL;
 	cam_array[7].i2c_target = 7;
 	cam_array[7].pRecieveHistoBuffer = NULL;
+	cam_array[7].detect_clk_port = GPIOE;
+	cam_array[7].detect_clk_pin = GPIO_PIN_2;
+	cam_array[7].detect_clk_af = GPIO_AF5_SPI4;
+	cam_array[7].detect_data_port = GPIOE;
+	cam_array[7].detect_data_pin = GPIO_PIN_6;
+	cam_array[7].detect_data_af = GPIO_AF5_SPI4;
 
 
 	for(i=0; i<CAMERA_COUNT; i++){

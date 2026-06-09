@@ -35,6 +35,12 @@ typedef struct {
 	uint8_t 		exposure;
 	uint8_t *pRecieveHistoBuffer;
     size_t   receiveBufferSize;      // Size of the buffer
+	GPIO_TypeDef *	detect_clk_port;
+	uint16_t		detect_clk_pin;
+	uint32_t		detect_clk_af;
+	GPIO_TypeDef *	detect_data_port;
+	uint16_t		detect_data_pin;
+	uint32_t		detect_data_af;
 } CameraDevice;
 
 #define CAMERA_COUNT	8
