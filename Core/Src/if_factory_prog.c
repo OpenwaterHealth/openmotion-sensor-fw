@@ -176,7 +176,7 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                     }else{  
                         uint16_t write_len = cmd->data[0] << 8 | cmd->data[1];
                         uint16_t read_len = cmd->data[2] << 8 | cmd->data[3];
-                        uint8_t *write_data = &cmd->data[5];
+                        uint8_t *write_data = &cmd->data[4];
                         memset(i2c_write_buf, 0, sizeof(i2c_write_buf));
                         memset(i2c_read_buf, 0, sizeof(i2c_read_buf));
                         if (write_len > sizeof(i2c_write_buf) || read_len > sizeof(i2c_read_buf)) {
