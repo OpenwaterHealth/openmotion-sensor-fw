@@ -67,12 +67,22 @@ it should). Unit tests: `tests/test_i2c_parser_verify.py`.
 | 1–7 (left) | row-shifted + OR'd garbage (cams 2, 3 additionally OR'd by diagnostic re-burns) | **never** | yes |
 | 8 (left) | correct image + Done | yes | yes |
 
+## Positive validation (2026-06-09, virgin module in slot 8)
+
+A brand-new camera module was installed in left slot 8 and burned with
+the fixed parser:
+
+1. `test_factory_prog.py` PASSED with full readback verification.
+2. Probe verdict: **NVCM PROGRAMMED** — 0x40 disappears after CRESETB
+   release, i.e. the FPGA auto-boots its user design.
+3. The Done fuse took in the same pass — no separate
+   `nvcm_burn_done.py` retry needed (the real busy-polling also fixed
+   the ISC_PROGRAM_DONE wait that bit the first camera-8 burn).
+4. Firmware pin-sampling detect: `C8: NVCM detect clk=0 data=0` →
+   "NVCM programmed, skipping SRAM load".
+
 ## Outstanding
 
-- **Positive end-to-end validation needs a virgin CrossLink**: clean burn
-  with the fixed parser → VERIFY passes → device auto-boots → pin-sampling
-  NVCM detect reports programmed. Cannot be done on cams 1–7 (the fixed
-  blank-check now rightly rejects them).
 - Burns are slower with real polling (real busy-waits + full verify).
 - Unexplained: one USB drop (errno 32) during an all-8-cameras
   `OW_FPGA_PROG_SRAM` detect loop earlier the same day. Not reproduced or
