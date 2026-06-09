@@ -6,6 +6,111 @@ detect this at runtime and skip SRAM programming — returning OK immediately.
 
 ---
 
+## ⮕ HANDOFF — NEXT AGENT START HERE (you have the `logic2` MCP)
+
+You are picking up a hardware bring-up that was paced as: edit firmware → write
+SDK test script → flash → power-cycle → run script → interpret → repeat.  A
+Saleae **Logic 2** analyzer is now wired to the sensor and exposed via the
+`logic2` MCP (the previous session couldn't see it — it was added after start).
+
+### What's already established (don't re-litigate)
+- **Camera 8's NVCM is confirmed PROGRAMMED** (valid, bootable).  Proven by the
+  auto-boot test: with the config port FORCED (activation key) `IDCODE` reads
+  `01 2C 00 43`; when CRESETB is released WITHOUT the activation key the config
+  port at **0x40 disappears** (`boot_0x40_responds=0`) — i.e. the FPGA booted a
+  user design from NVCM.  Reproduced 5×, TCA-safe.
+- The **direct content reads return floating `0xFF`** (feature row `0xE7`, feabits
+  `0xFB`, NVCM array `0x73`) while STATUS (`0x3C`) and USERCODE (`0xC0`) return
+  real data.  Leading explanation: a bare `ISC_ENABLE 0x08` does **not
+  read-enable** the NVCM array — NVCM-mode STATUS=`0x00000208` lacks the
+  Read-Enable bit (bit 11) that SRAM-mode STATUS=`0x00000E00` has.
+
+### Your immediate, highest-value task
+Put Logic 2 on cam8's config **SCL/SDA** and capture during one
+`OW_FACTORY_NVCM_CHECK` run.  Decode I2C and answer:
+1. For the `0xE7`/`0x73` reads — do the correct command bytes go out, and does
+   the **FPGA drive data** or does SDA **float high (no drive)**?  That tells us
+   NAK-vs-not-read-enabled vs wrong-framing.
+2. Confirm the activation-key + CRESETB timing matches intent.
+3. Use it as the **negative-control reference** in place of a blank camera.
+
+Then iterate the NVCM read-enable (try ISC_ENABLE operand variants / an explicit
+read-enable / trim per the PDFs) until `0x73` returns real, varied bytes — that
+both fixes the content read and lets you byte-compare the stored image
+(addresses the user's "was the NVCM written correctly / corrupt?" question).
+
+**FIRST, confirm with the user which Logic 2 channels map to cam8 SCL and SDA**
+(and trigger setup) — I don't have that mapping.
+
+### Exact repro (slow loop ~1–2 min/flash; user said don't get discouraged)
+```
+# build:   cmake --build build/Debug      (in openmotion-sensor-fw)
+# flash:   python openmotion-sensor-fw/scripts/deploy.py --device left --no-confirm
+#          (run from C:/Users/ethan/Projects; dfu-util exit 74 is benign)
+# boot:    python openmotion-bloodflow-app/tests/shelly.py --host 192.168.1.81 cycle --off-time 5.0
+# probe:   python openmotion-sdk/scripts/nvcm_probe.py --camera 8 [--operand 0x08] [--rows N] [--no-power]
+```
+Zed tasks "Deploy Sensor Left" and "Toggle Outlet" do the flash and power-cycle.
+Firmware printf comes back over USB as `[LEFT-COMM PRINTF]` log lines once
+`set_debug_flags(USB_PRINTF|CMD_VERBOSE)` is sent (the script does this).
+
+### ⚠ POWER-SAFETY RULES (the TCA wedges if violated)
+- **Only ONE camera powered at a time.**  The cam1 lock-up earlier was almost
+  certainly caused by powering cam1 while **cam8 was still powered** (cam1 IS
+  populated — not an empty slot).  Power off others first, then power the target.
+- Never run the boot/power steps in a tight loop across cameras.
+- If `0x70` starts timing out (`err 0x20`, repeated "TCA reset"), **recover with
+  a Toggle-Outlet power cycle** — it always clears it.
+- The probe path itself (mux select + CRESETB + I2C) is TCA-safe; it's *camera
+  power* transitions that are dangerous.
+
+### Firmware command under test — `OW_FACTORY_NVCM_CHECK = 0x6C`
+`if_factory_prog.c` → `fpga_nvcm_probe()` in `crosslink.c`.  Payload
+`[isc_operand(=0x08), num_rows(=1), do_boot_test(=1)]`.  Reads use
+`xi2c_write_and_read()` = repeated-START (`Seq_Transmit FIRST_FRAME` →
+`Seq_Receive LAST_FRAME`).  Wire sequence:
+```
+CRESETB low(1ms); write 0x40 <FF A4 C6 F4 8A>; CRESETB high(10ms)
+IDCODE     wr[E0 00 00 00] rd4
+ISC_ENABLE wr[C6 <op> 00 00] (op 0x08=NVCM / 0x00=SRAM); 5ms
+STATUS     wr[3C 00 00 00] rd4      <- real
+FEATROW    wr[E7 00 00 00] rd8      <- 0xFF (suspect read-not-enabled)
+FEABITS    wr[FB 00 00 00] rd2      <- 0xFF
+USERCODE   wr[C0 00 00 00] rd4      <- real (0x00000000)
+NVCM rows  wr[46 00 00 00]; per row wr[73 21 00 00] rd16   <- 0xFF
+ISC_DISABLE wr[26 00 00 00]
+boot test (if on): CRESETB low(5ms); CRESETB high(150ms, NO key);
+                   IsDeviceReady(0x40); CRESETB low
+```
+Response blob (parsed by `nvcm_probe.py`): `[0:4]idcode [4]idcode_ok
+[5]step_status [6:10]status [10:18]featrow [18:20]feabits [20:24]usercode
+[24]boot_probe_done [25]boot_0x40_responds [26]num_rows_read [27:]rows(16B ea)`.
+
+### Tip for FAST iteration without reflashing
+There's a known **off-by-one in `OW_FACTORY_I2C_WRRD`**: firmware reads
+`write_data = &cmd->data[5]` but the SDK `i2c_write_read()` packs it at index 4.
+If you fix that (index 5→4 in `if_factory_prog.c`) — one flash — you can then
+drive arbitrary repeated-START reads from Python (`sensor.i2c_write` /
+`i2c_write_read` / `creset`) and iterate the NVCM read framing at Python speed
+with Logic 2 watching, instead of reflashing per attempt.  (Verify nothing in
+the i2cem/isp path depends on index 5 first.)
+
+### Key files / state
+- FW: `openmotion-sensor-fw` @ `feature/fpga-autodetect` — `crosslink.c`
+  (`fpga_nvcm_probe`), `crosslink.h` (`fpga_nvcm_probe_t`), `if_factory_prog.c`
+  (`OW_FACTORY_NVCM_CHECK`), `common.h` (enum `0x6C`).  Iteration-2 build is on
+  the LEFT sensor now.
+- SDK: `openmotion-sdk` @ `next` — `omotion/MotionSensor.py` (`nvcm_check`),
+  `omotion/config.py` (`OW_FACTORY_NVCM_CHECK`), `scripts/nvcm_probe.py`.
+- Reference PDFs: `C:\Users\ethan\Downloads\C175812-012925_I2C_Crosslink NVCM
+  Programming 1.0.pdf` (authoritative I2C byte sequences) and
+  `C:\Users\ethan\Projects\CrossLink-Programming-Config-User-Guide.pdf` (OTP /
+  Feature-Row / blank-default semantics).  Opcode table + read-back flow are
+  summarized in the "Authoritative discriminators" section below.
+- All work committed (FW + SDK).  Nothing of substance uncommitted.
+
+---
+
 ## 2026-06-08
 
 ### Background
@@ -270,14 +375,16 @@ TCA9548A control write failed ... addr: 0x70 ret: 1 err: 32   (err 0x20 = I2C TI
 TCA reset (x3, then gave up); nvcm_check -> OW_ERROR
 ```
 
-Camera slot 1 is almost certainly **unpopulated or faulty** — enabling its mux
-channel lets a stuck/floating line hold the bus, and `0x70` stops ACKing.  This
-is the exact "TCA freaking out" symptom and the likely reason cam8 was the only
-in-scope camera.  **Recovered cleanly with a Toggle-Outlet power cycle**, after
-which cam8 re-probed as PROGRAMMED (system healthy).
+**CORRECTION (per user): camera 1 IS populated** — it has a camera in it.  So
+the wedge was NOT an empty slot.  The real cause was almost certainly that
+**cam8 was still powered when cam1 was powered on** (the prior cam8 probe left
+cam8 powered; the probe script never powers others off).  Two cameras powered at
+once → I2C/TCA conflict → `0x70` times out (`err 0x20`).  **Recovered cleanly
+with a Toggle-Outlet power cycle**, after which cam8 re-probed as PROGRAMMED.
 
-Lesson: the negative control needs a slot that is **populated with a blank
-FPGA**.  Camera 1 is not it.  Ask which slot (if any) qualifies before retrying.
+Lesson → **power-safety rule: only one camera powered at a time.**  To use cam1
+as the blank control: power OFF cam8 (and any others) first, then power cam1
+alone, then probe.  See the HANDOFF power-safety rules at the top.
 
 ---
 
@@ -297,8 +404,10 @@ bootable) via the auto-boot 0x40-disappearance test.  Reproduced 5×, TCA-safe.
    added a `logic2` MCP server, but its tools are NOT registered in this session
    (added after session start).  **RESTART the Claude Code session** to load it.
    Then capture the I2C during `OW_FACTORY_NVCM_CHECK` to resolve the 0xFF reads.
-2. **Blank-camera control** — camera 1 wedges the TCA (unpopulated/faulty).  Need
-   a populated-but-blank slot to prove the detector's negative case.
+2. **Blank-camera control** — camera 1 IS populated (per user) and is a valid
+   blank candidate.  Earlier wedge was a power-sequencing mistake (cam8 left
+   powered while powering cam1).  Retry: power OFF cam8 first, then power cam1
+   alone, then probe; expect `0x40` to still ACK after auto-boot (BLANK).
 3. **Read real NVCM contents** — feature-row (0xE7)/array (0x73) read floating
    `0xFF`; NVCM-mode STATUS=0x208 lacks the Read-Enable bit (SRAM-mode=0xE00 has
    it).  Need the NVCM read-enable sequence; the logic2 capture should reveal
