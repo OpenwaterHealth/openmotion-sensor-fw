@@ -32,6 +32,8 @@ typedef struct {
 	uint8_t feature_row[8];                /* 0xE7 LSC_READ_FEATURE */
 	uint8_t feabits[2];                    /* 0xFB LSC_READ_FEABITS */
 	uint8_t usercode[4];                   /* 0xC0 USERCODE */
+	uint8_t boot_probe_done;               /* 1 if the boot-behavior test ran */
+	uint8_t boot_0x40_responds;            /* after auto-boot: 1=ACK (blank), 0=gone (programmed) */
 	uint8_t num_rows_read;                 /* NVCM array rows actually read */
 	uint8_t nvcm_rows[FPGA_NVCM_MAX_ROWS * 16]; /* 0x73 LSC_READ_INCR_NV */
 } fpga_nvcm_probe_t;
@@ -46,7 +48,7 @@ typedef struct {
  */
 int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                     GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin,
-                    uint8_t isc_operand, uint8_t num_rows,
+                    uint8_t isc_operand, uint8_t num_rows, uint8_t do_boot_test,
                     fpga_nvcm_probe_t *out);
 
 int fpga_send_activation(I2C_HandleTypeDef *hi2c, uint16_t DevAddress);

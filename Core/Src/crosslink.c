@@ -238,7 +238,7 @@ static void nvcm_log_buf(const char *label, const uint8_t *buf, int len)
 
 int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                     GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin,
-                    uint8_t isc_operand, uint8_t num_rows,
+                    uint8_t isc_operand, uint8_t num_rows, uint8_t do_boot_test,
                     fpga_nvcm_probe_t *out)
 {
     uint8_t wbuf[4];
@@ -246,8 +246,8 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
     memset(out, 0, sizeof(*out));
     if (num_rows > FPGA_NVCM_MAX_ROWS) num_rows = FPGA_NVCM_MAX_ROWS;
 
-    printf("NVCM probe: isc_operand=0x%02X num_rows=%u addr=0x%02X\r\n",
-           isc_operand, (unsigned)num_rows, (unsigned)DevAddress);
+    printf("NVCM probe: isc_operand=0x%02X num_rows=%u boot_test=%u addr=0x%02X\r\n",
+           isc_operand, (unsigned)num_rows, (unsigned)do_boot_test, (unsigned)DevAddress);
 
     /* 1. Hold config port in SLAVE mode: CRESETB low, activation key, CRESETB
      *    high.  Sending the key while/around the CRESETB transition declares the
@@ -343,12 +343,38 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
         }
     }
 
-    /* 9. ISC_DISABLE — leave the device as we found it (still held in config). */
+    /* 9. ISC_DISABLE — end the config-read phase cleanly. */
     wbuf[0] = 0x26; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x00;
     xi2c_write_bytes(hi2c, DevAddress, wbuf, 4);
 
-    printf("NVCM probe done: step_status=0x%02X rows=%u\r\n",
-           (unsigned)out->step_status, (unsigned)out->num_rows_read);
+    /* 10. Boot-behavior test (behaviorally DEFINITIVE).  Release CRESETB WITHOUT
+     *     sending the activation key, so no slave port is declared active and the
+     *     device performs master auto-boot.  A programmed NVCM boots its user
+     *     design, which reassigns the config I2C pins (I2C_PORT=DISABLE by
+     *     default) so 0x40 stops ACKing.  A blank part has nothing to boot and
+     *     0x40 keeps ACKing.
+     *         0x40 ACKs  -> blank
+     *         0x40 gone  -> programmed
+     *     Ends by re-asserting CRESETB low to halt any booted user design and
+     *     free the shared I2C bus (TCA-safe). */
+    if (do_boot_test) {
+        HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);  /* assert reset */
+        delay_ms(5);
+        HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);    /* release, NO activation key */
+        delay_ms(150);                                       /* allow full auto-boot */
+
+        out->boot_probe_done = 1;
+        out->boot_0x40_responds =
+            (HAL_I2C_IsDeviceReady(hi2c, DevAddress << 1, 2, 50) == HAL_OK) ? 1 : 0;
+        printf("NVCM boot-test: 0x40 responds=%u (1=blank, 0=programmed)\r\n",
+               (unsigned)out->boot_0x40_responds);
+
+        HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);  /* halt: hold in reset, free bus */
+    }
+
+    printf("NVCM probe done: step_status=0x%02X rows=%u boot_done=%u boot_0x40=%u\r\n",
+           (unsigned)out->step_status, (unsigned)out->num_rows_read,
+           (unsigned)out->boot_probe_done, (unsigned)out->boot_0x40_responds);
     return 0;
 }
 

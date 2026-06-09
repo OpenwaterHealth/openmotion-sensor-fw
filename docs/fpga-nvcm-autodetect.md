@@ -169,4 +169,44 @@ probe → parse + interpret).  Only camera 8 is touched.
 
 | Iter | FW change | Result | Next |
 |---|---|---|---|
-| 1 | add `OW_FACTORY_NVCM_CHECK` dump-everything probe | (pending hardware) | — |
+| 1 | add `OW_FACTORY_NVCM_CHECK` dump-everything probe | infra works, content reads ambiguous | add boot-behavior test |
+
+#### Iteration 1 — hardware result (camera 8, believed programmed)
+
+End-to-end flow worked with **zero TCA complaints**: deploy → toggle outlet →
+power cam8 → switch (mux ch7) → probe.  `IDCODE = 01 2C 00 43, ok=1` — we
+successfully held the FPGA in slave config mode (it did NOT boot from NVCM), so
+0x40 stayed alive.
+
+Raw reads, operand `0x08` (NVCM) vs `0x00` (SRAM):
+
+| Read | 0x08 (NVCM) | 0x00 (SRAM) | Verdict |
+|---|---|---|---|
+| STATUS | `00 00 02 08` | `00 00 0E 00` | **real, mode-sensitive** |
+| FEATROW | `FF…` | `FF…` | untrustworthy (floating) |
+| FEABITS | `FF FF` | `FF FF` | untrustworthy |
+| USERCODE | `00 00 00 00` | `00 00 00 00` | real, zero |
+| NVCM rows | `FF…` | `FF…` | untrustworthy |
+
+Interpretation:
+- STATUS is genuine and changes with the ISC operand → our read path works.
+- In NVCM mode STATUS=0x208 has **no Read-Enable bit (bit 11)**; in SRAM mode
+  STATUS=0xE00 has read+write enable.  The bare `ISC_ENABLE 0x08` does **not**
+  read-enable the NVCM array, which explains the floating `0xFF` on the
+  feature-row / array reads.
+- The opcodes proven by the existing SRAM code (E0/3C/C0) return real data; the
+  spec-only opcodes (E7/FB/73) return 0xFF.  No working reference exists for
+  them and the agent flagged bit-reversal/framing/trim uncertainty.
+
+**Conclusion:** the all-`0xFF` reads are NOT real NVCM contents (blank should be
+`0x00`).  Don't trust them.  The naive "feature_row != 0 ⇒ programmed" verdict
+is wrong.  Pivot the *primary* signal to the behaviorally-definitive boot test;
+keep dumping content for the record in case a later framing fix makes it usable.
+
+| 2 | add boot-behavior test: release CRESETB w/o activation key, check if 0x40 still ACKs | (pending hardware) | — |
+
+Boot test logic: a programmed NVCM auto-boots its user design on CRESETB
+release → `I2C_PORT=DISABLE` reassigns the config pins → **0x40 stops ACKing**.
+A blank part has nothing to boot → 0x40 keeps ACKing.  So `0x40 responds ⇒
+blank`, `0x40 gone ⇒ programmed`.  Done on cam8 only, ends by re-asserting
+CRESETB low to halt the booted design and free the bus (TCA-safe).

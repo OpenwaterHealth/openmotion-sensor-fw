@@ -211,10 +211,12 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
 
                     /* Params: data[0] = ISC_ENABLE operand (default 0x08 = NVCM
                      * access, 0x00 = SRAM); data[1] = # of 16-byte NVCM rows to
-                     * read back (default 1).  Parameterized so the host can vary
-                     * them without reflashing. */
-                    uint8_t isc_operand = (cmd->data_len >= 1) ? cmd->data[0] : 0x08;
-                    uint8_t num_rows    = (cmd->data_len >= 2) ? cmd->data[1] : 1;
+                     * read back (default 1); data[2] = run boot-behavior test
+                     * (default 1).  Parameterized so the host can vary them
+                     * without reflashing. */
+                    uint8_t isc_operand  = (cmd->data_len >= 1) ? cmd->data[0] : 0x08;
+                    uint8_t num_rows     = (cmd->data_len >= 2) ? cmd->data[1] : 1;
+                    uint8_t do_boot_test = (cmd->data_len >= 3) ? cmd->data[2] : 1;
 
                     /* Route this camera's mux channel (mux I2C only — no power). */
                     if (TCA9548A_SelectChannel(_active_cam->pI2c, 0x70, _active_cam->i2c_target) != HAL_OK)
@@ -227,12 +229,14 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
 
                     fpga_nvcm_probe(_active_cam->pI2c, _active_cam->device_address,
                                     _active_cam->cresetb_port, _active_cam->cresetb_pin,
-                                    isc_operand, num_rows, &nvcm_probe);
+                                    isc_operand, num_rows, do_boot_test, &nvcm_probe);
 
                     /* Serialize a fixed-layout blob into i2c_read_buf:
                      *  [0..3] idcode, [4] idcode_ok, [5] step_status,
                      *  [6..9] status, [10..17] feature_row, [18..19] feabits,
-                     *  [20..23] usercode, [24] num_rows_read, [25..] rows(16B each) */
+                     *  [20..23] usercode, [24] boot_probe_done,
+                     *  [25] boot_0x40_responds, [26] num_rows_read,
+                     *  [27..] rows(16B each) */
                     uint16_t n = 0;
                     memcpy(&i2c_read_buf[n], nvcm_probe.idcode, 4);       n += 4;
                     i2c_read_buf[n++] = nvcm_probe.idcode_ok;
@@ -241,6 +245,8 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                     memcpy(&i2c_read_buf[n], nvcm_probe.feature_row, 8);  n += 8;
                     memcpy(&i2c_read_buf[n], nvcm_probe.feabits, 2);      n += 2;
                     memcpy(&i2c_read_buf[n], nvcm_probe.usercode, 4);     n += 4;
+                    i2c_read_buf[n++] = nvcm_probe.boot_probe_done;
+                    i2c_read_buf[n++] = nvcm_probe.boot_0x40_responds;
                     i2c_read_buf[n++] = nvcm_probe.num_rows_read;
                     if (nvcm_probe.num_rows_read > 0)
                     {
