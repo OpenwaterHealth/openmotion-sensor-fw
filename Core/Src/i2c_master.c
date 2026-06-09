@@ -215,16 +215,6 @@ HAL_StatusTypeDef TCA9548A_SelectBroadcast(I2C_HandleTypeDef *hi2c, uint8_t addr
     return TCA9548A_WriteControl(hi2c, address, data);
 }
 
-HAL_StatusTypeDef TCA9548A_EnableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel)
-{
-    if (channel > 7) {
-        return HAL_ERROR;
-    }
-
-    uint8_t data = (uint8_t)(I2C_current_target | (1u << channel));
-    return TCA9548A_WriteControl(hi2c, address, data);
-}
-
 HAL_StatusTypeDef TCA9548A_DisableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel)
 {
     if (channel > 7) {

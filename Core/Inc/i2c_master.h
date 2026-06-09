@@ -20,7 +20,10 @@ uint8_t read_data_register_of_slave(I2C_HandleTypeDef * pI2c, uint8_t slave_addr
 void reset_slaves(I2C_HandleTypeDef * pI2c);
 HAL_StatusTypeDef TCA9548A_SelectChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel);
 HAL_StatusTypeDef TCA9548A_SelectBroadcast(I2C_HandleTypeDef *hi2c, uint8_t address);
-HAL_StatusTypeDef TCA9548A_EnableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel);
+/* NOTE: there is intentionally no TCA9548A_EnableChannel (additive select).
+ * Selecting multiple channels in parallel puts several FPGAs on the shared
+ * bus at once — see docs/tca9548a-bus-issues.md. Use SelectChannel (exactly
+ * one channel) or DisableChannel/DisableAll. */
 HAL_StatusTypeDef TCA9548A_DisableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel);
 HAL_StatusTypeDef TCA9548A_DisableAll(I2C_HandleTypeDef *hi2c, uint8_t address);
 void I2C_BusRecovery(I2C_HandleTypeDef *hi2c);

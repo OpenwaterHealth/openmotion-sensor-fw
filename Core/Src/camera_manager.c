@@ -124,7 +124,9 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 
 	bool clk_low  = HAL_GPIO_ReadPin(cam->detect_clk_port, cam->detect_clk_pin) == GPIO_PIN_RESET;
 	bool data_low = HAL_GPIO_ReadPin(cam->detect_data_port, cam->detect_data_pin) == GPIO_PIN_RESET;
-	printf("C%d: NVCM detect clk=%d data=%d\r\n", cam->id + 1, !clk_low, !data_low);
+	if ((logging_get_debug_flags() & DEBUG_FLAG_CMD_VERBOSE) != 0u) {
+		printf("C%d: NVCM detect clk=%d data=%d\r\n", cam->id + 1, !clk_low, !data_low);
+	}
 
 	/* Restore pins to their peripheral alternate function. */
 	gpio.Mode = GPIO_MODE_AF_PP;
@@ -1978,10 +1980,12 @@ _Bool enable_camera_power(uint8_t cam_id){
 
 	HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET); // Set power pin high
 	cam->isPowered = true;
-	if (TCA9548A_EnableChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
-		printf("Failed to enable mux channel for Camera %d\r\n", cam_id + 1);
-		return false;
-	}
+	/* Do NOT select the mux channel here. A freshly powered CrossLink with
+	 * blank/unloaded config drives its config pins during its boot attempt,
+	 * and those are the same physical pins as this mux channel — connecting
+	 * the channel now clamps the shared I2C bus and the next transaction
+	 * times out. Every I2C consumer (temp poll, FPGA programming, camera
+	 * config) selects the channel itself right before transacting. */
 
 	printf("Enabled Power for Camera %d\r\n", cam_id+1);
 	return true;
