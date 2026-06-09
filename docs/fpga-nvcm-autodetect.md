@@ -203,10 +203,57 @@ Interpretation:
 is wrong.  Pivot the *primary* signal to the behaviorally-definitive boot test;
 keep dumping content for the record in case a later framing fix makes it usable.
 
-| 2 | add boot-behavior test: release CRESETB w/o activation key, check if 0x40 still ACKs | (pending hardware) | — |
+| 2 | add boot-behavior test: release CRESETB w/o activation key, check if 0x40 still ACKs | **DEFINITIVE: cam8 = PROGRAMMED** | build production skip-logic on boot test |
 
 Boot test logic: a programmed NVCM auto-boots its user design on CRESETB
 release → `I2C_PORT=DISABLE` reassigns the config pins → **0x40 stops ACKing**.
 A blank part has nothing to boot → 0x40 keeps ACKing.  So `0x40 responds ⇒
 blank`, `0x40 gone ⇒ programmed`.  Done on cam8 only, ends by re-asserting
 CRESETB low to halt the booted design and free the bus (TCA-safe).
+
+#### Iteration 2 — hardware result (camera 8)
+
+```
+NVCM IDCODE: 01 2C 00 43   ok=1     <- forced config mode: 0x40 PRESENT
+NVCM STATUS: 00 00 02 08            (NVCM-mode, no read-enable)
+NVCM FEATROW/FEABITS/ROWS: FF...    (read artifact, not enabled)
+NVCM boot-test: 0x40 responds=0     <- auto-boot: 0x40 GONE
+```
+
+**VERDICT: camera 8 NVCM is PROGRAMMED with a valid, bootable image.**
+
+Why this is robust (self-validating within one run): the config port at 0x40
+is **present** during the forced-config phase (activation key → IDCODE ok) and
+**absent** during the auto-boot phase (no activation key).  The port *flips*
+with the mode:
+- blank part → 0x40 present in BOTH phases (nothing boots)
+- programmed part → 0x40 present when forced, GONE after auto-boot ← observed
+
+This rules out "0x40 is just always gone" and "always present."  It also
+addresses the corrupt-write hypothesis: entering User Mode (which reassigns the
+config pins) only happens when configuration **completes and asserts DONE**.  A
+corrupt/garbled NVCM image fails the config CRC and never hands off, so 0x40
+would have stayed.  It didn't → the image is structurally valid and bootable
+(this proves the *write took*, not that the user *logic* is functionally
+perfect).
+
+The direct content reads (feature row / NVCM array) stay `0xFF` because a bare
+`ISC_ENABLE 0x08` doesn't read-enable the NVCM array (STATUS 0x208 lacks the
+read-enable bit that SRAM-mode 0xE00 has).  This is now **moot for detection** —
+the boot test is the reliable, power-safe, framing-independent detector.
+
+### Recommended detector (production)
+
+```
+power on camera; select mux channel
+CRESETB low; send activation key; CRESETB high      # force config mode
+read IDCODE  -> must be 01 2C 00 43 (config port reachable)
+CRESETB low; CRESETB high (NO activation key); wait ~150ms   # allow auto-boot
+probe 0x40:
+    no ACK  -> NVCM PROGRAMMED  -> skip SRAM load; leave CRESETB high (running)
+    ACK     -> NOT programmed   -> proceed with SRAM load
+```
+
+Never touches camera power.  Open validation item: confirm a **known-blank**
+camera shows `0x40 ACKs` (0x40 present after auto-boot) as the negative control
+— requires probing a non-cam8 slot, which the current task scope forbids.
