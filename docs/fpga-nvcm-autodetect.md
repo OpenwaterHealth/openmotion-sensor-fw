@@ -87,4 +87,86 @@ This is safer because:
 
 | Commit | Description |
 |--------|-------------|
-| (pending) | Revert init to stock; keep detection in program paths only |
+| 0eb5a92 | Revert init to stock; keep detection in program paths only |
+
+---
+
+## 2026-06-08 (afternoon) — Pivot to DIRECT NVCM read-back
+
+### Why pivot
+
+The boot-inference approach (let CRESETB go HIGH without the activation key, see
+whether 0x40 disappears) is **indirect** and, worse, it relies on power/reset
+toggling near the TCA9548A — which is what keeps upsetting the mux.  We're
+abandoning it as the primary signal.
+
+After re-reading both Lattice PDFs in depth, there is a **direct, authoritative**
+method that (a) never lets the FPGA boot, (b) never touches camera power, and
+(c) reads the actual NVCM fuse state instead of inferring it from runtime
+behavior:
+
+> Hold the configuration port in **slave mode** (send the activation key around
+> the CRESETB transition, exactly as `fpga_configure()` already does for SRAM),
+> enter **NVCM access mode** with `ISC_ENABLE = C6 08 00 00` (operand `0x08`
+> selects NVCM; `0x00` = SRAM), then read fuse-backed registers over I2C.
+
+### Authoritative discriminators (from the I2C NVCM Programming spec)
+
+| Read | Opcode | Bytes | Blank | Programmed |
+|---|---|---:|---|---|
+| IDCODE | `E0 00 00 00` | 4 | `01 2C 00 43` | `01 2C 00 43` (sanity only) |
+| Status Register | `3C 00 00 00` | 4 | bit8 Done=0 | bit8 Done=1; bit6 = "NVCM blank check" |
+| **Feature Row** | `E7 00 00 00` | 8 | all `0x00` | non-zero (UNAMBIGUOUS per User Guide p26-27) |
+| Feature Bits | `FB 00 00 00` | 2 | `0x0000` | non-zero |
+| USERCODE | `C0 00 00 00` | 4 | `0x00000000` | programmed value (only if build sets one) |
+| NVCM array row | `46…` then `73 21 00 00` | 16/row | all `0x00` | non-zero |
+
+Key spec facts: **blank reads as 0x00, NOT 0xFF** on this part.  NVCM is OTP, so
+"programmed" is permanent.  `xi2c_write_and_read()` already does a proper
+repeated-START (`I2C_FIRST_FRAME` → `I2C_LAST_FRAME`), which is exactly what the
+CrossLink read transactions require.
+
+### Boundary bug found (NOT fixed — noted)
+
+The SDK `MotionSensor.i2c_write_read()` packs the write-data at payload **index 4**
+(`[wlen_hi,wlen_lo,rlen_hi,rlen_lo, data…]`), but the firmware
+`OW_FACTORY_I2C_WRRD` handler reads `write_data = &cmd->data[5]` (index **5**) —
+an off-by-one that corrupts the SDK's combined write-then-read passthrough.
+`i2c_write` (index 2) and `i2c_read` (index 0-1) are correct.  Left alone for now
+to avoid touching shared code other scripts may compensate for; the new dedicated
+command sidesteps it entirely.
+
+### Iteration 1 design — one parameterized firmware command, dump everything
+
+To minimize slow flash cycles, the firmware command is a **thin, parameterized
+NVCM-read primitive** so the parameters that carry the most uncertainty (which
+ISC_ENABLE operand, how many NVCM rows) can be varied **from Python without
+reflashing**:
+
+- **`OW_FACTORY_NVCM_CHECK = 0x6C`** (factory dispatch, `if_factory_prog.c`).
+  Payload: `data[0]` = ISC_ENABLE operand1 (default `0x08`=NVCM), `data[1]` =
+  number of 16-byte NVCM rows to read (default 1).
+- **`fpga_nvcm_probe()`** in `crosslink.c`: CRESETB low → activation key →
+  CRESETB high → IDCODE → `ISC_ENABLE <operand>` → read status, feature row,
+  feature bits, usercode, N NVCM rows → `ISC_DISABLE`.  Every step is
+  best-effort and records a `step_status` bitmask so one failed read doesn't
+  abort the rest.  Verbose `printf` at each step (gated by `DEBUG_FLAG_USB_PRINTF`).
+- Returns a fixed-layout byte blob to the host (idcode, ok, step_status, status,
+  feature_row, feabits, usercode, num_rows, rows…).
+- **Never touches camera power.**  The script powers camera 8 once via the
+  standard `OW_CAMERA_POWER_ON`, then `switch_camera(7)` (selects active cam +
+  TCA channel 7), then `OW_FACTORY_NVCM_CHECK`.
+
+SDK side: `MotionSensor.nvcm_check(operand, rows)` + `scripts/nvcm_probe.py`
+(connect left → debug flags `USB_PRINTF|CMD_VERBOSE` → power cam8 → switch cam8 →
+probe → parse + interpret).  Only camera 8 is touched.
+
+**Hypothesis under test:** on the known-programmed camera-8 part, at least one of
+{Feature Row ≠ 0, Status bit8 Done=1, NVCM row0 ≠ 0, USERCODE ≠ 0} will read as
+"programmed", giving an absolute signal that needs no blank reference.
+
+### Iteration log
+
+| Iter | FW change | Result | Next |
+|---|---|---|---|
+| 1 | add `OW_FACTORY_NVCM_CHECK` dump-everything probe | (pending hardware) | — |
