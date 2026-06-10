@@ -141,6 +141,14 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 	HAL_GPIO_Init(cam->detect_data_port, &gpio);
 
 	if (clk_low && data_low) {
+		/* The booted design drives this camera's bus clock; edges seen while
+		 * the pins were re-attached can leave the USART receiver bit-shifted
+		 * (every histogram bin reads multiplied by a power of two). Same
+		 * reset the SRAM programming path requires after fpga_configure(). */
+		if (cam->useUsart && cam->pUart != NULL) {
+			cam->pUart->Instance->CR1 &= ~USART_CR1_UE;
+			cam->pUart->Instance->CR1 |= USART_CR1_UE;
+		}
 		return true;
 	}
 
