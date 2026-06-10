@@ -1,13 +1,63 @@
 # FPGA NVCM Investigation — Handoff Document
 
-**Date:** 2026-06-08
-**Branch:** `feature/fpga-autodetect` (sensor-fw), `next` (SDK)
+**Date:** 2026-06-09 (updated)
+**Branch:** `feature/nvcm-programming` (sensor-fw), `next` (SDK)
 **Hardware:** Left sensor module, connected via USB
-**Next goal:** Investigate why camera 8's NVCM may not have programmed successfully
+**Status:** Camera 8 NVCM fully programmed and Done fuse burned
 
 ---
 
-## Key Finding: The Boot Test Is Invalid
+## Resolution: Off-By-One Bug in Firmware I2C Write-Read Handler
+
+**Root cause found and fixed.** The `OW_FACTORY_I2C_WRRD` handler in
+`Core/Src/if_factory_prog.c:179` read `write_data` from `&cmd->data[5]`
+but the SDK packs it at index 4:
+
+```
+SDK payload: [write_len_hi, write_len_lo, read_len_hi, read_len_lo, write_data...]
+                 data[0]       data[1]       data[2]       data[3]     data[4] ← correct
+Firmware read:                                                         data[5] ← was wrong
+```
+
+This shifted every byte sent via `i2c_write_read()` by one position. Every
+STATUS register read, every busy-wait poll, and every verify step during NVCM
+programming was sending garbage to the FPGA. The `i2c_write` and `i2c_read`
+handlers were NOT affected — only the combined write-read path.
+
+**Fix:** `&cmd->data[5]` → `&cmd->data[4]` (commit `1cb7700`).
+
+### NVCM Programming Results (Camera 8, Post-Fix)
+
+After flashing the fix, NVCM programming succeeded:
+
+| Discriminator | Before Fix | After Fix | Expected (Programmed) |
+|---|---|---|---|
+| NVCM rows (0x73) | 00×16 per row | Non-zero (real bitstream data) | Non-zero |
+| Feature Row (0xE7) | 00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 01 80 | Non-zero |
+| Done bit (STATUS bit 8) | 0 | **1** | 1 |
+| Feature Bits (0xFB) | 00 00 | 00 00 | Possibly zero (design-dependent) |
+| USERCODE (0xC0) | 00 00 00 00 | 00 00 00 00 | Design-dependent |
+| STATUS (0x3C) | 0x00001E02 | **0x00081F02** | Done=1 |
+
+Done fuse was burned using `openmotion-sdk/scripts/nvcm_burn_done.py`. The
+full `test_factory_prog.py` script programs NVCM rows and Feature Row but
+its ISC_PROGRAM_DONE wait may be insufficient — the standalone
+`nvcm_burn_done.py` with a 500ms post-command delay succeeded on first try.
+
+Done=1 persists across power cycles. Camera 8's NVCM is permanently programmed.
+
+### Notes
+
+- **FEABITS = 00 00** — may be intentionally zero in the algorithm, or may
+  need separate investigation. Not blocking auto-boot.
+- **CDONE pin** didn't go high in Saleae captures after Done burn. The user
+  design may not drive CDONE, or the capture window missed the transition.
+  The STATUS register Done bit is the authoritative source.
+- **Other cameras (4, 6, 7)** still have blank NVCM. Only camera 8 was programmed.
+
+---
+
+## Background: The Boot Test Is Invalid
 
 We spent several sessions building an NVCM auto-detection mechanism based on
 the assumption that a blank FPGA's I2C config port (0x40) would remain active
@@ -112,35 +162,16 @@ If the Done bit can't be trusted alone, a secondary check is whether the
 Feature Row is non-zero (it's programmed before Done and contains boot
 config). Both should be non-zero on a properly programmed device.
 
-## Next Investigation: Why Did Cam8's NVCM Programming Fail?
+## Resolved: Cam8's NVCM Was Blank (Not Previously Programmed)
 
-The user believes cam8 should have been NVCM-programmed. All evidence says
-it wasn't (or the programming didn't complete — Done bit not set). Possible
-explanations:
+The NVCM had never been successfully programmed. All prior attempts via the
+SDK's `test_factory_prog.py` were corrupted by the off-by-one bug — every
+`i2c_write_read` STATUS poll sent shifted bytes, so the FPGA never received
+correct commands during the programming flow. The script reported "PASSED"
+because its verify reads were also broken (garbage in, garbage out).
 
-1. **Programming was never attempted** on this particular device
-2. **Programming failed partway** — NVCM array may be partially written but
-   Done bit was never burned (the last step)
-3. **Programming succeeded on a different device** — this sensor module may
-   have been swapped or cam8's FPGA was replaced
-4. **The read-back path isn't working** — our reads may not reflect the true
-   NVCM state (least likely given the spec-consistent zero values)
-
-To investigate, the next agent should:
-
-1. **Check the NVCM programming history** — who programmed cam8, when, and
-   with what tool? Was it Diamond Programmer over I2C, or some other method?
-2. **Capture a Diamond Programmer NVCM programming session** — use Logic 2
-   to capture the I2C traffic during a real NVCM programming attempt. Compare
-   the command sequence to what we've been sending.
-3. **Try programming an FPGA's NVCM** — if all FPGAs are blank, you could
-   attempt NVCM programming on one of them to verify the write path works.
-   **Warning: NVCM is one-time programmable (OTP). A failed write is permanent.**
-4. **Check the Verify flow with PROG_TRIM** — the Lattice Verify flow requires
-   `PROG_TRIM (0xD1)` before reading NVCM. We tried this and got trim parameter
-   echoes (`14 F2 F0 44`) instead of real content. This may be correct behavior
-   for a blank device (sense amplifier outputs trim values when reading empty cells).
-   A programmed device should return non-zero content after trim.
+After fixing the firmware, NVCM programming succeeded on first attempt and
+the Done fuse was burned successfully.
 
 ---
 
@@ -284,19 +315,26 @@ Results:
 - On a truly blank device, the trim echo is expected — the sense amplifiers
   output the programmed trim values when reading empty cells.
 
-### Uncommitted Changes (on device now)
+### Committed Fix
 
-The firmware currently flashed has a **multi-checkpoint boot test** (probes
-at 50, 100, 150, 250, 500, 1000, 2000ms). This is a diagnostic build. The
-working tree has:
+- **`Core/Src/if_factory_prog.c`** — off-by-one fix in `OW_FACTORY_I2C_WRRD`
+  handler: `&cmd->data[5]` → `&cmd->data[4]` (commit `1cb7700` on
+  `feature/nvcm-programming`)
 
-- `crosslink.c` — multi-checkpoint boot test in `fpga_nvcm_probe()`
-- `camera_manager.c` — `fpga_detect_nvcm()` timing aligned (150ms, 2 trials)
-  but the function itself is still broken (uses the invalid boot test approach)
-- `crosslink.h` — header comments updated
-- `docs/fpga-nvcm-autodetect.md` — engineering notebook (partially updated,
-  missing the final "boot test is invalid" findings)
+### Firmware on Device
 
-These changes should NOT be committed as-is. The `fpga_detect_nvcm()` function
-needs to be rewritten to use the activation-key + Done-bit approach instead of
-the boot test, or removed entirely until NVCM programming is confirmed working.
+The left sensor is flashed with the fixed firmware (version
+`1.5.4-dev.1-12-gb47f75c-dirty` at time of NVCM burn — rebuild with the
+committed fix for a clean version string).
+
+### Remaining Work
+
+- `fpga_detect_nvcm()` in `camera_manager.c` still uses the invalid boot
+  test approach. It was rewritten on `feature/fpga-autodetect` (commit
+  `c40a6b4`) to use the Done-bit approach but may need further validation
+  now that NVCM programming is confirmed working.
+- Cameras 4, 6, 7 still have blank NVCM — can be programmed using the same
+  flow now that the I2C bug is fixed.
+- `test_factory_prog.py` may need a longer wait after ISC_PROGRAM_DONE
+  (the standalone `nvcm_burn_done.py` uses 500ms and succeeded; the algo
+  script's built-in wait may be shorter).

@@ -59,8 +59,10 @@ static HAL_StatusTypeDef TCA9548A_WriteControl(I2C_HandleTypeDef *hi2c, uint8_t 
         printf("requested: 0x%02X current: 0x%02X addr: 0x%02X ret: %d err: %lu\r\n",
                data, I2C_current_target, address, ret, hi2c->ErrorCode);
 
-        /* Recover bus by resetting mux state machine and deselecting channels. */
         TCA9548A_ResetHardware();
+        if (attempt >= 1) {
+            I2C_BusRecovery(hi2c);
+        }
     }
 
     return ret;
@@ -213,16 +215,6 @@ HAL_StatusTypeDef TCA9548A_SelectBroadcast(I2C_HandleTypeDef *hi2c, uint8_t addr
     return TCA9548A_WriteControl(hi2c, address, data);
 }
 
-HAL_StatusTypeDef TCA9548A_EnableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel)
-{
-    if (channel > 7) {
-        return HAL_ERROR;
-    }
-
-    uint8_t data = (uint8_t)(I2C_current_target | (1u << channel));
-    return TCA9548A_WriteControl(hi2c, address, data);
-}
-
 HAL_StatusTypeDef TCA9548A_DisableChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel)
 {
     if (channel > 7) {
@@ -231,4 +223,58 @@ HAL_StatusTypeDef TCA9548A_DisableChannel(I2C_HandleTypeDef *hi2c, uint8_t addre
 
     uint8_t data = (uint8_t)(I2C_current_target & (uint8_t)~(1u << channel));
     return TCA9548A_WriteControl(hi2c, address, data);
+}
+
+HAL_StatusTypeDef TCA9548A_DisableAll(I2C_HandleTypeDef *hi2c, uint8_t address)
+{
+    return TCA9548A_WriteControl(hi2c, address, 0x00);
+}
+
+void I2C_BusRecovery(I2C_HandleTypeDef *hi2c)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    /* I2C1: PB8 = SCL, PB7 = SDA, AF4 */
+    HAL_I2C_DeInit(hi2c);
+
+    gpio.Pin = GPIO_PIN_8;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = GPIO_PIN_7;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+
+    /* Clock out up to 9 bits to free a slave holding SDA low. */
+    for (int i = 0; i < 9; i++) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+        delay_us(5);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+        delay_us(5);
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET)
+            break;
+    }
+
+    /* Generate STOP: SDA low → SCL high → SDA high. */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+    delay_us(5);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    delay_us(5);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+    delay_us(5);
+
+    /* Restore AF and reinit. */
+    gpio.Pin = GPIO_PIN_7 | GPIO_PIN_8;
+    gpio.Mode = GPIO_MODE_AF_OD;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    HAL_I2C_Init(hi2c);
+    I2C_current_target = 0x00;
+    printf("I2C bus recovery complete\r\n");
 }
