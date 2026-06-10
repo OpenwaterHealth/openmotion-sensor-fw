@@ -81,6 +81,19 @@ the fixed parser:
 4. Firmware pin-sampling detect: `C8: NVCM detect clk=0 data=0` →
    "NVCM programmed, skipping SRAM load".
 
+The same chain was repeated on the right sensor module (reflashed to the
+current firmware) with camera 1 — a **USART**-connected FPGA (USART2,
+detect pins PA4/PD6): burn PASSED with verification, auto-boots,
+`C1: NVCM detect clk=0 data=0` → SRAM load skipped. Combined with the
+blank-camera results, both bus types are validated in both NVCM states:
+
+| Camera | Bus | NVCM | Detect |
+|---|---|---|---|
+| left 8 (new module) | SPI4 | programmed | clk=0 data=0 → skip |
+| right 1 | USART2 | programmed | clk=0 data=0 → skip |
+| left 4 | USART6 | blank | clk=1 data=1 → SRAM |
+| left 7 | SPI2 | blank | clk=1 data=1 → SRAM |
+
 ## Outstanding
 
 - Burns are slower with real polling (real busy-waits + full verify).
