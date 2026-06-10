@@ -1,0 +1,340 @@
+# FPGA NVCM Investigation — Handoff Document
+
+**Date:** 2026-06-09 (updated)
+**Branch:** `feature/nvcm-programming` (sensor-fw), `next` (SDK)
+**Hardware:** Left sensor module, connected via USB
+**Status:** Camera 8 NVCM fully programmed and Done fuse burned
+
+---
+
+## Resolution: Off-By-One Bug in Firmware I2C Write-Read Handler
+
+**Root cause found and fixed.** The `OW_FACTORY_I2C_WRRD` handler in
+`Core/Src/if_factory_prog.c:179` read `write_data` from `&cmd->data[5]`
+but the SDK packs it at index 4:
+
+```
+SDK payload: [write_len_hi, write_len_lo, read_len_hi, read_len_lo, write_data...]
+                 data[0]       data[1]       data[2]       data[3]     data[4] ← correct
+Firmware read:                                                         data[5] ← was wrong
+```
+
+This shifted every byte sent via `i2c_write_read()` by one position. Every
+STATUS register read, every busy-wait poll, and every verify step during NVCM
+programming was sending garbage to the FPGA. The `i2c_write` and `i2c_read`
+handlers were NOT affected — only the combined write-read path.
+
+**Fix:** `&cmd->data[5]` → `&cmd->data[4]` (commit `1cb7700`).
+
+### NVCM Programming Results (Camera 8, Post-Fix)
+
+After flashing the fix, NVCM programming succeeded:
+
+| Discriminator | Before Fix | After Fix | Expected (Programmed) |
+|---|---|---|---|
+| NVCM rows (0x73) | 00×16 per row | Non-zero (real bitstream data) | Non-zero |
+| Feature Row (0xE7) | 00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 01 80 | Non-zero |
+| Done bit (STATUS bit 8) | 0 | **1** | 1 |
+| Feature Bits (0xFB) | 00 00 | 00 00 | Possibly zero (design-dependent) |
+| USERCODE (0xC0) | 00 00 00 00 | 00 00 00 00 | Design-dependent |
+| STATUS (0x3C) | 0x00001E02 | **0x00081F02** | Done=1 |
+
+Done fuse was burned using `openmotion-sdk/scripts/nvcm_burn_done.py`. The
+full `test_factory_prog.py` script programs NVCM rows and Feature Row but
+its ISC_PROGRAM_DONE wait may be insufficient — the standalone
+`nvcm_burn_done.py` with a 500ms post-command delay succeeded on first try.
+
+Done=1 persists across power cycles. Camera 8's NVCM is permanently programmed.
+
+### Notes
+
+- **FEABITS = 00 00** — may be intentionally zero in the algorithm, or may
+  need separate investigation. Not blocking auto-boot.
+- **CDONE pin** didn't go high in Saleae captures after Done burn. The user
+  design may not drive CDONE, or the capture window missed the transition.
+  The STATUS register Done bit is the authoritative source.
+- **Other cameras (4, 6, 7)** still have blank NVCM. Only camera 8 was programmed.
+
+---
+
+## Background: The Boot Test Is Invalid
+
+We spent several sessions building an NVCM auto-detection mechanism based on
+the assumption that a blank FPGA's I2C config port (0x40) would remain active
+after CRESETB release, while a programmed FPGA's port would disappear (user
+design boots and reassigns I2C pins).
+
+**This assumption is wrong.** The Lattice CrossLink spec (Section 4.3–4.4 of
+the Programming & Config User Guide) states:
+
+> "If no Activation Key is received and CRESETB pin is released HIGH, the
+> device enters Master Configuration Mode and boots from the location
+> specified in the BOOT_UP_SEQUENCE preference."
+
+> "If the CrossLink device does not find any valid configuration data, only
+> the Slave SPI (SSPI) or Slave I2C modes may be used to program the device.
+> **An external SPI Master or I2C Master needs to write the Activation Key**
+> to the FPGA to enter one of these modes."
+
+The I2C slave config port at 0x40 is **only active after the activation key
+is sent**. Without the key, 0x40 does NOT respond — regardless of NVCM state.
+Both blank and programmed FPGAs show identical behavior: 0x40 gone.
+
+Confirmed empirically: we probed 0x40 at 50ms, 100ms, 150ms, 250ms, 500ms,
+1000ms, and 2000ms after CRESETB release (no activation key). **0x40 never
+responded on any camera at any timepoint.**
+
+## All Available Evidence Points to Blank NVCM
+
+Every NVCM discriminator we can read (via forced slave config with activation
+key) returns values consistent with a blank/unprogrammed device:
+
+| Discriminator | Cam8 Value | Blank Default (per spec) | Programmed Expected |
+|---|---|---|---|
+| Done bit (STATUS bit 8) | **0** | 0 | 1 |
+| Feature Row (0xE7) | 00 00 00 00 00 00 00 00 | 00×8 | non-zero |
+| Feature Bits (0xFB) | 00 00 | 00 00 | non-zero |
+| USERCODE (0xC0) | 00 00 00 00 | 00 00 00 00 | design-dependent |
+| NVCM rows (0x73) | 00×16 per row | 00×16 | non-zero |
+| STATUS (0x3C) | 0x00001E02 | — | bit 8 Done=1 |
+
+The Done bit is the most important signal. It's the **last step** of NVCM
+programming (opcode `ISC_PROGRAM_DONE = 0x5E`). If it's not set, the FPGA
+won't try to auto-boot from NVCM. It's 0 on all cameras tested.
+
+## Full Left Sensor Module Camera Map
+
+| Camera | TCA Ch | FPGA Present | IDCODE | All Reads |
+|--------|--------|-------------|--------|-----------|
+| 1 | 0 | **NO** — activation fails, all 0xFF | — | bus idle |
+| 2 | 1 | **NO** | — | bus idle |
+| 3 | 2 | **NO** | — | bus idle |
+| 4 | 3 | **YES** — IDCODE 01 2C 00 43 | ok | all zeros |
+| 5 | 4 | **NO** | — | bus idle |
+| 6 | 5 | **YES** | ok | all zeros |
+| 7 | 6 | **YES** | ok | all zeros |
+| 8 | 7 | **YES** | ok | all zeros |
+
+4 populated FPGAs (cams 4, 6, 7, 8), 4 depopulated positions (cams 1, 2, 3, 5).
+All 4 present FPGAs show identical readings — all zeros, Done bit not set.
+
+## What `fpga_detect_nvcm()` Actually Does (and Why It's Wrong)
+
+**Note:** This function was added on `feature/fpga-autodetect` (commit
+`0eb5a92`) and has never been merged to `main` or `next`. Production firmware
+always SRAM-programs every FPGA unconditionally. No shipped systems are affected.
+
+The feature-branch detection function in `camera_manager.c:109` does:
+1. Power on camera
+2. Select TCA mux channel
+3. CRESETB low (5ms) → CRESETB high (no activation key) → wait 150ms
+4. `HAL_I2C_IsDeviceReady(0x40)` — check for ACK
+5. No ACK → return `true` ("NVCM programmed, skip SRAM load")
+
+This returns `true` for **every FPGA** (blank or programmed) because 0x40
+never responds without the activation key. It also returns `true` for
+depopulated camera positions (no FPGA = no ACK). The function will
+incorrectly skip SRAM loading on ALL cameras, causing the system to not work.
+
+**Both `program_fpga()` and `program_sram_fpga()` call this function** when
+`force_update=false`. If merged as-is, no camera would ever get SRAM loaded.
+
+## Correct Detection Approach (For Future Implementation)
+
+To reliably detect NVCM programming, use the activation key to enter forced
+slave config mode and read discriminators:
+
+```
+CRESETB low → activation key (FF A4 C6 F4 8A) → CRESETB high → 10ms delay
+IDCODE (0xE0)  → must be 01 2C 00 43 (FPGA present)
+ISC_ENABLE (0xC6 0x02)  → NVCM mode with read-enable
+STATUS (0x3C)  → check bit 8 (Done)
+  Done=1 → NVCM is programmed → can skip SRAM load
+  Done=0 → NVCM is blank → needs SRAM load
+ISC_DISABLE (0x26)
+```
+
+The Done bit is the definitive signal. It's the last thing programmed during
+NVCM programming and controls whether the FPGA attempts auto-boot from NVCM.
+**Do not use the boot test (CRESETB release without activation key).**
+
+If the Done bit can't be trusted alone, a secondary check is whether the
+Feature Row is non-zero (it's programmed before Done and contains boot
+config). Both should be non-zero on a properly programmed device.
+
+## Resolved: Cam8's NVCM Was Blank (Not Previously Programmed)
+
+The NVCM had never been successfully programmed. All prior attempts via the
+SDK's `test_factory_prog.py` were corrupted by the off-by-one bug — every
+`i2c_write_read` STATUS poll sent shifted bytes, so the FPGA never received
+correct commands during the programming flow. The script reported "PASSED"
+because its verify reads were also broken (garbage in, garbage out).
+
+After fixing the firmware, NVCM programming succeeded on first attempt and
+the Done fuse was burned successfully.
+
+---
+
+## Tools and Environment
+
+### Hardware Setup
+
+- **Sensor module:** Left sensor, connected via USB (composite device:
+  COMMS on IF0, HISTO on IF1, IMU on IF2)
+- **USB IDs:** Sensor VID `0x0483` PID `0x5A5A`, DFU bootloader PID `0xDF11`
+- **Power control:** Shelly smart plug at `192.168.1.81` — controls power to
+  the console (which power-cycles the sensors)
+- **Logic analyzer:** Saleae Logic Pro 16, device ID `F7E3BA8F5A116A9A`
+  - Channel mapping: D0=CRESETB, D3=**SCL**, D6=**SDA**, D7=GPIO1/CDONE
+  - **Labels in Logic 2 may be backwards** — always configure I2C analyzer
+    as SCL=Ch3, SDA=Ch6
+  - 1.8V logic threshold, 50 MHz sample rate for I2C captures
+
+### Software / Scripts
+
+| Tool | Location | Purpose |
+|---|---|---|
+| `nvcm_probe.py` | `openmotion-sdk/scripts/nvcm_probe.py` | Main NVCM probe script. Connects to left sensor, powers camera, runs `OW_FACTORY_NVCM_CHECK`, parses + displays results. |
+| `deploy.py` | `openmotion-sensor-fw/scripts/deploy.py` | Flash firmware via DFU. `--device left --no-confirm` for left sensor. |
+| `shelly.py` | `openmotion-bloodflow-app/tests/shelly.py` | Power cycle via Shelly smart plug. `--host 192.168.1.81 cycle --off-time 5.0` |
+| `dfu-util` | `openmotion-sdk/omotion/dfu-util/win64/dfu-util.exe` | Low-level DFU flash tool (called by deploy.py). |
+| Logic 2 MCP | Available as `logic2` MCP server tools | Control Saleae Logic 2 from Claude Code. |
+
+### Build Commands
+
+```powershell
+# Configure (downloads FPGA bitstream from GitHub — needs internet)
+cmake --preset Debug
+
+# Build
+cmake --build build/Debug
+
+# Output: build/Debug/motion-sensor-fw.{elf,hex,bin,map}
+```
+
+### Flash + Power Cycle + Probe Workflow
+
+```powershell
+# 1. Build
+cmake --build build/Debug
+
+# 2. Flash (from repo root or parent)
+python openmotion-sensor-fw/scripts/deploy.py --device left --no-confirm
+#    Exit code 74 from dfu-util is BENIGN — sensor needs power cycle after DFU
+
+# 3. Power cycle (mandatory after DFU flash)
+python openmotion-bloodflow-app/tests/shelly.py --host 192.168.1.81 cycle --off-time 5.0
+
+# 4. Wait ~8 seconds for sensor to boot and USB to enumerate
+
+# 5. Probe
+python openmotion-sdk/scripts/nvcm_probe.py --camera 8 --operand 0x02 --rows 4
+#    --camera N     : which camera to probe (1-8)
+#    --operand 0xNN : ISC_ENABLE operand (0x02=NVCM read-enable, 0x08=NVCM no read-enable)
+#    --rows N       : number of 16-byte NVCM rows to read (0-8)
+#    --no-power     : skip powering on the camera (if already powered)
+```
+
+### Power Safety Rules
+
+- **Only ONE camera powered at a time.** The probe script powers on the
+  target but does NOT power off others. Always power cycle between cameras.
+- If `0x70` (TCA9548A mux) starts timing out (`err 0x20`), recover with a
+  full power cycle via Shelly.
+- The probe path (mux select + CRESETB + I2C) is TCA-safe; camera power
+  transitions are dangerous.
+
+### Key Firmware Files
+
+| File | Purpose |
+|---|---|
+| `Core/Src/crosslink.c` | FPGA I2C functions. `fpga_nvcm_probe()` is the diagnostic probe, `fpga_configure()` is the SRAM programming flow. |
+| `Core/Inc/crosslink.h` | Probe result struct `fpga_nvcm_probe_t`, step bitmask defines. |
+| `Core/Src/camera_manager.c` | `fpga_detect_nvcm()` (broken production detector at line 109), `program_fpga()`, `program_sram_fpga()`. Camera array init with per-camera CRESETB/power/TCA assignments. |
+| `Core/Src/if_commands.c` | Command dispatcher. `OW_FPGA_PROG_SRAM` at line 378, `OW_FACTORY_NVCM_CHECK` handled in `if_factory_prog.c`. |
+| `Core/Inc/common.h` | Command enum definitions. |
+
+### Key SDK Files
+
+| File | Purpose |
+|---|---|
+| `omotion/MotionSensor.py` | `nvcm_check(operand, rows)` — sends `OW_FACTORY_NVCM_CHECK` and returns raw response bytes. |
+| `omotion/config.py` | Enum `OW_FACTORY_NVCM_CHECK = 0x6C`. |
+| `scripts/nvcm_probe.py` | CLI probe script — parses the `fpga_nvcm_probe_t` binary blob and displays a human-readable report. |
+
+### Reference Documents
+
+| Document | Location |
+|---|---|
+| CrossLink I2C NVCM Programming Spec | `C:\Users\ethan\Projects\C175812-012925_I2C_Crosslink NVCM Programming 1.0.pdf` |
+| CrossLink Programming & Config User Guide | `C:\Users\ethan\Projects\CrossLink-Programming-Config-User-Guide.pdf` |
+| Engineering notebook | `openmotion-sensor-fw/docs/fpga-nvcm-autodetect.md` |
+
+### Logic 2 Capture Files
+
+All in `openmotion-sensor-fw/docs/captures/`:
+
+| File | Contents |
+|---|---|
+| `nvcm-probe-capture3-1v8.sal` | Clean capture of full probe (1.8V, 50MHz) |
+| `nvcm-probe-i2c-corrected.csv` | I2C decode with correct SCL/SDA assignment |
+| `nvcm-trim-probe.sal` | Capture of probe with PROG_TRIM step |
+| `nvcm-trim-probe-i2c.csv` | I2C decode of trim probe |
+
+### Relevant Spec Sections
+
+- **Section 4.3** (Config User Guide): Activation key required for slave port access
+- **Section 4.4**: Boot sequence — NVCM-EXT default, activation key needed after failed boot
+- **Section 5.5**: I2C Configuration Mode
+- **Table C.1** (Appendix C): Status register bit definitions — bit 8 = Done, bit 12 = Busy, bit 13 = Fail
+- **Table 7.1**: Feature Row definition — all zeros = HW default (blank)
+- **NVCM Programming Spec, Figure 2**: NVCM Program flow — Done bit is last step
+- **NVCM Programming Spec, Figure 3**: NVCM Verify flow — PROG_TRIM required before reads
+- **NVCM Programming Spec, Table 9**: ISC_ENABLE operand definitions — bit 1 = NVCM read-enable
+- **NVCM Programming Spec, Table 24**: Extended status register — bit 7 = Done, bit 6 = NVCM blank check
+
+### PROG_TRIM Experiment Summary
+
+The Lattice Verify flow requires `PROG_TRIM (0xD1)` before NVCM read-back.
+We implemented this:
+
+```
+ISC_ENABLE_X (0x74, operand 0x04)    — transparent mode, SRAM write
+PROG_TRIM (0xD1, operands 00 20 00, data 14 F2 F0 44 00 00 00 00)
+ISC_DISABLE (0x26)
+```
+
+Results:
+- First run after power-on: NVCM rows read `14 F2 F0 44 00×12` — the trim
+  parameter bytes echoing through the sense amplifier. Not real NVCM content.
+- Second run (no power cycle): all zeros.
+- **PROG_TRIM's volatile state survives CRESETB toggle** and prevents the FPGA
+  from auto-booting. This poisoned the boot test (caused a programmed FPGA to
+  appear blank). We removed the trim step from the probe and restructured to
+  run the boot test first.
+- On a truly blank device, the trim echo is expected — the sense amplifiers
+  output the programmed trim values when reading empty cells.
+
+### Committed Fix
+
+- **`Core/Src/if_factory_prog.c`** — off-by-one fix in `OW_FACTORY_I2C_WRRD`
+  handler: `&cmd->data[5]` → `&cmd->data[4]` (commit `1cb7700` on
+  `feature/nvcm-programming`)
+
+### Firmware on Device
+
+The left sensor is flashed with the fixed firmware (version
+`1.5.4-dev.1-12-gb47f75c-dirty` at time of NVCM burn — rebuild with the
+committed fix for a clean version string).
+
+### Remaining Work
+
+- `fpga_detect_nvcm()` in `camera_manager.c` still uses the invalid boot
+  test approach. It was rewritten on `feature/fpga-autodetect` (commit
+  `c40a6b4`) to use the Done-bit approach but may need further validation
+  now that NVCM programming is confirmed working.
+- Cameras 4, 6, 7 still have blank NVCM — can be programmed using the same
+  flow now that the I2C bug is fixed.
+- `test_factory_prog.py` may need a longer wait after ISC_PROGRAM_DONE
+  (the standalone `nvcm_burn_done.py` uses 500ms and succeeded; the algo
+  script's built-in wait may be shorter).

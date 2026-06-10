@@ -90,6 +90,72 @@ static bool camera_request_is_valid(uint8_t cam_id) {
 }
 
 
+/**
+ * Detect whether a CrossLink FPGA has been permanently programmed via NVCM.
+ *
+ * Method: enter forced slave config mode (activation key + CRESETB), read the
+ * STATUS register Done bit.  Done=1 means NVCM was fully programmed (the Done
+ * bit is the last step burned during NVCM programming and gates auto-boot).
+ *
+ * The slave I2C config port at 0x40 requires the activation key to become
+ * active — without it, 0x40 never responds regardless of NVCM state.
+ */
+static bool fpga_detect_nvcm(CameraDevice *cam)
+{
+	GPIO_InitTypeDef gpio = {0};
+
+	/* Deselect all TCA channels before toggling CRESETB — a resetting FPGA
+	 * can glitch the I2C bus through an open mux channel. */
+	TCA9548A_DisableAll(&hi2c1, 0x70);
+
+	gpio.Mode = GPIO_MODE_INPUT;
+	gpio.Pull = GPIO_NOPULL;
+	gpio.Speed = GPIO_SPEED_FREQ_LOW;
+
+	gpio.Pin = cam->detect_clk_pin;
+	HAL_GPIO_Init(cam->detect_clk_port, &gpio);
+	gpio.Pin = cam->detect_data_pin;
+	HAL_GPIO_Init(cam->detect_data_port, &gpio);
+
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	delay_ms(5);
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
+	delay_ms(100);
+
+	bool clk_low  = HAL_GPIO_ReadPin(cam->detect_clk_port, cam->detect_clk_pin) == GPIO_PIN_RESET;
+	bool data_low = HAL_GPIO_ReadPin(cam->detect_data_port, cam->detect_data_pin) == GPIO_PIN_RESET;
+	if ((logging_get_debug_flags() & DEBUG_FLAG_CMD_VERBOSE) != 0u) {
+		printf("C%d: NVCM detect clk=%d data=%d\r\n", cam->id + 1, !clk_low, !data_low);
+	}
+
+	/* Restore pins to their peripheral alternate function. */
+	gpio.Mode = GPIO_MODE_AF_PP;
+	gpio.Pull = GPIO_NOPULL;
+	gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+
+	gpio.Pin = cam->detect_clk_pin;
+	gpio.Alternate = cam->detect_clk_af;
+	HAL_GPIO_Init(cam->detect_clk_port, &gpio);
+	gpio.Pin = cam->detect_data_pin;
+	gpio.Alternate = cam->detect_data_af;
+	HAL_GPIO_Init(cam->detect_data_port, &gpio);
+
+	if (clk_low && data_low) {
+		/* The booted design drives this camera's bus clock; edges seen while
+		 * the pins were re-attached can leave the USART receiver bit-shifted
+		 * (every histogram bin reads multiplied by a power of two). Same
+		 * reset the SRAM programming path requires after fpga_configure(). */
+		if (cam->useUsart && cam->pUart != NULL) {
+			cam->pUart->Instance->CR1 &= ~USART_CR1_UE;
+			cam->pUart->Instance->CR1 |= USART_CR1_UE;
+		}
+		return true;
+	}
+
+	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	return false;
+}
+
 static void init_camera(CameraDevice *cam){
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -146,6 +212,12 @@ void init_camera_sensors() {
 	cam_array[0].pUart = &husart2;
 	cam_array[0].i2c_target = 0;
 	cam_array[0].pRecieveHistoBuffer = NULL;
+	cam_array[0].detect_clk_port = GPIOA;
+	cam_array[0].detect_clk_pin = GPIO_PIN_4;
+	cam_array[0].detect_clk_af = GPIO_AF7_USART2;
+	cam_array[0].detect_data_port = GPIOD;
+	cam_array[0].detect_data_pin = GPIO_PIN_6;
+	cam_array[0].detect_data_af = GPIO_AF7_USART2;
 
 	cam_array[1].id = 1;
 	cam_array[1].cresetb_port = CRESET_2_GPIO_Port;
@@ -164,6 +236,12 @@ void init_camera_sensors() {
 	cam_array[1].pUart = NULL;
 	cam_array[1].i2c_target = 1;
 	cam_array[1].pRecieveHistoBuffer = NULL;
+	cam_array[1].detect_clk_port = GPIOB;
+	cam_array[1].detect_clk_pin = GPIO_PIN_3;
+	cam_array[1].detect_clk_af = GPIO_AF8_SPI6;
+	cam_array[1].detect_data_port = GPIOA;
+	cam_array[1].detect_data_pin = GPIO_PIN_7;
+	cam_array[1].detect_data_af = GPIO_AF8_SPI6;
 
 	cam_array[2].id = 2;
 	cam_array[2].cresetb_port = CRESET_3_GPIO_Port;
@@ -182,6 +260,12 @@ void init_camera_sensors() {
 	cam_array[2].pUart = &husart3;
 	cam_array[2].i2c_target = 2;
 	cam_array[2].pRecieveHistoBuffer = NULL;
+	cam_array[2].detect_clk_port = GPIOD;
+	cam_array[2].detect_clk_pin = GPIO_PIN_10;
+	cam_array[2].detect_clk_af = GPIO_AF7_USART3;
+	cam_array[2].detect_data_port = GPIOD;
+	cam_array[2].detect_data_pin = GPIO_PIN_9;
+	cam_array[2].detect_data_af = GPIO_AF7_USART3;
 
 	cam_array[3].id = 3;
 	cam_array[3].cresetb_port = CRESET_4_GPIO_Port;
@@ -200,6 +284,12 @@ void init_camera_sensors() {
 	cam_array[3].pUart = &husart6;
 	cam_array[3].i2c_target = 3;
 	cam_array[3].pRecieveHistoBuffer = NULL;
+	cam_array[3].detect_clk_port = GPIOC;
+	cam_array[3].detect_clk_pin = GPIO_PIN_8;
+	cam_array[3].detect_clk_af = GPIO_AF7_USART6;
+	cam_array[3].detect_data_port = GPIOC;
+	cam_array[3].detect_data_pin = GPIO_PIN_7;
+	cam_array[3].detect_data_af = GPIO_AF7_USART6;
 
 	cam_array[4].id = 4;
 	cam_array[4].cresetb_port = CRESET_5_GPIO_Port;
@@ -218,6 +308,12 @@ void init_camera_sensors() {
 	cam_array[4].pUart = &husart1;
 	cam_array[4].i2c_target = 4;
 	cam_array[4].pRecieveHistoBuffer = NULL;
+	cam_array[4].detect_clk_port = GPIOA;
+	cam_array[4].detect_clk_pin = GPIO_PIN_8;
+	cam_array[4].detect_clk_af = GPIO_AF7_USART1;
+	cam_array[4].detect_data_port = GPIOB;
+	cam_array[4].detect_data_pin = GPIO_PIN_15;
+	cam_array[4].detect_data_af = GPIO_AF4_USART1;
 
 	cam_array[5].id = 5;
 	cam_array[5].cresetb_port = CRESET_6_GPIO_Port;
@@ -236,6 +332,12 @@ void init_camera_sensors() {
 	cam_array[5].pUart = NULL;
 	cam_array[5].i2c_target = 5;
 	cam_array[5].pRecieveHistoBuffer = NULL;
+	cam_array[5].detect_clk_port = GPIOC;
+	cam_array[5].detect_clk_pin = GPIO_PIN_10;
+	cam_array[5].detect_clk_af = GPIO_AF6_SPI3;
+	cam_array[5].detect_data_port = GPIOB;
+	cam_array[5].detect_data_pin = GPIO_PIN_2;
+	cam_array[5].detect_data_af = GPIO_AF7_SPI3;
 
 	cam_array[6].id = 6;
 	cam_array[6].cresetb_port = CRESET_7_GPIO_Port;
@@ -254,6 +356,12 @@ void init_camera_sensors() {
 	cam_array[6].pUart = NULL;
 	cam_array[6].i2c_target = 6;
 	cam_array[6].pRecieveHistoBuffer = NULL;
+	cam_array[6].detect_clk_port = GPIOA;
+	cam_array[6].detect_clk_pin = GPIO_PIN_9;
+	cam_array[6].detect_clk_af = GPIO_AF5_SPI2;
+	cam_array[6].detect_data_port = GPIOC;
+	cam_array[6].detect_data_pin = GPIO_PIN_1;
+	cam_array[6].detect_data_af = GPIO_AF5_SPI2;
 
 	cam_array[7].id = 7;
 	cam_array[7].cresetb_port = CRESET_8_GPIO_Port;
@@ -272,6 +380,12 @@ void init_camera_sensors() {
 	cam_array[7].pUart = NULL;
 	cam_array[7].i2c_target = 7;
 	cam_array[7].pRecieveHistoBuffer = NULL;
+	cam_array[7].detect_clk_port = GPIOE;
+	cam_array[7].detect_clk_pin = GPIO_PIN_2;
+	cam_array[7].detect_clk_af = GPIO_AF5_SPI4;
+	cam_array[7].detect_data_port = GPIOE;
+	cam_array[7].detect_data_pin = GPIO_PIN_6;
+	cam_array[7].detect_data_af = GPIO_AF5_SPI4;
 
 
 	for(i=0; i<CAMERA_COUNT; i++){
@@ -717,8 +831,13 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 	if(!force_update)
 	{
 		if(cam->isProgrammed) return true;
+		if(fpga_detect_nvcm(cam)){
+			cam->isProgrammed = true;
+			printf("NVCM programmed, skipping\r\n");
+			return true;
+		}
 	} else {
-		cam->isProgrammed = false; // set programmed to false and Program FPGA
+		cam->isProgrammed = false;
 	}
 
 	if(TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK)
@@ -752,11 +871,15 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 	if(!force_update)
 	{
 		if(cam->isProgrammed){
-			// printf("already programmed\r\n");
 			return true;
-		} 
+		}
+		if(fpga_detect_nvcm(cam)){
+			cam->isProgrammed = true;
+			printf("C%d: NVCM programmed, skipping SRAM load\r\n", cam_id+1);
+			return true;
+		}
 	} else {
-		cam->isProgrammed = false; // set isProgrammed to false and program FPGA
+		cam->isProgrammed = false;
 	}
 
 	if(TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK)
@@ -1865,10 +1988,12 @@ _Bool enable_camera_power(uint8_t cam_id){
 
 	HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET); // Set power pin high
 	cam->isPowered = true;
-	if (TCA9548A_EnableChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
-		printf("Failed to enable mux channel for Camera %d\r\n", cam_id + 1);
-		return false;
-	}
+	/* Do NOT select the mux channel here. A freshly powered CrossLink with
+	 * blank/unloaded config drives its config pins during its boot attempt,
+	 * and those are the same physical pins as this mux channel — connecting
+	 * the channel now clamps the shared I2C bus and the next transaction
+	 * times out. Every I2C consumer (temp poll, FPGA programming, camera
+	 * config) selects the channel itself right before transacting. */
 
 	printf("Enabled Power for Camera %d\r\n", cam_id+1);
 	return true;

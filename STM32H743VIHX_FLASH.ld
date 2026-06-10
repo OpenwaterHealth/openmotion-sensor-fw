@@ -155,6 +155,15 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM_D1
 
+  /* Persistent across soft/IWDG reset; not zeroed by startup */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM_D1
+
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack :
   {

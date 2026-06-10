@@ -72,6 +72,7 @@ typedef enum {
 	OW_IMU = 0xE8,
 	OW_I2C_PASSTHRU = 0xE9,
 	OW_CONTROLLER = 0xEA,
+	OW_FPGA_PROG = 0xEB,
 	OW_BAD_PARSE = 0xEC,
 	OW_BAD_CRC = 0xED,
 	OW_UNKNOWN = 0xEE,
@@ -152,6 +153,15 @@ typedef enum {
 	OW_CAMERA_READ_SECURITY_UID = 0x53,
 
 } MotionCameraCommands;
+
+typedef enum {
+	OW_FACTORY_I2C_SCAN = 0x60,
+	OW_FACTORY_CRESET = 0x68,
+	OW_FACTORY_I2C_RD = 0x69,
+	OW_FACTORY_I2C_WR = 0x6A,
+	OW_FACTORY_I2C_WRRD = 0x6B,
+	OW_FACTORY_NVCM_CHECK = 0x6C,
+} MotionFactoryCommands;
 
 typedef enum {
 	OW_CTRL_FAN_CTL = 0x0A,

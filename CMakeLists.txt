@@ -103,6 +103,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/uart_comms.c
     Core/Src/flash_eeprom.c
     Core/Src/motion_config.c
+    Core/Src/system_monitor.c
+    Core/Src/if_factory_prog.c
+    Core/Src/ram_scrub.c
     Core/Src/utils.c
     USB/Core/Src/usbd_ioreq.c
     USB/Core/Src/usbd_desc.c
@@ -196,3 +199,20 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
     COMMENT "Generating .hex/.bin and merging FPGA bitstream at ${FPGA_BITSTREAM_ADDR}"
 )
 
+# Build + DFU-flash targets, one per sensor side. Invokes scripts/deploy.py.
+# `--device` is required by the script, so we expose two separate targets.
+find_program(PYTHON_FOR_DEPLOY NAMES python3 python)
+if(PYTHON_FOR_DEPLOY)
+    foreach(SIDE left right)
+        add_custom_target(flash-${SIDE}
+            COMMAND ${PYTHON_FOR_DEPLOY} ${CMAKE_SOURCE_DIR}/scripts/deploy.py
+                    --device ${SIDE} --config $<CONFIG> --no-build
+            DEPENDS ${CMAKE_PROJECT_NAME}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            USES_TERMINAL
+            COMMENT "Flashing ${CMAKE_PROJECT_NAME} (${SIDE} sensor) via DFU"
+        )
+    endforeach()
+else()
+    message(WARNING "Python not found — `flash-left`/`flash-right` targets will not be available")
+endif()

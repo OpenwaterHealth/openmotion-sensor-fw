@@ -6,8 +6,8 @@ on:
     branches: [ "main", "next" ]
     tags:
       - "*.*.*"
-      - "v*.*.*"
-      - "pre-*"
+      - "*.*.*-rc.*"
+      - "*.*.*-dev.*"
   release:
     types: [created]
 
@@ -65,7 +65,7 @@ jobs:
 
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
-          if [[ "$TAG_NAME" == pre-* ]] || [[ "$TAG_NAME" == *"-rc"* ]] || [[ "$TAG_NAME" == *"-beta"* ]]; then
+          if [[ "$TAG_NAME" == *"-rc."* ]] || [[ "$TAG_NAME" == *"-dev."* ]]; then
             echo "prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "prerelease=false" >> $GITHUB_OUTPUT

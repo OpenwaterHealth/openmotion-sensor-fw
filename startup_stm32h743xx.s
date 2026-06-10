@@ -65,6 +65,12 @@ Reset_Handler:
 /* Call the clock system initialization function.*/
   bl  SystemInit
 
+/* Seed ECC syndromes on every SRAM bank before .data/.bss init so that
+   the first byte/halfword store to a never-written 64-bit line does not
+   latch spurious SEDCF+DEDF in the RAMECC controller. ram_scrub() uses
+   only its own stack frame and no global/static state. */
+  bl  ram_scrub
+
 /* Copy the data segment initializers from flash to SRAM */
   ldr r0, =_sdata
   ldr r1, =_edata
