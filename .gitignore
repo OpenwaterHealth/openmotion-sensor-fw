@@ -60,3 +60,7 @@ Thumbs.db
 .vscode/
 build/
 platform.json
+
+# Superpowers working files (plans/specs are scratch; keep architecture docs tracked)
+docs/superpowers/plans/
+docs/superpowers/specs/
