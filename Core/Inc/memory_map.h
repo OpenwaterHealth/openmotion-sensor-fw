@@ -36,8 +36,20 @@
 #define ADDR_FLASH_SECTOR_7_BANK2     ((uint32_t)0x081E0000) /* Base @ of Sector 7, 128 Kbytes */
 
 #define ADDR_CAMERA_BITSTREAM       ADDR_FLASH_SECTOR_5_BANK2
-#define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000) 
+#define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000)
 #define FLASH_USER_START_ADDR       ADDR_FLASH_SECTOR_7_BANK2
+
+/* Boot flags in the top words of SRAM4 (0x38000000 + 64 KB). They must NOT
+ * live at the bottom of SRAM4: spi6_buffer (the FPGA histogram DMA buffer)
+ * is linked at 0x38000000, and the histogram SOF marker is the same
+ * 0xDEADBEEF value as the DFU magic, so streamed data could spoof a
+ * bootloader request across a warm reset. ram_scrub() zeroes all of SRAM4
+ * on every normal boot, so the flags only persist across the resets that
+ * set them deliberately. */
+#define BOOT_FLAG_DFU_REQUEST_ADDR    ((uint32_t)0x3800FFF8) /* app asks SystemInit to enter ROM bootloader */
+#define BOOT_FLAG_DFU_REQUEST_MAGIC   ((uint32_t)0xDEADBEEF)
+#define BOOT_FLAG_JUMP_ENTRY_ADDR     ((uint32_t)0x3800FFFC) /* set entering bootloader; if still set at app start, app was entered by jump, not reset */
+#define BOOT_FLAG_JUMP_ENTRY_MAGIC    ((uint32_t)0xB00710AD)
 
 #ifdef __cplusplus
 }

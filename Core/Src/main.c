@@ -34,6 +34,7 @@
 #include "ICM20948.h"
 #include "camera_manager.h"
 #include "system_monitor.h"
+#include "memory_map.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -2136,7 +2137,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM15) {
     HAL_TIM_Base_Stop_IT(htim);
     if(_enter_dfu) {
-      *((uint32_t *)0x38000000) = 0xDEADBEEF; 
+      *((uint32_t *)BOOT_FLAG_DFU_REQUEST_ADDR) = BOOT_FLAG_DFU_REQUEST_MAGIC;
     }
 
 

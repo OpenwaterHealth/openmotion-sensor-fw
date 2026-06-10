@@ -45,6 +45,7 @@
   */
 
 #include "stm32h7xx.h"
+#include "memory_map.h"
 #include <math.h>
 
 #if !defined  (HSE_VALUE)
@@ -166,9 +167,26 @@
   */
 
 void CheckBootloaderFlag(void) {
-    if (*((uint32_t *)0x38000000) == 0xDEADBEEF) {
-        *((uint32_t *)0x38000000) = 0; // Clear flag
-        
+    /* The ROM bootloader exits by jumping to the app (dfu-util ':leave' /
+       CubeProgrammer '-g'), not by resetting, so the app starts with the
+       bootloader's clock and peripheral state and USB bring-up hangs.
+       The jump-entry flag is set on the way INTO the bootloader; if it's
+       still set here, we were entered by that jump — force one clean
+       system reset. */
+    if (*((volatile uint32_t *)BOOT_FLAG_JUMP_ENTRY_ADDR) == BOOT_FLAG_JUMP_ENTRY_MAGIC) {
+        *((volatile uint32_t *)BOOT_FLAG_JUMP_ENTRY_ADDR) = 0;
+        __DSB();
+        /* Read back through the D3 AHB bridge so the clear is committed to
+           SRAM before the reset hits — a buffered write lost here would
+           re-trigger this branch forever. */
+        (void)*((volatile uint32_t *)BOOT_FLAG_JUMP_ENTRY_ADDR);
+        NVIC_SystemReset();
+    }
+
+    if (*((uint32_t *)BOOT_FLAG_DFU_REQUEST_ADDR) == BOOT_FLAG_DFU_REQUEST_MAGIC) {
+        *((uint32_t *)BOOT_FLAG_DFU_REQUEST_ADDR) = 0; // Clear flag
+        *((uint32_t *)BOOT_FLAG_JUMP_ENTRY_ADDR) = BOOT_FLAG_JUMP_ENTRY_MAGIC; // Expect jump-entry on the way back
+
 
         SysTick->CTRL = 0;
         SysTick->LOAD = 0;
