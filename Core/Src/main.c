@@ -126,8 +126,9 @@ __attribute__((section(".RAM_D1"))) uint8_t bitstream_buffer[MAX_BITSTREAM_SIZE]
 volatile uint8_t event_bits = 0x00;         // holds the event bits to be flipped
 volatile uint8_t event_bits_enabled = 0x00; // holds the event bits for the cameras to be enabled
 volatile uint16_t pulse_count = 0;
-extern uint32_t imu_frame_counter;
+extern volatile uint32_t imu_frame_counter;
 volatile bool _enter_dfu = false;
+volatile uint8_t imu_sample_due = 0; // set by the TIM14 ISR, serviced by imu_service()
 
 ICM_Axis3D a;
 ICM_Axis3D m;
@@ -178,7 +179,7 @@ static void MX_TIM15_Init(void);
 static void MX_IWDG1_Init(void);
 static void MX_RAMECC_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void imu_service(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -416,7 +417,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  	comms_host_check_received(); // check comms  
+  	comms_host_check_received(); // check comms
+    imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
+    logging_pump();          /* Flush USB log data buffered from ISR context */
     check_streaming();
     poll_mcu_temperature();  /* Print warning if MCU junction temp above threshold */
     USB_RecoveryCheck();     /* EFT/lock-up watchdog: rebuild USB stack if bus goes dead */
@@ -2059,6 +2062,59 @@ static void wait_for_usb_queues_to_finish(void)
 
 /* HAL_RAMECC_DetectErrorCallback is implemented in system_monitor.c */
 
+/**
+ * @brief Service one pending IMU sample (set by the TIM14 ISR at 200 Hz).
+ * @note  Runs in the main loop so the ~1.4 ms blocking ICM read and any
+ *        error printf happen in thread context, where the USB IRQ can
+ *        preempt. If the loop is busy for more than one tick the missed
+ *        samples are dropped (visible as gaps in the stream's F counter).
+ */
+static void imu_service(void)
+{
+  if (!imu_sample_due) {
+    return;
+  }
+  imu_sample_due = 0;
+
+  /* hi2c1 is shared with the TCA9548A camera mux, which the FSIN EXTI ISR
+   * uses for temperature polling during streaming — mask that IRQ for the
+   * duration of the read so the two transactions can't interleave. The
+   * EXTI pending bit latches, so a frame sync arriving meanwhile is
+   * serviced right after, just delayed by the read. */
+  bool fsin_irq_was_enabled = (NVIC_GetEnableIRQ(EXTI15_10_IRQn) != 0U);
+  if (fsin_irq_was_enabled) {
+    HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
+  }
+  uint8_t read_status = ICM_GetAllRawData(&a, &t, &g, &m);
+  if (fsin_irq_was_enabled) {
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+  }
+
+  if (read_status != HAL_OK) {
+    /* A flaky ICM fails every tick at 200 Hz — keep the signal, drop the
+     * volume (same pattern as the FSIN debounce warning). */
+    static uint32_t imu_read_err_count = 0;
+    imu_read_err_count++;
+    if ((imu_read_err_count & 0xFF) == 1) {
+      printf("IMU Read Error (%lu so far)\r\n", (unsigned long)imu_read_err_count);
+    }
+    return;
+  }
+
+  uint32_t frame = imu_frame_counter;
+  memset(usb_buf, 0, 128);
+  int len = snprintf(
+      usb_buf, sizeof(usb_buf),
+      "{\"F\":%lu,\"G\":[%d,%d,%d],\"M\":[%d,%d,%d],\"A\":[%d,%d,%d],\"T\":%d.%02d}\r\n",
+      (unsigned long)frame,
+      g.x, g.y, g.z,
+      m.x, m.y, m.z,
+      a.x, a.y, a.z,
+      (int)t, (int)((t - (int)t) * 100.0f)
+  );
+  USBD_IMU_SetTxBuffer(&hUsbDeviceHS, (uint8_t *)usb_buf, len);
+}
+
 /* USER CODE END 4 */
 
  /* MPU Configuration */
@@ -2114,23 +2170,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
   if (htim->Instance == TIM14)
   {
+	  /* No I2C and no printf in here: this ISR runs at preemption priority
+	   * 0, same as the USB OTG_HS IRQ, so anything that waits on USB (the
+	   * USB log path does) can never complete and wedges the CPU in this
+	   * ISR (2026-06-11 IMU streaming wedge). The main loop samples via
+	   * imu_service(). Counting ticks here keeps frame numbers honest:
+	   * gaps in F reveal samples the main loop couldn't service in time. */
 	  imu_frame_counter++;
-	  // call imu
-	  if(ICM_GetAllRawData(&a,&t, &g, &m) != HAL_OK){
-		  printf("IMU Read Error\r\n");
-	  }else{
-		  memset(usb_buf,0,128);
-		  int len = snprintf(
-		      usb_buf, sizeof(usb_buf),
-		      "{\"F\":%ld,\"G\":[%d,%d,%d],\"M\":[%d,%d,%d],\"A\":[%d,%d,%d],\"T\":%d.%02d}\r\n",
-			  imu_frame_counter,
-		      g.x, g.y, g.z,
-		      m.x, m.y, m.z,
-		      a.x, a.y, a.z,
-			  (int)t, (int)((t - (int)t) * 100.0f)
-		  );
-		  USBD_IMU_SetTxBuffer(&hUsbDeviceHS, (uint8_t *)usb_buf, len);
-	  }
+	  imu_sample_due = 1;
   }
 
   if (htim->Instance == TIM15) {
