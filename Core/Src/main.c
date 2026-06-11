@@ -419,6 +419,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
   	comms_host_check_received(); // check comms
     imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
+    camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
     logging_pump();          /* Flush USB log data buffered from ISR context */
     check_streaming();
     poll_mcu_temperature();  /* Print warning if MCU junction temp above threshold */
@@ -2077,19 +2078,11 @@ static void imu_service(void)
   }
   imu_sample_due = 0;
 
-  /* hi2c1 is shared with the TCA9548A camera mux, which the FSIN EXTI ISR
-   * uses for temperature polling during streaming — mask that IRQ for the
-   * duration of the read so the two transactions can't interleave. The
-   * EXTI pending bit latches, so a frame sync arriving meanwhile is
-   * serviced right after, just delayed by the read. */
-  bool fsin_irq_was_enabled = (NVIC_GetEnableIRQ(EXTI15_10_IRQn) != 0U);
-  if (fsin_irq_was_enabled) {
-    HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
-  }
+  /* hi2c1 is shared with the TCA9548A camera mux and the camera sensors,
+   * but every user runs here in the main loop — the frame ISRs only set
+   * flags (see camera_i2c_service()) — so this blocking read can't
+   * interleave with another transaction and needs no IRQ masking. */
   uint8_t read_status = ICM_GetAllRawData(&a, &t, &g, &m);
-  if (fsin_irq_was_enabled) {
-    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
-  }
 
   if (read_status != HAL_OK) {
     /* A flaky ICM fails every tick at 200 Hz — keep the signal, drop the

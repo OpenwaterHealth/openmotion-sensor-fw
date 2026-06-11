@@ -29,10 +29,9 @@ static void TCA9548A_ResetHardware(void)
 }
 
 /* Maximum time to wait for one I2C mux write.  HAL_MAX_DELAY must NEVER be
- * used here because TCA9548A_WriteControl is called from interrupt context
- * (via poll_camera_temperatures → send_data → FSIN IRQ).  A stuck I2C bus
- * (e.g. a failed camera sensor holding SDA low after its channel is selected)
- * would otherwise block the CPU forever, making COMM unresponsive. */
+ * used here: a stuck I2C bus (e.g. a failed camera sensor holding SDA low
+ * after its channel is selected) would otherwise block the main loop
+ * forever, starving the IWDG refresh and leaving COMM unresponsive. */
 #define TCA9548A_I2C_TIMEOUT_MS  50U
 
 /* Bounded timeout for all general slave read/write operations.  Using

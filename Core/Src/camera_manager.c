@@ -26,6 +26,16 @@ volatile float cam_temp[CAMERA_COUNT] = {0};   // °C ×100
 static uint32_t next_temp_ms = 0;
 static uint8_t  next_cam_idx = 0;
 
+/* hi2c1 is shared by the camera mux/sensors, the ICM IMU and the CrossLink
+ * config port, and the HAL I2C driver is not re-entrant: if the FSIN/TIM4
+ * frame ISRs started a transaction while a main-loop command handler had one
+ * in flight, the handle state machine gets corrupted (NACKs, stuck bus).
+ * The frame ISRs therefore never touch hi2c1 — they only set these flags,
+ * and camera_i2c_service() does the bus work from the main loop, where it
+ * is naturally serialized with every other hi2c1 user. */
+static volatile bool    cam_temp_poll_due = false;     /* set by send_data() */
+static volatile uint8_t cam_mux_disable_pending = 0;   /* set by check_camera_failures() */
+
 #define FPGA_I2C_ADDRESS 0x40  // Replace with your FPGA's I2C address
 #define HISTO_JSON_BUFFER_SIZE 34000
 #define HISTO_SIZE_32B 1024
@@ -1042,7 +1052,7 @@ _Bool configure_camera_testpattern(uint8_t cam_id, uint8_t test_pattern)
 	return true;
 }
 
-void poll_camera_temperatures(void)
+static void poll_camera_temperatures(void)
 {
     uint32_t now = get_timestamp_ms();
 
@@ -1084,6 +1094,38 @@ void poll_camera_temperatures(void)
         {
             TCA9548A_SelectChannel(&hi2c1, 0x70, active_cam->i2c_target);
         }
+    }
+}
+
+void camera_i2c_service(void)
+{
+    /* Disconnect the mux channels of failed cameras before the temperature
+     * poll, so a sensor holding SDA low can't wedge the reads below. */
+    if (cam_mux_disable_pending != 0u) {
+        __disable_irq();
+        uint8_t pending = cam_mux_disable_pending;
+        cam_mux_disable_pending = 0u;
+        __enable_irq();
+
+        for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+            if ((pending & (1u << cam_id)) == 0u) {
+                continue;
+            }
+            CameraDevice *pFailed = get_camera_byID(cam_id);
+            if (pFailed != NULL) {
+                HAL_StatusTypeDef mux_ret =
+                    TCA9548A_DisableChannel(&hi2c1, 0x70, pFailed->i2c_target);
+                if (mux_ret != HAL_OK) {
+                    printf("Camera %d: failed to disable TCA mux channel %u (ret=%d)\r\n",
+                           cam_id + 1, (unsigned)pFailed->i2c_target, (int)mux_ret);
+                }
+            }
+        }
+    }
+
+    if (cam_temp_poll_due) {
+        cam_temp_poll_due = false;
+        poll_camera_temperatures();
     }
 }
 /* -------- END CAMERA I2C FUNCTIONS -------- */
@@ -1260,18 +1302,12 @@ static void check_camera_failures(void) {
 						event_bits_enabled &= ~(uint8_t)(1u << cam_id);
 						__enable_irq();
 
-						/* 2. Deselect the camera's I2C mux channel.
-						 *    Uses the bounded TCA9548A_I2C_TIMEOUT_MS timeout (50 ms)
-						 *    so this is a one-time bounded stall, not a hang. */
-						CameraDevice *pFailed = get_camera_byID(cam_id);
-						if (pFailed != NULL) {
-							HAL_StatusTypeDef mux_ret =
-								TCA9548A_DisableChannel(&hi2c1, 0x70, pFailed->i2c_target);
-							if (mux_ret != HAL_OK) {
-								printf("Camera %d: failed to disable TCA mux channel %u (ret=%d)\r\n",
-								       cam_id + 1, (unsigned)pFailed->i2c_target, (int)mux_ret);
-							}
-						}
+						/* 2. Queue the camera's I2C mux channel for deselect.
+						 *    This runs in the FSIN/TIM4 frame ISR, which must not
+						 *    touch hi2c1 (a main-loop transaction may be mid-flight);
+						 *    camera_i2c_service() does the mux write from the main
+						 *    loop with the bounded TCA9548A timeout. */
+						cam_mux_disable_pending |= (uint8_t)(1u << cam_id);
 					}
 				}
 			}
@@ -1322,7 +1358,9 @@ _Bool send_data(void) {
 	} else {
 		success = send_histogram_data();
 	}
-	poll_camera_temperatures();
+	/* Temperature polling does hi2c1 traffic, so it can't run here in the
+	 * frame ISR — flag it for camera_i2c_service() in the main loop. */
+	cam_temp_poll_due = true;
 
     if (success) {
 		total_frames_sent++;
