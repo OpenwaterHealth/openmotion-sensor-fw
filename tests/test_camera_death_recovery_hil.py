@@ -9,9 +9,10 @@ sensor power cycle. Post-fix, the firmware rails the camera off for a
 telemetry, and the next scan's normal power->program->configure->stream
 sequence performs a genuine bring-up.
 
-This test simulates the death by erasing the camera's FPGA SRAM
-mid-stream (the stall detector can't tell the difference), then runs a
-second bring-up and asserts data flows from that camera again.
+This test simulates the death by pulling the camera's FPGA reset
+(OW_FPGA_OFF / CRESETB low) mid-stream — the stall detector can't tell
+the difference — then runs a second bring-up and asserts data flows
+from that camera again.
 
 Run on a bench with a sensor attached (WinUSB via Zadig):
 
@@ -167,9 +168,15 @@ def test_dead_camera_recovers_on_next_scan(sensor):
         assert sensor.enable_aggregator_fsin() is True
         time.sleep(STREAM_SETTLE_S)
 
-        # Kill camera 2: erasing its FPGA SRAM stops the design, so it
-        # stops posting data — same signature as a regulator dropout.
-        assert sensor.erase_sram_fpga(KILL_MASK) is True
+        # Kill camera 2: OW_FPGA_OFF pulls its CRESETB low, stopping the
+        # design, so it stops posting data — same signature as a regulator
+        # dropout. (erase_sram_fpga doesn't work here: on NVCM-programmed
+        # modules the config port can't be activated while the design runs;
+        # the SDK has no wrapper for OW_FPGA_OFF, so send it raw.)
+        from omotion.config import OW_ERROR, OW_FPGA, OW_FPGA_OFF
+
+        r = sensor._send(packetType=OW_FPGA, command=OW_FPGA_OFF, addr=KILL_MASK)
+        assert r.packetType != OW_ERROR, "OW_FPGA_OFF kill command failed"
 
         # Stall detector fires within 3 frames (~75 ms); isolation +
         # rail-off runs from the main loop right after.
