@@ -1143,6 +1143,33 @@ static void camera_death_isolate(uint8_t cam_id)
            cam_id + 1, (unsigned)CAMERA_RECOVERY_OFF_MS);
 }
 
+/* Re-power a dead camera's rail once its cool-off has elapsed, keeping
+ * CRESETB low: the FPGA stays unbooted and quiet, while the OV2312 (direct
+ * I2C behind the mux) comes back up so temperature telemetry resumes.
+ * needs_recovery stays set until program_fpga() completes the real
+ * bring-up at the next scan. Main-loop only. */
+static void camera_recovery_tick(void)
+{
+    uint32_t now = get_timestamp_ms();
+
+    for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+        CameraDevice *cam = &cam_array[cam_id];
+        if (!cam->needs_recovery || cam->isPowered) {
+            continue;  /* healthy, or host already re-powered it (option B) */
+        }
+        if ((int32_t)(now - cam->recovery_repower_at) < 0) {
+            continue;  /* still cooling (wrap-safe compare) */
+        }
+
+        HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET);
+        cam->isPowered = true;
+
+        printf("Camera %d: rail re-powered after cool-off (FPGA held in reset)\r\n",
+               cam_id + 1);
+    }
+}
+
 void camera_i2c_service(void)
 {
     /* Isolate cameras the frame ISR's stall detector declared dead — abort
@@ -1166,6 +1193,8 @@ void camera_i2c_service(void)
         cam_temp_poll_due = false;
         poll_camera_temperatures();
     }
+
+    camera_recovery_tick();  /* Re-power dead cameras whose cool-off elapsed */
 }
 /* -------- END CAMERA I2C FUNCTIONS -------- */
 
