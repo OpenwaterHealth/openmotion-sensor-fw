@@ -486,6 +486,18 @@ static void process_imu_commands(UartPacket *uartResp, UartPacket cmd)
 {
 	switch (cmd.command)
 	{
+	case OW_IMU_INIT:
+		VERBOSE_CMD("[CMD] OW_IMU_INIT\r\n");
+		uartResp->command = OW_IMU_INIT;
+		uartResp->packet_type = OW_RESP;
+		uartResp->data_len = 0;
+		uartResp->data = NULL;
+		if (ICM_WHOAMI() != ICM20948_EXPECTED_ID || ICM_Init() != HAL_OK)
+		{
+			uartResp->packet_type = OW_ERROR;
+			VERBOSE_CMD("Failed to initialize IMU\r\n");
+		}
+		break;
 	case OW_IMU_GET_TEMP:
 		VERBOSE_CMD("[CMD] OW_IMU_GET_TEMP\r\n");
 		uartResp->command = OW_IMU_GET_TEMP;

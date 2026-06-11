@@ -15,6 +15,7 @@
 
  void init_dma_logging();
  bool is_using_dma();
+ void logging_pump(void);
  void logging_set_debug_flags(uint32_t flags);
  uint32_t logging_get_debug_flags(void);
  void logging_UART_TxCpltCallback(UART_HandleTypeDef *huart);
