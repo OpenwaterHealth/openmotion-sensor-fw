@@ -199,6 +199,8 @@ static void init_camera(CameraDevice *cam){
 	cam->isProgrammed = false;
 	cam->isPowered = true;
 	cam->isPresent = false;
+	cam->needs_recovery = false;
+	cam->recovery_repower_at = 0;
 }
 
 void init_camera_sensors() {

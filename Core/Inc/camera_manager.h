@@ -41,9 +41,19 @@ typedef struct {
 	GPIO_TypeDef *	detect_data_port;
 	uint16_t		detect_data_pin;
 	uint32_t		detect_data_af;
+	/* Death-recovery state (see docs/superpowers/specs/2026-06-11-camera-death-recovery-design.md):
+	 * set when the stall detector declares this camera dead (PCB regulator
+	 * thermal shutdown etc.); cleared when program_fpga() completes a real
+	 * bring-up or the host explicitly powers the camera off. */
+	bool		needs_recovery;
+	uint32_t	recovery_repower_at;	/* get_timestamp_ms() deadline to re-power the rail */
 } CameraDevice;
 
 #define CAMERA_COUNT	8
+/* How long a dead camera's rail is held off so the camera-module PCB power
+ * regulator (supplies both the CrossLink FPGA and the OV2312) can cool and
+ * clear its thermal-shutdown latch. */
+#define CAMERA_RECOVERY_OFF_MS	10000
 #define HISTOGRAM_DATA_SIZE	4100
 #define WIDTH 1920
 #define HEIGHT 1280
