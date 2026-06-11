@@ -869,6 +869,18 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 	return true;
 }
 
+/* A successful FPGA bring-up is the last firmware-owned step of death
+ * recovery (the host's config + stream-enable commands follow on their
+ * own). Clear the marker and announce it. */
+static void camera_recovery_complete(CameraDevice *cam)
+{
+    if (cam->needs_recovery) {
+        cam->needs_recovery = false;
+        printf("Camera %d: recovered after data-stall (power-cycled, reprogrammed)\r\n",
+               cam->id + 1);
+    }
+}
+
 _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 {
 	// printf("C%d: programming...", cam_id+1);
@@ -888,6 +900,7 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 		if(fpga_detect_nvcm(cam)){
 			cam->isProgrammed = true;
 			printf("C%d: NVCM programmed, skipping SRAM load\r\n", cam_id+1);
+			camera_recovery_complete(cam);
 			return true;
 		}
 	} else {
@@ -908,6 +921,7 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 		return false;
 	} else {
 		cam->isProgrammed = true;
+		camera_recovery_complete(cam);
 	}
 
 	// If the selected camera is one that uses USART, 
@@ -2156,6 +2170,10 @@ _Bool disable_camera_power(uint8_t cam_id){
 	cam->isProgrammed = false; // Clear programmed status when power is off
 	cam->isConfigured = false; // Clear configured status when power is off
 	cam->streaming_enabled = false; // Clear streaming status when power is off
+	/* An explicit host power-off IS the recovery rail-cycle — and it must
+	 * disarm the cool-off tick so it can't re-power a camera the host
+	 * deliberately turned off (e.g. power_off_unused_cameras). */
+	cam->needs_recovery = false;
 
 	printf("Disabled Power for Camera %d\r\n", cam_id+1);
 	return true;
@@ -2185,6 +2203,7 @@ void power_off_all_cameras(void) {
 		cam->isProgrammed = false;
 		cam->isConfigured = false;
 		cam->streaming_enabled = false;
+		cam->needs_recovery = false;
 		cam_temp[i] = 25.0f;
 	}
 	printf("All cameras powered off\r\n");
