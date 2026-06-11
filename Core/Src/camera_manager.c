@@ -829,6 +829,8 @@ uint32_t read_usercode_fpga(uint8_t cam_id)
 	return ret_val;
 }
 
+static void camera_recovery_complete(CameraDevice *cam);
+
 _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len, _Bool force_update)
 {
 	printf("C%d: programming...", cam_id+1);
@@ -846,6 +848,7 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 		if(fpga_detect_nvcm(cam)){
 			cam->isProgrammed = true;
 			printf("NVCM programmed, skipping\r\n");
+			camera_recovery_complete(cam);
 			return true;
 		}
 	} else {
@@ -863,7 +866,8 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 		printf("Program FPGA Camera %d Failed\r\n", cam_id+1);
 		return false;
 	}else{
-
+		cam->isProgrammed = true;
+		camera_recovery_complete(cam);
 	}
 	printf("done\r\n");
 	return true;
