@@ -2003,8 +2003,15 @@ _Bool enable_camera_power(uint8_t cam_id){
 	 * With CRESETB held low the FPGA stays quiet until program_fpga()'s
 	 * per-camera detect/program flow releases it — boots are serialized by
 	 * construction, and the reset-held FPGA also can't drive its config
-	 * pins (shared with the I2C mux channel and SPI/USART buses). */
-	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	 * pins (shared with the I2C mux channel and SPI/USART buses).
+	 *
+	 * ONLY on a real off->on transition: re-issuing power-on for a camera
+	 * that is already running (apps do this between scans) must not yank
+	 * CRESETB on a live design — that kills it mid-transfer and wedges the
+	 * MCU's SPI/USART in BUSY ("camera not READY" on the next scan). */
+	if (!cam->isPowered) {
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	}
 	HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET); // Set power pin high
 	cam->isPowered = true;
 	/* Do NOT select the mux channel here either — every I2C consumer (temp
