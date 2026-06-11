@@ -96,8 +96,25 @@ void ClearBuffer_DMA(void)
 }
 
 _Bool comms_interface_send(UartPacket *pResp) {
+	static volatile _Bool send_in_progress = false;
+
+	if (__get_IPSR() != 0U) {
+		/* Interrupt context: the USB OTG_HS IRQ shares preemption priority
+		 * 0 with several ISRs, so the tx_flag wait below could never
+		 * complete — refuse instead of busy-waiting into a wedge. */
+		return false;
+	}
+	if (send_in_progress) {
+		/* Re-entered via a printf inside this function (the USB log path
+		 * routes printf back here). No printf in this branch — that is
+		 * exactly the recursion being refused. */
+		return false;
+	}
+	send_in_progress = true;
+
 	if(!tx_flag){
 		printf("Comm tx not complete from last time");
+		send_in_progress = false;
 		return false;
 	}
 
@@ -120,6 +137,7 @@ _Bool comms_interface_send(UartPacket *pResp) {
 	if (pkt_size > sizeof(txBuffer)) {
 		printf("Packet too large to send, len=%lu\r\n", pkt_size);
 		// Handle error: packet too large for txBuffer
+		send_in_progress = false;
 		return false;
 	}
 
@@ -153,6 +171,7 @@ _Bool comms_interface_send(UartPacket *pResp) {
 		}
 		tx_flag = 1; // reset to idle on failure
 		USB_NotifyTxFailure();
+		send_in_progress = false;
 		return false;
 	}
 
@@ -167,12 +186,16 @@ _Bool comms_interface_send(UartPacket *pResp) {
 	while (!tx_flag) {
 		if ((get_timestamp_ms() - start_time) >= TX_TIMEOUT) {
 			// Timeout handling: Log error and break out or reset the flag.
+			// printf before releasing send_in_progress so the message only
+			// buffers instead of re-entering this function.
 			printf("COMM USB TX Timeout\r\n");
 			tx_flag = 1; // reset to idle on timeout
 			USB_NotifyTxFailure();
+			send_in_progress = false;
 			return false;
 		}
 	}
+	send_in_progress = false;
 	return true;
 }
 

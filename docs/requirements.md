@@ -257,7 +257,8 @@ This prevents spurious frame-sync pulses during power state transitions.
 
 | Command | Code | Description |
 |---|---|---|
-| `OW_IMU_ON` | 0x31 | Start timer-driven IMU data streaming; resets frame counter |
+| `OW_IMU_INIT` | 0x30 | (Re-)initialize the ICM-20948 and AK09916 (also runs at boot); `OW_RESP` on success, `OW_ERROR` if either device is absent or init fails |
+| `OW_IMU_ON` | 0x31 | Start timer-driven IMU data streaming at 40 Hz; resets frame counter |
 | `OW_IMU_OFF` | 0x32 | Stop timer-driven IMU data streaming |
 | `OW_IMU_GET_TEMP` | 0x34 | Read IMU temperature (float, °C); returned as 4-byte payload |
 | `OW_IMU_GET_ACCEL` | 0x35 | Read 3-axis accelerometer data (`ICM_Axis3D`: 3×int16) |
@@ -353,8 +354,13 @@ This prevents spurious frame-sync pulses during power state transitions.
 ### 8.1 Device
 
 - InvenSense ICM-20948 at I2C address `0x68`.
-- Integrated AK09916 magnetometer at I2C address `0x0C`.
-- WHO_AM_I expected value: `0xEA`.
+- Integrated AK09916 magnetometer at I2C address `0x0C`, accessed
+  directly over the host bus through the ICM's BYPASS mux (the ICM's aux
+  I2C master never executes transactions on this hardware — see
+  `Core/Src/ICM20948.c`).
+- WHO_AM_I expected values: ICM `0xEA`; AK09916 WIA `0x48 0x09`.
+- Accel/gyro DLPF enabled at ~11.5 Hz bandwidth (anti-aliasing for the
+  40 Hz stream); accel ±16 g, gyro ±2000 dps; mag continuous 100 Hz.
 
 ### 8.2 Data
 
@@ -365,9 +371,15 @@ This prevents spurious frame-sync pulses during power state transitions.
 
 ### 8.3 Streaming
 
-- Timer-driven streaming (timer handle `IMU_TIMER`).
-- Frame counter (`imu_frame_counter`) incremented per interrupt.
-- IMU data packets transmitted over USB IMU bulk endpoint.
+- Timer-driven at 40 Hz (`IMU_TIMER` = TIM14) — one sample per camera
+  frame. The ISR only sets a flag; sampling and the USB send run from
+  the main loop (`imu_service()` in `main.c`), so the blocking I2C reads
+  and any error printf never execute in interrupt context.
+- Frame counter (`imu_frame_counter`) incremented per timer tick; gaps
+  in `F` reveal samples the main loop could not service in time.
+- Samples are JSON lines on the USB IMU bulk endpoint (IF2):
+  `{"F":<frame>,"G":[x,y,z],"M":[x,y,z],"A":[x,y,z],"T":<°C>}\r\n`.
+  Samples are dropped (not queued) while the endpoint is busy.
 
 ---
 

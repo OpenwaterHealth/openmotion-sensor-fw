@@ -202,9 +202,27 @@ void logging_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 /* Send accumulated log message over command and control endpoint */
 static void send_log_message_over_comms(void) {
+	static volatile bool log_send_in_progress = false;
+
 	if (!log_msg_rb_initialized) {
 		lwrb_init(&log_msg_rb, log_msg_buffer, sizeof(log_msg_buffer));
 		log_msg_rb_initialized = true;
+	}
+
+	/* Never transmit from interrupt context: comms_interface_send busy-waits
+	 * on tx_flag, which only the USB OTG_HS IRQ sets — and that IRQ shares
+	 * preemption priority 0 with several ISRs that printf, so the wait can
+	 * never complete (2026-06-11 IMU streaming wedge). Keep the data
+	 * buffered; the main loop flushes it via logging_pump(). */
+	if (__get_IPSR() != 0U) {
+		return;
+	}
+
+	/* Re-entry guard: comms_interface_send's failure paths printf, which
+	 * lands back here on the newline. Recursing would clobber the shared
+	 * txBuffer mid-build — keep the new data buffered instead. */
+	if (log_send_in_progress) {
+		return;
 	}
 
 	size_t linear_len = lwrb_get_linear_block_read_length(&log_msg_rb);
@@ -238,15 +256,26 @@ static void send_log_message_over_comms(void) {
 	// Note: This may fail silently if USB is not initialized, which is acceptable
 	// comms_interface_send handles packet building, CRC calculation, and transmission
 	// For logging, we use a non-blocking approach - if it times out, we just skip
+	log_send_in_progress = true;
 	_Bool sent = comms_interface_send(&log_packet);
+	log_send_in_progress = false;
 	if (!sent) {
 		// Transmission failed or timed out - keep message in buffer to retry later
 		// Don't remove data from the buffer, so it can be retried on next call
 		return;
 	}
-	
+
 	// Remove only the bytes that were successfully sent
 	lwrb_skip(&log_msg_rb, linear_len);
+}
+
+/* Flush USB log data that was buffered while in interrupt context.
+ * Called from the main loop; no-op when there is nothing pending. */
+void logging_pump(void) {
+	if ((debug_flags & DEBUG_FLAG_USB_PRINTF) == 0u) {
+		return;
+	}
+	send_log_message_over_comms();
 }
 
 /* Add character to log message buffer and send if newline encountered */
