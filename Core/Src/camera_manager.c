@@ -1101,7 +1101,14 @@ static void poll_camera_temperatures(void)
                     // Select the correct I2C channel for this camera before reading temperature
                     if (TCA9548A_SelectChannel(&hi2c1, 0x70, pCam->i2c_target) == HAL_OK)
                     {
-                        cam_temp[cam] = X02C1B_read_temp(pCam);
+                        /* Keep last-known-good on failed reads: read_temp
+                         * returns a negative error code on I2C failure, and
+                         * a live OV2312 die never legitimately reads <= 0 °C
+                         * (self-heating), so treat non-positive as failure. */
+                        float t = X02C1B_read_temp(pCam);
+                        if (t > 0.0f) {
+                            cam_temp[cam] = t;
+                        }
                     }
                     else
                     {
