@@ -92,8 +92,8 @@ def test_imu_stream_with_usb_printf_does_not_wedge_comm(sensor):
     except Exception as exc:
         pytest.fail(f"OW_IMU_GET_TEMP got no response (wedge): {exc!r}")
 
-    # Let the 200 Hz sample timer run; on pre-fix firmware with a flaky
-    # ICM this alone printf-storms the ISR.
+    # Let the sample timer run; on pre-fix firmware with a flaky ICM this
+    # alone printf-storms the ISR.
     time.sleep(2.0)
 
     assert sensor.ping() is True, "command interface died during IMU streaming"

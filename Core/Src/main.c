@@ -1185,7 +1185,7 @@ static void MX_TIM14_Init(void)
   htim14.Instance = TIM14;
   htim14.Init.Prescaler = 240-1;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim14.Init.Period = 5000-1;
+  htim14.Init.Period = 25000-1;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
@@ -2063,7 +2063,8 @@ static void wait_for_usb_queues_to_finish(void)
 /* HAL_RAMECC_DetectErrorCallback is implemented in system_monitor.c */
 
 /**
- * @brief Service one pending IMU sample (set by the TIM14 ISR at 200 Hz).
+ * @brief Service one pending IMU sample (set by the TIM14 ISR at 40 Hz —
+ *        one sample per camera frame, matching the configured 17 Hz DLPF).
  * @note  Runs in the main loop so the ~1.4 ms blocking ICM read and any
  *        error printf happen in thread context, where the USB IRQ can
  *        preempt. If the loop is busy for more than one tick the missed
