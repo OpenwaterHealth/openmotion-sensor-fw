@@ -1142,6 +1142,15 @@ static void camera_death_isolate(uint8_t cam_id)
      * aborting the next scan before recovery could run. */
     (void)reset_camera_usart(cam_id);
 
+    /* Drop any stale event bit: a dying camera's last DMA can complete on
+     * garbage clock edges during the regulator brownout, and the bit would
+     * otherwise put one garbage section into the next frame. (The send
+     * paths also mask ready_bits by event_bits_enabled — defense in depth
+     * against the BUSY_RX re-arm this caused on 2026-06-11.) */
+    __disable_irq();
+    event_bits &= (uint8_t)~(1u << cam_id);
+    __enable_irq();
+
     /* FPGA into reset: it can't drive the shared mux/bus pins, and if the
      * regulator un-latches on its own an NVCM part can't auto-boot
      * uncontrolled (see enable_camera_power()'s serialized-boot rationale). */
@@ -1518,7 +1527,12 @@ _Bool send_histogram_data(void) {
 		return true;
 	}
 	__disable_irq();
-	ready_bits = event_bits;
+	/* Mask by event_bits_enabled: a dead camera's aborted DMA can complete
+	 * on garbage clock edges while its regulator browns out, setting a stale
+	 * event bit. Unmasked, that bit would put its garbage buffer in the
+	 * frame AND re-arm reception below — re-wedging the peripheral in
+	 * BUSY_RX ("camera not READY" on the next scan, field-hit 2026-06-11). */
+	ready_bits = event_bits & event_bits_enabled;
 	event_bits = 0x00;
 	__enable_irq();
 
@@ -1667,7 +1681,9 @@ _Bool send_histogram_data_cmp(void) {
 		return true;
 	}
 	__disable_irq();
-	ready_bits = event_bits;
+	/* Mask by event_bits_enabled — same rationale as send_histogram_data():
+	 * never include or re-arm a camera the stall detector disabled. */
+	ready_bits = event_bits & event_bits_enabled;
 	event_bits = 0x00;
 	__enable_irq();
 

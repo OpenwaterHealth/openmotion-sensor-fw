@@ -38,8 +38,12 @@ requires_bench = pytest.mark.skipif(
 )
 
 CONNECT_TIMEOUT_S = 15.0
-CAM_MASK = 0x03          # two cameras: kill cam 2, cam 1 is the control
-KILL_MASK = 0x02         # camera id 1 (1-based "Camera 2" in FW logs)
+# Kill camera selectable via OW_KILL_CAM (1-based; default 6 — the SPI3
+# channel that failed in the field on 2026-06-11 via the unmasked
+# ready_bits re-arm). Camera 1 is the always-on control.
+KILL_CAM = int(os.environ.get("OW_KILL_CAM", "6"))
+KILL_MASK = 1 << (KILL_CAM - 1)
+CAM_MASK = 0x01 | KILL_MASK
 COOL_OFF_S = 10.0        # CAMERA_RECOVERY_OFF_MS in Core/Inc/camera_manager.h
 STREAM_SETTLE_S = 2.0
 # Aggregated frame: 10-byte header + per camera (SOH + id + 4096 histo +
@@ -168,7 +172,7 @@ def test_dead_camera_recovers_on_next_scan(sensor):
         assert sensor.enable_aggregator_fsin() is True
         time.sleep(STREAM_SETTLE_S)
 
-        # Kill camera 2: OW_FPGA_OFF pulls its CRESETB low, stopping the
+        # Kill the target camera: OW_FPGA_OFF pulls its CRESETB low, stopping the
         # design, so it stops posting data — same signature as a regulator
         # dropout. (erase_sram_fpga doesn't work here: on NVCM-programmed
         # modules the config port can't be activated while the design runs;
@@ -181,8 +185,8 @@ def test_dead_camera_recovers_on_next_scan(sensor):
         # Stall detector fires within 3 frames (~75 ms); isolation +
         # rail-off runs from the main loop right after.
         time.sleep(2.0)
-        assert tap.saw("Camera 2 has stopped posting data"), tap.lines
-        assert tap.saw("Camera 2: rail off"), tap.lines
+        assert tap.saw(f"Camera {KILL_CAM} has stopped posting data"), tap.lines
+        assert tap.saw(f"Camera {KILL_CAM}: rail off"), tap.lines
 
         # Scan teardown must succeed cleanly with a dead camera present.
         assert sensor.disable_aggregator_fsin() is True
@@ -194,24 +198,24 @@ def test_dead_camera_recovers_on_next_scan(sensor):
 
         # --- cool-off: rail returns on its own with the FPGA in reset ---
         time.sleep(COOL_OFF_S + 2.0)
-        assert tap.saw("Camera 2: rail re-powered after cool-off"), tap.lines
+        assert tap.saw(f"Camera {KILL_CAM}: rail re-powered after cool-off"), tap.lines
 
         # --- scan 2: the unmodified bring-up must fully recover it ---
         _bring_up(sensor, CAM_MASK)
-        assert tap.saw("Camera 2: recovered after data-stall"), tap.lines
+        assert tap.saw(f"Camera {KILL_CAM}: recovered after data-stall"), tap.lines
 
         received = _stream_window(sensor, CAM_MASK, STREAM_SETTLE_S)
         assert received >= MIN_HEALTHY_BYTES, (
             f"post-recovery stream too thin: {received} bytes "
-            f"(expected >= {MIN_HEALTHY_BYTES}) — camera 2 likely still dark"
+            f"(expected >= {MIN_HEALTHY_BYTES}) — camera {KILL_CAM} likely still dark"
         )
         # A 2-camera frame is only assembled when BOTH cameras post data,
         # so a healthy byte count at the 2-camera frame size implies the
         # killed camera is posting again. Also assert it died exactly once
         # (the deliberate kill) and not again after recovery.
         deaths = sum(
-            "Camera 2 has stopped posting data" in line for line in tap.lines
+            f"Camera {KILL_CAM} has stopped posting data" in line for line in tap.lines
         )
-        assert deaths == 1, f"camera 2 died again after recovery ({deaths} deaths)"
+        assert deaths == 1, f"camera {KILL_CAM} died again after recovery ({deaths} deaths)"
     finally:
         logging.getLogger().removeHandler(tap)
