@@ -2085,7 +2085,7 @@ static void imu_service(void)
   uint8_t read_status = ICM_GetAllRawData(&a, &t, &g, &m);
 
   if (read_status != HAL_OK) {
-    /* A flaky ICM fails every tick at 200 Hz — keep the signal, drop the
+    /* A flaky ICM fails every tick at 40 Hz — keep the signal, drop the
      * volume (same pattern as the FSIN debounce warning). */
     static uint32_t imu_read_err_count = 0;
     imu_read_err_count++;
