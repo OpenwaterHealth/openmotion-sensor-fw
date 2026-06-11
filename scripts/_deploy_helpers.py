@@ -29,9 +29,16 @@ def read_project_name(cmake_path: Path) -> str:
     return m.group(1)
 
 
-def bin_path_for(repo_root: Path, config: str, project: str) -> Path:
-    """Return the absolute path to the produced .bin for a given config."""
-    return repo_root / "build" / config / f"{project}.bin"
+def bin_path_for(repo_root: Path, config: str, project: str,
+                 fw_only: bool = False) -> Path:
+    """Return the absolute path to the produced .bin for a given config.
+
+    With fw_only=True, return the pre-merge firmware-only image
+    (``{project}-raw.bin``) — no FPGA bitstream, so flashing it leaves the
+    bitstream sectors untouched and is much faster.
+    """
+    name = f"{project}-raw.bin" if fw_only else f"{project}.bin"
+    return repo_root / "build" / config / name
 
 
 def _bundled_dfu_util() -> Optional[Path]:
@@ -92,6 +99,67 @@ def resolve_dfu_util(override: str | None) -> str:
             "--dfu-util PATH."
         )
     return found
+
+
+# Default install locations for STM32CubeProgrammer's CLI, checked when it
+# isn't on PATH. The CLI flashes the same ROM DFU bootloader ~10x faster than
+# dfu-util because it doesn't sleep through every bwPollTimeout the bootloader
+# reports between 2 KB chunks.
+_CUBE_CLI_DEFAULT_PATHS = (
+    Path("C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe"),
+    Path("C:/Program Files (x86)/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe"),
+    Path("/usr/local/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI"),
+    Path("/Applications/STMicroelectronics/STM32Cube/STM32CubeProgrammer/STM32CubeProgrammer.app/Contents/MacOs/bin/STM32_Programmer_CLI"),
+)
+
+
+def resolve_programmer_cli(override: str | None) -> Optional[str]:
+    """Return a path to STM32_Programmer_CLI, or None if not installed.
+
+    Search order:
+      1. --programmer-cli override (must exist if given)
+      2. STM32_Programmer_CLI on PATH
+      3. Known default install locations
+
+    Unlike resolve_dfu_util, a missing CLI is not an error — the caller
+    falls back to dfu-util.
+    """
+    if override:
+        if not Path(override).is_file():
+            raise RuntimeError(
+                f"--programmer-cli path does not exist: {override}"
+            )
+        return override
+
+    found = shutil.which("STM32_Programmer_CLI")
+    if found:
+        return found
+
+    for candidate in _CUBE_CLI_DEFAULT_PATHS:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def wait_for_dfu_device_cube(cli: str, timeout: float = 10.0,
+                             poll_interval: float = 0.3) -> bool:
+    """Poll `STM32_Programmer_CLI -l usb` until an STM32 DFU device appears.
+
+    Returns True if a device was found, False on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [cli, "-l", "usb"],
+                capture_output=True, text=True, check=False,
+            )
+            if "Device Index" in result.stdout:
+                return True
+        except FileNotFoundError:
+            return False
+        time.sleep(poll_interval)
+    return False
 
 
 DFU_VID_PID_STR = "0483:df11"
