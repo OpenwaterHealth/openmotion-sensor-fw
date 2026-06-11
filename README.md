@@ -1,6 +1,24 @@
 # Openwater Open-Motion Sensor Module v1.0.0
 This repository contains the firmware for the Motion Sensor Module.
 
+# Build & Flash
+
+Requires arm-none-eabi-gcc, CMake 3.22+, and Ninja (or use the `ghcr.io/openwaterhealth/stm32-build-env:latest` Docker image). The configure step downloads the latest FPGA bitstream from GitHub releases; to work offline, pre-place it at `fpga/openmotion-camera-fpga.bin`.
+
+```powershell
+cmake --preset Debug
+cmake --build build/Debug    # → build/Debug/motion-sensor-fw.{elf,hex,bin}
+```
+
+Flash a connected sensor over USB DFU (no ST-LINK needed):
+
+```powershell
+python scripts/deploy.py --device left    # or right; see --help for options
+# equivalent: cmake --build build/Debug --target flash-left
+```
+
+The script enters DFU mode through the `omotion` SDK, flashes the merged firmware + FPGA image, and waits for the sensor to re-enumerate. See `scripts/deploy.py --help` for options.
+
 # Driver Install
 This device is a USB composite device with three interfaces and we are required to install the Latest WinUSB Driver for COMMS_HISTO_IMU(HS)
 

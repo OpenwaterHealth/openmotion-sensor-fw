@@ -1293,8 +1293,17 @@ _Bool send_data(void) {
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
-	if(get_timestamp_ms() - most_recent_frame_time < 15 ){ 
-		printf("Frame sync detected less than 15ms after previous frame (debounce issue), passing.\r\n");
+	if(get_timestamp_ms() - most_recent_frame_time < 15 ){
+		/* Rate-limit this warning: on boards with FSIN ringing it fires on
+		 * EVERY frame (40 Hz), and the printf flood over UART/USB has been
+		 * an amplifier in several USB-death cascades. Keep the signal,
+		 * drop the volume. */
+		static uint32_t debounce_count = 0;
+		debounce_count++;
+		if ((debounce_count & 0xFF) == 1) {
+			printf("Frame sync debounce (<15ms): %lu events so far, passing.\r\n",
+			       (unsigned long)debounce_count);
+		}
 		return true;
 	}
 
@@ -1986,14 +1995,28 @@ _Bool enable_camera_power(uint8_t cam_id){
 
 	CameraDevice *cam = get_camera_byID(cam_id);
 
+	/* Hold the FPGA in reset BEFORE applying power. Without this, every
+	 * NVCM-programmed CrossLink auto-boots ~50 ms after its rail comes up;
+	 * a multi-camera power-on mask then boots several FPGAs simultaneously,
+	 * which exceeds some modules' power/bus margins and kills the MCU's USB
+	 * (bench-proven 2026-06-10, see docs/nvcm-rowdrop-incident.md follow-ups).
+	 * With CRESETB held low the FPGA stays quiet until program_fpga()'s
+	 * per-camera detect/program flow releases it — boots are serialized by
+	 * construction, and the reset-held FPGA also can't drive its config
+	 * pins (shared with the I2C mux channel and SPI/USART buses).
+	 *
+	 * ONLY on a real off->on transition: re-issuing power-on for a camera
+	 * that is already running (apps do this between scans) must not yank
+	 * CRESETB on a live design — that kills it mid-transfer and wedges the
+	 * MCU's SPI/USART in BUSY ("camera not READY" on the next scan). */
+	if (!cam->isPowered) {
+		HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+	}
 	HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET); // Set power pin high
 	cam->isPowered = true;
-	/* Do NOT select the mux channel here. A freshly powered CrossLink with
-	 * blank/unloaded config drives its config pins during its boot attempt,
-	 * and those are the same physical pins as this mux channel — connecting
-	 * the channel now clamps the shared I2C bus and the next transaction
-	 * times out. Every I2C consumer (temp poll, FPGA programming, camera
-	 * config) selects the channel itself right before transacting. */
+	/* Do NOT select the mux channel here either — every I2C consumer (temp
+	 * poll, FPGA programming, camera config) selects the channel itself
+	 * right before transacting. */
 
 	printf("Enabled Power for Camera %d\r\n", cam_id+1);
 	return true;
