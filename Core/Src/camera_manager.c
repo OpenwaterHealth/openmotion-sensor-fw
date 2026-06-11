@@ -1943,6 +1943,16 @@ _Bool enable_camera_stream(uint8_t cam_id){
 		return false;
 	}
 
+	/* Refuse to arm a dead or unpowered camera: a recovery-pending camera's
+	 * rail and mux channel are off (regulator cool-off) and arming it would
+	 * re-select the disabled channel and fail noisily downstream. The next
+	 * scan's power->program->configure sequence clears needs_recovery first.
+	 * (disable_camera_stream is the symmetric no-op-success guard.) */
+	if (cam_array[cam_id].needs_recovery || !cam_array[cam_id].isPowered) {
+		printf("Camera %d stream enable refused: awaiting recovery/power\r\n", cam_id + 1);
+		return false;
+	}
+
 	bool status = false;
 	bool enabled = (event_bits_enabled & (1 << cam_id)) != 0;
 	if(enabled){
