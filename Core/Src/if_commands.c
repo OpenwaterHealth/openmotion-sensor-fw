@@ -12,6 +12,7 @@
 #include "common.h"
 #include "jsmn.h"
 #include "i2c_master.h"
+#include "i2c_health.h"
 #include "i2c_protocol.h"
 #include "ICM20948.h"
 #include "0X02C1B.h"
@@ -86,6 +87,17 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		uartResp->command = OW_CMD_TOGGLE_LED;
 		uartResp->packet_type = OW_RESP;
 		HAL_GPIO_TogglePin(ERROR_LED_GPIO_Port, ERROR_LED_Pin);
+		break;
+	case OW_CMD_I2C_STATUS:
+		VERBOSE_CMD("[CMD] OW_CMD_I2C_STATUS reserved=0x%02X\r\n", cmd.reserved);
+		uartResp->command = OW_CMD_I2C_STATUS;
+		uartResp->packet_type = OW_RESP;
+		/* reserved==1 -> re-run the scan live before returning the snapshot. */
+		if (cmd.reserved == 1) {
+			i2c_health_scan();
+		}
+		uartResp->data_len = sizeof(i2c_health_t);
+		uartResp->data = (uint8_t *)i2c_health_get();
 		break;
 	case OW_CMD_DEBUG_FLAGS: {
 		VERBOSE_CMD("[CMD] OW_CMD_DEBUG_FLAGS reserved=0x%02X len=%u\r\n", cmd.reserved, (unsigned)cmd.data_len);
