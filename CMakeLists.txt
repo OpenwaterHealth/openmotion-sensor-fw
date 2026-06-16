@@ -95,6 +95,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/histo_fake.c
     Core/Src/i2c_protocol.c
     Core/Src/i2c_master.c
+    Core/Src/i2c_health.c
     Core/Src/ICM20948.c
     Core/Src/if_commands.c
     Core/Src/lwrb.c
