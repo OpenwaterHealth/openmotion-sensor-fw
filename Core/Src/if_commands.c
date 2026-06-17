@@ -18,6 +18,7 @@
 #include "0X02C1B.h"
 #include "histo_fake.h"
 #include "motion_config.h"
+#include "sensor_serial.h"
 #include "logging.h"
 #include <stdio.h>
 #include <inttypes.h>
@@ -185,6 +186,50 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		}
 		break;
 		
+	case OW_CMD_SERIAL: {
+		VERBOSE_CMD("[CMD] OW_CMD_SERIAL reserved=%u len=%u\r\n", cmd.reserved, (unsigned)cmd.data_len);
+		uartResp->command = OW_CMD_SERIAL;
+		uartResp->packet_type = OW_RESP;
+		// reserved == 0: READ  -> payload = ASCII serial (data_len 0 == unprogrammed)
+		// reserved == 1: WRITE (guarded; OW_ERROR if already programmed)
+		// reserved == 2: WRITE (force)
+		if (cmd.reserved == 0) {
+			static char serial_buf[SERIAL_MAX_LEN];
+			uint8_t serial_len = 0;
+			if (Serial_Read(serial_buf, &serial_len) != HAL_OK) {
+				// Unprogrammed: empty payload, not an error.
+				uartResp->data_len = 0;
+				uartResp->data = NULL;
+			} else {
+				uartResp->data_len = serial_len;
+				uartResp->data = (uint8_t *)serial_buf;
+			}
+		} else if (cmd.reserved == 1 || cmd.reserved == 2) {
+			bool force = (cmd.reserved == 2);
+			if (cmd.data == NULL || cmd.data_len == 0 ||
+			    cmd.data_len > SERIAL_MAX_LEN) {
+				uartResp->packet_type = OW_ERROR;
+				uartResp->data_len = 0;
+				uartResp->data = NULL;
+				break;
+			}
+			// HAL_BUSY == refused overwrite; HAL_ERROR == bad input / flash fail.
+			if (Serial_Write((const char *)cmd.data, (uint8_t)cmd.data_len, force) != HAL_OK) {
+				uartResp->packet_type = OW_ERROR;
+				uartResp->data_len = 0;
+				uartResp->data = NULL;
+				break;
+			}
+			// ACK with empty payload on success.
+			uartResp->data_len = 0;
+			uartResp->data = NULL;
+		} else {
+			uartResp->packet_type = OW_UNKNOWN;
+			uartResp->data_len = 0;
+			uartResp->data = NULL;
+		}
+		break;
+	}
 	case OW_CMD_RESET:
 		VERBOSE_CMD("[CMD] OW_CMD_RESET\r\n");
 		uartResp->command = OW_CMD_RESET;

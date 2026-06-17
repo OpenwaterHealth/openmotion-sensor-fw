@@ -35,9 +35,16 @@
 #define ADDR_FLASH_SECTOR_6_BANK2     ((uint32_t)0x081C0000) /* Base @ of Sector 6, 128 Kbytes */
 #define ADDR_FLASH_SECTOR_7_BANK2     ((uint32_t)0x081E0000) /* Base @ of Sector 7, 128 Kbytes */
 
+/* Camera FPGA bitstream is ~160 KB, so it occupies sectors 5 AND 6 of bank 2. */
 #define ADDR_CAMERA_BITSTREAM       ADDR_FLASH_SECTOR_5_BANK2
-#define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000) 
-#define FLASH_USER_START_ADDR       ADDR_FLASH_SECTOR_7_BANK2
+#define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000)
+#define FLASH_USER_START_ADDR       ADDR_FLASH_SECTOR_7_BANK2   /* motion_config */
+
+/* Hardware serial number record. Its own bank-2 sector, distinct from
+ * motion_config (sector 7) and the camera bitstream (sectors 5-6), because the
+ * minimum flash erase granularity is one 128 KB sector. Lives outside the
+ * firmware image (linker caps FLASH at bank 1), so it survives FW updates. */
+#define FLASH_SERIAL_START_ADDR     ADDR_FLASH_SECTOR_4_BANK2
 
 #ifdef __cplusplus
 }
