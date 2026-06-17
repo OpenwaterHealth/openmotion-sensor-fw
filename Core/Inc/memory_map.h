@@ -40,11 +40,15 @@
 #define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000)
 #define FLASH_USER_START_ADDR       ADDR_FLASH_SECTOR_7_BANK2   /* motion_config */
 
-/* Hardware serial number record. Its own bank-2 sector, distinct from
- * motion_config (sector 7) and the camera bitstream (sectors 5-6), because the
- * minimum flash erase granularity is one 128 KB sector. Lives outside the
- * firmware image (linker caps FLASH at bank 1), so it survives FW updates. */
-#define FLASH_SERIAL_START_ADDR     ADDR_FLASH_SECTOR_4_BANK2
+/* Hardware serial number: a 32-byte record at the TOP of the motion_config
+ * sector (sector 7). Sector 7 is the only flash region ABOVE the firmware
+ * image (the merged image runs from 0x08000000 through the FPGA bitstream end
+ * in sector 6), so it is the only place a value survives a full firmware flash
+ * — which is exactly why motion_config lives there too. The two tenants share
+ * one 128 KB sector (the minimum erase granularity); motion_config.c owns the
+ * sector and preserves this slot across its erase/rewrite. */
+#define FLASH_SERIAL_RECORD_SIZE    32U
+#define FLASH_SERIAL_START_ADDR     (ADDR_FLASH_END_ADDRESS - FLASH_SERIAL_RECORD_SIZE)
 
 #ifdef __cplusplus
 }

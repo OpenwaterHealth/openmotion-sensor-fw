@@ -10,6 +10,7 @@
 
 #include "sensor_serial.h"
 #include "flash_eeprom.h"
+#include "motion_config.h"
 #include "memory_map.h"
 #include <string.h>
 #include <stddef.h>
@@ -104,12 +105,10 @@ HAL_StatusTypeDef Serial_Write(const char *s, uint8_t len, bool force)
     rec.reserved = 0;
     rec.crc16    = serial_crc16(&rec, offsetof(serial_record_t, crc16));
 
-    /* Flash is write-once-per-erase: erase the reserved sector, then program. */
-    if (Flash_Erase(FLASH_SERIAL_START_ADDR, FLASH_SERIAL_START_ADDR) != HAL_OK) {
-        return HAL_ERROR;
-    }
-    if (Flash_Write_Bytes(FLASH_SERIAL_START_ADDR,
-                          (const uint8_t *)&rec, sizeof(rec)) != HAL_OK) {
+    /* The serial shares the config's flash sector (the only sector that
+     * survives a full firmware flash), so motion_config owns the erase and
+     * carries the config through it. */
+    if (motion_cfg_persist_serial((const uint8_t *)&rec) != HAL_OK) {
         return HAL_ERROR;
     }
 

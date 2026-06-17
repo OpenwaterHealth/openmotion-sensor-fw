@@ -4,10 +4,13 @@
  * Sensor module hardware serial number, persisted in internal flash.
  *
  * The sensor has no external NV memory, so unlike the console (which stores
- * this in the 24AA025E48 EEPROM) the record lives in a dedicated bank-2 flash
- * sector at FLASH_SERIAL_START_ADDR. That sector is outside the firmware image
- * (the linker caps FLASH at bank 1 / 1024K), so the serial survives both power
- * cycles and firmware updates — the same guarantee motion_config relies on.
+ * this in the 24AA025E48 EEPROM) the record lives in internal flash, in a
+ * 32-byte slot at the top of the motion_config sector (FLASH_SERIAL_START_ADDR).
+ * That sector (sector 7) is the only flash region above the firmware image
+ * (incl. the merged FPGA bitstream), so it is the only place a value survives a
+ * full firmware flash — which is why motion_config lives there too. The two
+ * share one erase granularity; motion_config.c owns the sector and preserves
+ * this slot across its rewrites (writes here go through motion_cfg_persist_serial).
  *
  * The on-wire record layout and the OW_CMD_SERIAL command semantics are kept
  * byte-for-byte identical to the console's console_serial.h so the SDK / test
