@@ -30,6 +30,7 @@
 #include "logging.h"
 #include "utils.h"
 #include "i2c_master.h"
+#include "i2c_health.h"
 #include "histo_fake.h"
 #include "ICM20948.h"
 #include "camera_manager.h"
@@ -395,6 +396,12 @@ int main(void)
   HAL_GPIO_WritePin(ERROR_LED_GPIO_Port, ERROR_LED_Pin, GPIO_PIN_SET);
 
   init_camera_sensors(); // init structures and camera configs
+
+  /* Boot-time I2C health scan: bring up each camera/FPGA one at a time and
+   * verify mux, IMU, all 8 cameras and FPGAs respond. Caches a snapshot the
+   * host can read via OW_CMD_I2C_STATUS. Leaves all cameras powered off. */
+  i2c_health_scan();
+  HAL_IWDG_Refresh(&hiwdg1);
 
   // Select default camera
   TCA9548A_SelectChannel(&hi2c1, 0x70, get_active_cam()->i2c_target);

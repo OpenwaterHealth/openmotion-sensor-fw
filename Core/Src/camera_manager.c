@@ -34,7 +34,7 @@ static uint8_t  next_cam_idx = 0;
  * and camera_i2c_service() does the bus work from the main loop, where it
  * is naturally serialized with every other hi2c1 user. */
 static volatile bool    cam_temp_poll_due = false;     /* set by send_data() */
-static volatile uint8_t cam_mux_disable_pending = 0;   /* set by check_camera_failures() */
+static volatile uint8_t cam_recovery_pending = 0;   /* set by check_camera_failures() (frame ISR); serviced by camera_i2c_service() */
 
 #define FPGA_I2C_ADDRESS 0x40  // Replace with your FPGA's I2C address
 #define HISTO_JSON_BUFFER_SIZE 34000
@@ -199,6 +199,8 @@ static void init_camera(CameraDevice *cam){
 	cam->isProgrammed = false;
 	cam->isPowered = true;
 	cam->isPresent = false;
+	cam->needs_recovery = false;
+	cam->recovery_repower_at = 0;
 }
 
 void init_camera_sensors() {
@@ -827,6 +829,8 @@ uint32_t read_usercode_fpga(uint8_t cam_id)
 	return ret_val;
 }
 
+static void camera_recovery_complete(CameraDevice *cam);
+
 _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len, _Bool force_update)
 {
 	printf("C%d: programming...", cam_id+1);
@@ -844,6 +848,7 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 		if(fpga_detect_nvcm(cam)){
 			cam->isProgrammed = true;
 			printf("NVCM programmed, skipping\r\n");
+			camera_recovery_complete(cam);
 			return true;
 		}
 	} else {
@@ -861,10 +866,23 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 		printf("Program FPGA Camera %d Failed\r\n", cam_id+1);
 		return false;
 	}else{
-
+		cam->isProgrammed = true;
+		camera_recovery_complete(cam);
 	}
 	printf("done\r\n");
 	return true;
+}
+
+/* A successful FPGA bring-up is the last firmware-owned step of death
+ * recovery (the host's config + stream-enable commands follow on their
+ * own). Clear the marker and announce it. */
+static void camera_recovery_complete(CameraDevice *cam)
+{
+    if (cam->needs_recovery) {
+        cam->needs_recovery = false;
+        printf("Camera %d: recovered after data-stall (power-cycled, reprogrammed)\r\n",
+               cam->id + 1);
+    }
 }
 
 _Bool program_fpga(uint8_t cam_id, _Bool force_update)
@@ -886,6 +904,7 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 		if(fpga_detect_nvcm(cam)){
 			cam->isProgrammed = true;
 			printf("C%d: NVCM programmed, skipping SRAM load\r\n", cam_id+1);
+			camera_recovery_complete(cam);
 			return true;
 		}
 	} else {
@@ -906,6 +925,7 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 		return false;
 	} else {
 		cam->isProgrammed = true;
+		camera_recovery_complete(cam);
 	}
 
 	// If the selected camera is one that uses USART, 
@@ -1070,7 +1090,10 @@ static void poll_camera_temperatures(void)
             uint8_t cam = next_cam_idx;
             next_cam_idx = (next_cam_idx + 1) % CAM_TEMP_TOTAL_CAMS;
 
-            if (cam_array[cam].isPresent)
+            /* Poll only powered slots: a dead camera mid cool-off has its
+             * rail (and mux channel) off; polling it would re-select the
+             * channel and fail every read. */
+            if (cam_array[cam].isPresent && cam_array[cam].isPowered)
             {
                 CameraDevice *pCam = get_camera_byID(cam);
                 if (pCam != NULL)
@@ -1078,7 +1101,14 @@ static void poll_camera_temperatures(void)
                     // Select the correct I2C channel for this camera before reading temperature
                     if (TCA9548A_SelectChannel(&hi2c1, 0x70, pCam->i2c_target) == HAL_OK)
                     {
-                        cam_temp[cam] = X02C1B_read_temp(pCam);
+                        /* Keep last-known-good on failed reads: read_temp
+                         * returns a negative error code on I2C failure, and
+                         * a live OV2312 die never legitimately reads <= 0 °C
+                         * (self-heating), so treat non-positive as failure. */
+                        float t = X02C1B_read_temp(pCam);
+                        if (t > 0.0f) {
+                            cam_temp[cam] = t;
+                        }
                     }
                     else
                     {
@@ -1097,28 +1127,98 @@ static void poll_camera_temperatures(void)
     }
 }
 
+/* Isolate a camera the stall detector declared dead, and start its cool-off.
+ * Main-loop only (blocking I2C + HAL aborts). See the design spec. */
+static void camera_death_isolate(uint8_t cam_id)
+{
+    CameraDevice *cam = get_camera_byID(cam_id);
+    if (cam == NULL) {
+        return;
+    }
+
+    /* Transport: abort in-flight DMA, flush FIFOs, force HAL READY — covers
+     * both USART and SPI cameras. Without this the dead camera's peripheral
+     * sits in BUSY_RX and the SDK's pre-program READY status check fails,
+     * aborting the next scan before recovery could run. */
+    (void)reset_camera_usart(cam_id);
+
+    /* Drop any stale event bit: a dying camera's last DMA can complete on
+     * garbage clock edges during the regulator brownout, and the bit would
+     * otherwise put one garbage section into the next frame. (The send
+     * paths also mask ready_bits by event_bits_enabled — defense in depth
+     * against the BUSY_RX re-arm this caused on 2026-06-11.) */
+    __disable_irq();
+    event_bits &= (uint8_t)~(1u << cam_id);
+    __enable_irq();
+
+    /* FPGA into reset: it can't drive the shared mux/bus pins, and if the
+     * regulator un-latches on its own an NVCM part can't auto-boot
+     * uncontrolled (see enable_camera_power()'s serialized-boot rationale). */
+    HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+
+    /* Disconnect the mux channel so a sensor holding SDA low can't wedge
+     * the temperature poll below (bounded TCA9548A timeout). */
+    if (TCA9548A_DisableChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
+        printf("Camera %d: failed to disable TCA mux channel %u\r\n",
+               cam_id + 1, (unsigned)cam->i2c_target);
+    }
+
+    /* Rail off so the PCB regulator can cool and clear its thermal latch.
+     * Deliberately preserves isPresent (scan-start determination) and
+     * cam_temp[] (host keeps last known good temperature). */
+    HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_RESET);
+    cam->isPowered = false;
+    cam->isProgrammed = false;
+    cam->isConfigured = false;
+    cam->streaming_enabled = false;
+    cam->recovery_repower_at = get_timestamp_ms() + CAMERA_RECOVERY_OFF_MS;
+
+    printf("Camera %d: rail off for %u ms (regulator cool-off)\r\n",
+           cam_id + 1, (unsigned)CAMERA_RECOVERY_OFF_MS);
+}
+
+/* Re-power a dead camera's rail once its cool-off has elapsed, keeping
+ * CRESETB low: the FPGA stays unbooted and quiet, while the OV2312 (direct
+ * I2C behind the mux) comes back up so temperature telemetry resumes.
+ * needs_recovery stays set until program_fpga() completes the real
+ * bring-up at the next scan. Main-loop only. */
+static void camera_recovery_tick(void)
+{
+    uint32_t now = get_timestamp_ms();
+
+    for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+        CameraDevice *cam = &cam_array[cam_id];
+        if (!cam->needs_recovery || cam->isPowered) {
+            continue;  /* healthy, or host already re-powered it (option B) */
+        }
+        if ((int32_t)(now - cam->recovery_repower_at) < 0) {
+            continue;  /* still cooling (wrap-safe compare) */
+        }
+
+        HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(cam->power_port, cam->power_pin, GPIO_PIN_SET);
+        cam->isPowered = true;
+
+        printf("Camera %d: rail re-powered after cool-off (FPGA held in reset)\r\n",
+               cam_id + 1);
+    }
+}
+
 void camera_i2c_service(void)
 {
-    /* Disconnect the mux channels of failed cameras before the temperature
-     * poll, so a sensor holding SDA low can't wedge the reads below. */
-    if (cam_mux_disable_pending != 0u) {
+    /* Isolate cameras the frame ISR's stall detector declared dead — abort
+     * their transport, hold CRESETB low, disconnect their mux channel and
+     * cut their rail — before the temperature poll, so a wedged sensor
+     * can't stall the reads below. */
+    if (cam_recovery_pending != 0u) {
         __disable_irq();
-        uint8_t pending = cam_mux_disable_pending;
-        cam_mux_disable_pending = 0u;
+        uint8_t pending = cam_recovery_pending;
+        cam_recovery_pending = 0u;
         __enable_irq();
 
         for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
-            if ((pending & (1u << cam_id)) == 0u) {
-                continue;
-            }
-            CameraDevice *pFailed = get_camera_byID(cam_id);
-            if (pFailed != NULL) {
-                HAL_StatusTypeDef mux_ret =
-                    TCA9548A_DisableChannel(&hi2c1, 0x70, pFailed->i2c_target);
-                if (mux_ret != HAL_OK) {
-                    printf("Camera %d: failed to disable TCA mux channel %u (ret=%d)\r\n",
-                           cam_id + 1, (unsigned)pFailed->i2c_target, (int)mux_ret);
-                }
+            if ((pending & (1u << cam_id)) != 0u) {
+                camera_death_isolate(cam_id);
             }
         }
     }
@@ -1127,6 +1227,8 @@ void camera_i2c_service(void)
         cam_temp_poll_due = false;
         poll_camera_temperatures();
     }
+
+    camera_recovery_tick();  /* Re-power dead cameras whose cool-off elapsed */
 }
 /* -------- END CAMERA I2C FUNCTIONS -------- */
 
@@ -1286,28 +1388,24 @@ static void check_camera_failures(void) {
 				if (camera_failure_counters[cam_id] >= CAMERA_FAILURE_THRESHOLD_CYCLES) {
 					// Only act once per failure (when threshold is exactly reached)
 					if (camera_failure_counters[cam_id] == CAMERA_FAILURE_THRESHOLD_CYCLES) {
-						cam_array[cam_id].isPresent = false;
+						/* Mark dead via needs_recovery — NOT isPresent, which keeps
+						 * the presence determination from scan start. The likely
+						 * cause is the camera PCB's power regulator hitting thermal
+						 * shutdown (kills both FPGA and OV2312), so the camera
+						 * needs a timed rail cycle, done from the main loop. */
+						cam_array[cam_id].needs_recovery = true;
 						printf("Camera %d has stopped posting data\r\n", cam_id + 1);
 
-						/* ── Cleanly isolate the failed camera ────────────────────────
-						 * 1. Remove from event_bits_enabled so subsequent frames never
-						 *    wait for it (and the temperature poller skips it).
-						 * 2. Tell the TCA9548A I2C mux to disconnect that channel.
-						 *    This prevents poll_camera_temperatures() from ever
-						 *    selecting it and getting the I2C bus stuck if the sensor
-						 *    is holding SDA low (the root cause of COMM going dark). */
-
-						/* 1. Clear the camera's event-enable bit (atomic) */
+						/* 1. Clear the camera's event-enable bit (atomic) so
+						 *    subsequent frames never wait for it. */
 						__disable_irq();
 						event_bits_enabled &= ~(uint8_t)(1u << cam_id);
 						__enable_irq();
 
-						/* 2. Queue the camera's I2C mux channel for deselect.
-						 *    This runs in the FSIN/TIM4 frame ISR, which must not
-						 *    touch hi2c1 (a main-loop transaction may be mid-flight);
-						 *    camera_i2c_service() does the mux write from the main
-						 *    loop with the bounded TCA9548A timeout. */
-						cam_mux_disable_pending |= (uint8_t)(1u << cam_id);
+						/* 2. Queue isolation + rail-off for the main loop. This
+						 *    runs in the FSIN/TIM4 frame ISR, which must not touch
+						 *    hi2c1 or block; camera_i2c_service() does the work. */
+						cam_recovery_pending |= (uint8_t)(1u << cam_id);
 					}
 				}
 			}
@@ -1429,7 +1527,12 @@ _Bool send_histogram_data(void) {
 		return true;
 	}
 	__disable_irq();
-	ready_bits = event_bits;
+	/* Mask by event_bits_enabled: a dead camera's aborted DMA can complete
+	 * on garbage clock edges while its regulator browns out, setting a stale
+	 * event bit. Unmasked, that bit would put its garbage buffer in the
+	 * frame AND re-arm reception below — re-wedging the peripheral in
+	 * BUSY_RX ("camera not READY" on the next scan, field-hit 2026-06-11). */
+	ready_bits = event_bits & event_bits_enabled;
 	event_bits = 0x00;
 	__enable_irq();
 
@@ -1578,7 +1681,9 @@ _Bool send_histogram_data_cmp(void) {
 		return true;
 	}
 	__disable_irq();
-	ready_bits = event_bits;
+	/* Mask by event_bits_enabled — same rationale as send_histogram_data():
+	 * never include or re-arm a camera the stall detector disabled. */
+	ready_bits = event_bits & event_bits_enabled;
 	event_bits = 0x00;
 	__enable_irq();
 
@@ -1908,6 +2013,16 @@ _Bool enable_camera_stream(uint8_t cam_id){
 		return false;
 	}
 
+	/* Refuse to arm a dead or unpowered camera: a recovery-pending camera's
+	 * rail and mux channel are off (regulator cool-off) and arming it would
+	 * re-select the disabled channel and fail noisily downstream. The next
+	 * scan's power->program->configure sequence clears needs_recovery first.
+	 * (disable_camera_stream is the symmetric no-op-success guard.) */
+	if (cam_array[cam_id].needs_recovery || !cam_array[cam_id].isPowered) {
+		printf("Camera %d stream enable refused: awaiting recovery/power\r\n", cam_id + 1);
+		return false;
+	}
+
 	bool status = false;
 	bool enabled = (event_bits_enabled & (1 << cam_id)) != 0;
 	if(enabled){
@@ -1978,11 +2093,14 @@ _Bool disable_camera_stream(uint8_t cam_id){
 		return false;
 	}
 
-	/* A camera that is not present is already stopped — treat disable as a
+	/* A dead or unpowered camera is already stopped — treat disable as a
 	 * no-op success.  Returning false here would cause OW_CAMERA_STREAM to
 	 * report OW_ERROR when the host tries to disable all cameras at the end
-	 * of a scan, even though the failed camera is already fully quiesced. */
-	if (!cam_array[cam_id].isPresent) {
+	 * of a scan, even though the failed camera is already fully quiesced.
+	 * (isPresent is deliberately NOT the death marker — it keeps the
+	 * presence determination from scan start.) */
+	if (cam_array[cam_id].needs_recovery || !cam_array[cam_id].isPowered ||
+	    !cam_array[cam_id].isPresent) {
 		return true;
 	}
 
@@ -2079,6 +2197,10 @@ _Bool disable_camera_power(uint8_t cam_id){
 	cam->isProgrammed = false; // Clear programmed status when power is off
 	cam->isConfigured = false; // Clear configured status when power is off
 	cam->streaming_enabled = false; // Clear streaming status when power is off
+	/* An explicit host power-off IS the recovery rail-cycle — and it must
+	 * disarm the cool-off tick so it can't re-power a camera the host
+	 * deliberately turned off (e.g. power_off_unused_cameras). */
+	cam->needs_recovery = false;
 
 	printf("Disabled Power for Camera %d\r\n", cam_id+1);
 	return true;
@@ -2108,6 +2230,7 @@ void power_off_all_cameras(void) {
 		cam->isProgrammed = false;
 		cam->isConfigured = false;
 		cam->streaming_enabled = false;
+		cam->needs_recovery = false;
 		cam_temp[i] = 25.0f;
 	}
 	printf("All cameras powered off\r\n");
