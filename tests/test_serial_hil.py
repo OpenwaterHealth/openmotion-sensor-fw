@@ -36,7 +36,7 @@ SERIAL_WRITE_FORCE = 2
 SERIAL_MAX_LEN = 24
 _ERROR_TYPES = (OW_ERROR, OW_NAK)
 
-CONNECT_TIMEOUT_S = 15.0
+CONNECT_TIMEOUT_S = 40.0  # bench enumeration after a cold boot can take 30-40s
 
 requires_bench = pytest.mark.skipif(
     os.environ.get("OPENMOTION_HIL") != "1",
@@ -173,7 +173,7 @@ def test_serial_persists_across_power_cycle():
         interface.stop()
 
         subprocess.run(cycle_cmd, shell=True, check=True, timeout=60)
-        time.sleep(8.0)  # re-enumeration settle
+        time.sleep(12.0)  # re-enumeration settle
 
         interface, handle = _connect(side)
         assert _read_serial(handle) == test_serial, "serial did not survive power cycle"
