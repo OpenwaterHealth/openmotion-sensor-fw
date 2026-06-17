@@ -104,6 +104,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/uart_comms.c
     Core/Src/flash_eeprom.c
     Core/Src/motion_config.c
+    Core/Src/sensor_serial.c
     Core/Src/system_monitor.c
     Core/Src/if_factory_prog.c
     Core/Src/ram_scrub.c

@@ -76,6 +76,13 @@ HAL_StatusTypeDef motion_cfg_commit(void);
 // Restores factory defaults and writes them to flash.
 HAL_StatusTypeDef motion_cfg_factory_reset(void);
 
+// Persists a 32-byte hardware serial record into the reserved slot at the top
+// of the config sector (FLASH_SERIAL_START_ADDR), preserving the current
+// config. Owned here because the serial shares the config's flash sector — the
+// only sector that survives a full firmware flash. See sensor_serial.c.
+// serial_rec must point to FLASH_SERIAL_RECORD_SIZE bytes.
+HAL_StatusTypeDef motion_cfg_persist_serial(const uint8_t *serial_rec);
+
 // Convenience helpers for working with the JSON blob.
 // - motion_cfg_get_json_ptr() returns a pointer into the live config (NUL-terminated).
 // - motion_cfg_set_json() persists the provided JSON text into flash.

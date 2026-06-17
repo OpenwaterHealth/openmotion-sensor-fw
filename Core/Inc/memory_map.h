@@ -35,9 +35,20 @@
 #define ADDR_FLASH_SECTOR_6_BANK2     ((uint32_t)0x081C0000) /* Base @ of Sector 6, 128 Kbytes */
 #define ADDR_FLASH_SECTOR_7_BANK2     ((uint32_t)0x081E0000) /* Base @ of Sector 7, 128 Kbytes */
 
+/* Camera FPGA bitstream is ~160 KB, so it occupies sectors 5 AND 6 of bank 2. */
 #define ADDR_CAMERA_BITSTREAM       ADDR_FLASH_SECTOR_5_BANK2
-#define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000) 
-#define FLASH_USER_START_ADDR       ADDR_FLASH_SECTOR_7_BANK2
+#define ADDR_FLASH_END_ADDRESS      ((uint32_t)0x08200000)
+#define FLASH_USER_START_ADDR       ADDR_FLASH_SECTOR_7_BANK2   /* motion_config */
+
+/* Hardware serial number: a 32-byte record at the TOP of the motion_config
+ * sector (sector 7). Sector 7 is the only flash region ABOVE the firmware
+ * image (the merged image runs from 0x08000000 through the FPGA bitstream end
+ * in sector 6), so it is the only place a value survives a full firmware flash
+ * — which is exactly why motion_config lives there too. The two tenants share
+ * one 128 KB sector (the minimum erase granularity); motion_config.c owns the
+ * sector and preserves this slot across its erase/rewrite. */
+#define FLASH_SERIAL_RECORD_SIZE    32U
+#define FLASH_SERIAL_START_ADDR     (ADDR_FLASH_END_ADDRESS - FLASH_SERIAL_RECORD_SIZE)
 
 #ifdef __cplusplus
 }
