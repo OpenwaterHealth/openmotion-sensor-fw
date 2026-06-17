@@ -252,12 +252,19 @@ float X02C1B_read_temp(CameraDevice *cam)
         return ret;
     }
 
-    uint16_t bytes = (upper_byte << 8) + lower_byte;
+    /* Datasheet (OX02C1B §10.5.23): {0x4D2A, 0x4D2B} is the TPM average in
+     * Q8.8 fixed-point — upper byte = whole degrees C, lower byte = fraction
+     * (lower/256). Value <= 0xC000 is positive and read directly; value
+     * > 0xC000 is negative: subtract 0xC000, read the remainder as Q8.8, then
+     * negate. e.g. 0xD000 -> 0x10.00 -> -16.0 degC. */
+    uint16_t bytes = ((uint16_t)upper_byte << 8) | lower_byte;
     float temperature;
-    if(bytes < 0xC000)  //temperature is positive
-    	temperature = upper_byte + (0.001f * lower_byte);
-	else
-		temperature = (0xC0 - upper_byte) + (0.001f * lower_byte);
+    if (bytes <= 0xC000) {  // temperature is positive
+        temperature = upper_byte + (lower_byte / 256.0f);
+    } else {                // temperature is negative
+        uint16_t mag = bytes - 0xC000;
+        temperature = -(((mag >> 8) & 0xFF) + ((mag & 0xFF) / 256.0f));
+    }
 
 //    printf("Camera %d Temperature: %f degC (0x%X)\r\n",cam->id+1,temperature,bytes);
 
