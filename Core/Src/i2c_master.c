@@ -39,6 +39,7 @@ static void TCA9548A_ResetHardware(void)
  * SDA low or the peripheral locks up.  100 ms is generous for normal I2C
  * traffic but still guarantees the system stays responsive. */
 #define I2C_SLAVE_TIMEOUT_MS     100U
+#define I2C_REG_READ_TIMEOUT_MS  100U
 
 static HAL_StatusTypeDef TCA9548A_WriteControl(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t data)
 {
@@ -178,7 +179,7 @@ HAL_StatusTypeDef i2c_mem_read(I2C_HandleTypeDef *pI2c, uint8_t dev_addr,
 	                                               : I2C_MEMADD_SIZE_8BIT;
 
 	if (mux_channel != 0xFFu) {
-		status = TCA9548A_SelectChannel(pI2c, 0x70, mux_channel);
+		status = TCA9548A_SelectChannel(pI2c, TCA9548_ADDR, mux_channel);
 		if (status != HAL_OK) {
 			return status;
 		}
@@ -189,7 +190,7 @@ HAL_StatusTypeDef i2c_mem_read(I2C_HandleTypeDef *pI2c, uint8_t dev_addr,
 
 	if (mux_channel != 0xFFu) {
 		/* Always restore a clean bus, even if the read failed. */
-		(void)TCA9548A_DisableAll(pI2c, 0x70);
+		(void)TCA9548A_DisableAll(pI2c, TCA9548_ADDR);
 	}
 
 	return status;

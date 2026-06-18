@@ -18,7 +18,7 @@ uint8_t send_buffer_to_slave(I2C_HandleTypeDef * pI2c, uint8_t slave_addr, uint8
 uint8_t read_status_register_of_slave(I2C_HandleTypeDef * pI2c, uint8_t slave_addr, uint8_t* pBuffer, uint16_t max_len);
 uint8_t read_data_register_of_slave(I2C_HandleTypeDef * pI2c, uint8_t slave_addr, uint8_t* pBuffer, size_t rx_len);
 
-#define I2C_REG_READ_TIMEOUT_MS 100U
+#define I2C_REG_READ_MAX_LEN 256U   /* max bytes per OW_CMD_I2C_REG_READ */
 
 /* Generic register read: read `len` bytes starting at `reg_addr` from device
  * `dev_addr` (7-bit). `reg_addr_size` is 1 (8-bit reg addr) or 2 (16-bit).

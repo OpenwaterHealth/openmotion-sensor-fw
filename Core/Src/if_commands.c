@@ -34,7 +34,7 @@ extern volatile uint8_t event_bits_enabled;
 
 static uint32_t id_words[4] = {0};  /* 3 UID words + 1 zero-pad: HWID reply is 16B, so [3] would over-read 4B past the array */
 static uint8_t camera_status[8] = {0};
-static uint8_t i2c_reg_read_buf[256] = {0};
+static uint8_t i2c_reg_read_buf[I2C_REG_READ_MAX_LEN] = {0};
 static uint8_t camera_power_status = 0;
 static float cam_temp;
 static volatile float imu_temp = 0;
@@ -93,13 +93,13 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		uint16_t reg_addr      = (uint16_t)(((uint16_t)cmd.data[3] << 8) | cmd.data[4]);
 		uint16_t read_len      = (uint16_t)(((uint16_t)cmd.data[5] << 8) | cmd.data[6]);
 
-		if ((reg_addr_size != 1u && reg_addr_size != 2u) || read_len == 0u) {
+		/* mux_channel: 0x00-0x07 = TCA9548A channel, 0xFF = no mux (helper rejects 0x08-0xFE) */
+		if (dev_addr > 0x7Fu ||
+		    (reg_addr_size != 1u && reg_addr_size != 2u) ||
+		    read_len == 0u || read_len > sizeof(i2c_reg_read_buf)) {
 			uartResp->packet_type = OW_ERROR;
 			uartResp->data_len = 0;
 			break;
-		}
-		if (read_len > sizeof(i2c_reg_read_buf)) {
-			read_len = sizeof(i2c_reg_read_buf);
 		}
 
 		if (i2c_mem_read(&hi2c1, dev_addr, reg_addr, reg_addr_size,
