@@ -52,9 +52,9 @@ __ALIGN_BEGIN uint8_t uncmp_payload[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;  // Sta
 static uint8_t _active_buffer = 0; // Index of the buffer currently being written to
 volatile uint8_t frame_id = 0;
 extern volatile uint8_t event_bits_enabled; // holds the event bits for the cameras to be enabled
-extern uint8_t event_bits;
+extern volatile uint8_t event_bits;
 extern USBD_HandleTypeDef hUsbDeviceHS;
-extern uint32_t pulse_count;
+extern volatile uint16_t pulse_count;
 
 
 // Variables for keeping track of statisticss

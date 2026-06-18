@@ -32,7 +32,7 @@ extern volatile uint8_t event_bits_enabled;
 	} \
 } while(0)
 
-static uint32_t id_words[3] = {0};
+static uint32_t id_words[4] = {0};  /* 3 UID words + 1 zero-pad: HWID reply is 16B, so [3] would over-read 4B past the array */
 static uint8_t camera_status[8] = {0};
 static uint8_t camera_power_status = 0;
 static float cam_temp;
@@ -41,7 +41,7 @@ static ICM_Axis3D accel;
 static ICM_Axis3D gyro;
 volatile uint32_t imu_frame_counter = 0;
 
-extern bool _enter_dfu;
+extern volatile bool _enter_dfu;
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
 static void process_basic_command(UartPacket *uartResp, UartPacket cmd)

@@ -217,7 +217,7 @@ void comms_host_start(void) {
 // This is the FreeRTOS task
 void comms_host_check_received(void) {
 	UartPacket cmd;
-	UartPacket resp;
+	UartPacket resp = {0};   /* zero-init: error/NAK paths don't set every field (e.g. resp.command); avoids -Os uninitialized read */
 	uint16_t calculated_crc;
 	uint16_t rx_len;
 
