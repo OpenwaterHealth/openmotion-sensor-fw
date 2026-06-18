@@ -115,17 +115,29 @@ Reset_Handler:
   strd  r2, r3, [r0], #8
   cmp   r0, r1
   blo   5b
+/* NOTE: SRAM4 (D3) is deliberately NOT seeded here. CheckBootloaderFlag()
+   (the first thing SystemInit does) reads the "enter DFU" magic 0xDEADBEEF at
+   0x38000000, which is written before NVIC_SystemReset() and survives the
+   reset. Zeroing SRAM4 before that check silently swallows the DFU request.
+   SRAM4 is seeded just after SystemInit instead (see below). */
+
+/* Call the ExitRun0Mode function to configure the power supply */
+  bl  ExitRun0Mode
+/* Call the clock system initialization function.*/
+  bl  SystemInit
+
+/* Seed SRAM4 (D3) now that CheckBootloaderFlag() has consumed the DFU marker.
+   r2/r3 were clobbered by the C calls above, so re-zero them. Register-only,
+   touches only SRAM4 (not the stack). On a DFU boot CheckBootloaderFlag() jumps
+   to the ROM bootloader and never returns, so this is simply skipped. */
+  movs  r2, #0
+  movs  r3, #0
   ldr   r0, =0x38000000          /* SRAM4   64 KB @ 0x38000000 (D3) */
   ldr   r1, =0x38010000
 6:
   strd  r2, r3, [r0], #8
   cmp   r0, r1
   blo   6b
-
-/* Call the ExitRun0Mode function to configure the power supply */
-  bl  ExitRun0Mode
-/* Call the clock system initialization function.*/
-  bl  SystemInit
 
 /* Copy the data segment initializers from flash to SRAM */
   ldr r0, =_sdata
