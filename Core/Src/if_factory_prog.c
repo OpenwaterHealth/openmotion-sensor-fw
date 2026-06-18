@@ -15,8 +15,8 @@ extern I2C_HandleTypeDef hi2c1;
 
 static uint8_t i2c_list[128] = {0};
 
-uint8_t i2c_write_buf[256] = {0};
-uint8_t i2c_read_buf[256] = {0};
+static uint8_t i2c_write_buf[256] = {0};
+static uint8_t i2c_read_buf[256] = {0};
 
 static int iRet;
 static uint32_t _creset_state = 0;
@@ -144,6 +144,7 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                         response->data = NULL;
                     }else{                        
                         uint16_t read_len = cmd->data[0] << 8 | cmd->data[1];
+                        if (read_len > sizeof(i2c_read_buf)) read_len = sizeof(i2c_read_buf);  /* bound host-supplied length to the 256B buffer */
                         
                         memset(i2c_read_buf, 0, sizeof(i2c_read_buf));
                         iRet = xi2c_read_bytes(_active_cam->pI2c, _active_cam->device_address, i2c_read_buf, read_len);

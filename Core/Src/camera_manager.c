@@ -43,7 +43,7 @@ CameraDevice cam_array[CAMERA_COUNT];	// array of all the cameras
 
 static int _active_cam_idx = 0;
 
-volatile bool usb_failed = false;
+static volatile bool usb_failed = false;
 
 __ALIGN_BEGIN volatile uint8_t frame_buffer[1][CAMERA_COUNT * HISTOGRAM_DATA_SIZE] __ALIGN_END; // Double buffer
 __ALIGN_BEGIN uint8_t packet_buffer[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;
@@ -52,14 +52,14 @@ __ALIGN_BEGIN uint8_t uncmp_payload[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;  // Sta
 static uint8_t _active_buffer = 0; // Index of the buffer currently being written to
 volatile uint8_t frame_id = 0;
 extern volatile uint8_t event_bits_enabled; // holds the event bits for the cameras to be enabled
-extern uint8_t event_bits;
+extern volatile uint8_t event_bits;
 extern USBD_HandleTypeDef hUsbDeviceHS;
-extern uint32_t pulse_count;
+extern volatile uint16_t pulse_count;
 
 
 // Variables for keeping track of statisticss
-volatile uint32_t total_frames_sent = 0;
-volatile uint32_t total_frames_failed = 0;
+static volatile uint32_t total_frames_sent = 0;
+static volatile uint32_t total_frames_failed = 0;
 
 // Compression statistics (running averages)
 static uint32_t cmp_total_uncompressed = 0;  // Sum of all uncompressed payload sizes
@@ -70,10 +70,10 @@ static uint32_t cmp_usb_fail_count = 0;      // Number of USB send failures (com
 static uint32_t cmp_max_time_us = 0;         // Worst-case compression time in µs
 
 #define STREAMING_TIMEOUT_MS 150
-volatile uint32_t most_recent_frame_time = 0;
-volatile uint32_t streaming_start_time = 0;
-bool streaming_active = false;
-bool streaming_first_frame = false;
+static volatile uint32_t most_recent_frame_time = 0;
+static volatile uint32_t streaming_start_time = 0;
+static bool streaming_active = false;
+static bool streaming_first_frame = false;
 
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
@@ -421,15 +421,16 @@ CameraDevice* get_active_cam(void) {
 }
 
 CameraDevice* set_active_camera(int id) {
-	if(id < 0 || id >= CAMERA_COUNT) return NULL;
+	if(id < 0 || id >= CAMERA_COUNT) { return NULL; }
 
 	_active_cam_idx = id;
 	return &cam_array[_active_cam_idx];
 }
 
 CameraDevice* get_camera_byID(int id) {
-	if(id < 0 || id >= CAMERA_COUNT)
+	if(id < 0 || id >= CAMERA_COUNT) {
 		return NULL;
+	}
 	return &cam_array[id];
 }
 
@@ -844,7 +845,7 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 
 	if(!force_update)
 	{
-		if(cam->isProgrammed) return true;
+		if(cam->isProgrammed) { return true; }
 		if(fpga_detect_nvcm(cam)){
 			cam->isProgrammed = true;
 			printf("NVCM programmed, skipping\r\n");
@@ -1255,7 +1256,7 @@ static void generate_fake_histogram(uint8_t *histogram_data) {
 			break;
 		case 2:
     		for(int i=0;i<HISTOGRAM_BINS;i++){
-    			histogram[i] =  (uint32_t) 0xAAAAAAAA;
+    			histogram[i] =  (uint32_t) 0xAAAAAAAAU;
     		}
 			break;
 		case 3:
@@ -1474,7 +1475,7 @@ _Bool check_streaming(void){
 		uint32_t most_recent_frame_time_local = most_recent_frame_time;
 
 		if(current_time<most_recent_frame_time_local){
-			if(verbose_on) printf("Current time is less than most recent frame time, passing.\r\n");
+			if(verbose_on) { printf("Current time is less than most recent frame time, passing.\r\n"); }
 			// This is an edge case that seems to happen due to this function being interrupted by the interrupt that sets most_recent_frame_time.
 			return streaming_active;
 		}
@@ -1540,7 +1541,7 @@ _Bool send_histogram_data(void) {
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
 	for (int i = 0; i < CAMERA_COUNT ; ++i) {
-		if (ready_bits & (1 << i)) {
+		if ((ready_bits & (1 << i)) != 0) {
 			count++;
 		}
 	}
@@ -1648,7 +1649,7 @@ static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_m
 
 		if (run_len >= 3) {
 			/* Encode as repeat run */
-			if (di + 2 > dst_max) return -1;
+			if (di + 2 > dst_max) { return -1; }
 			dst[di++] = (uint8_t)(0x80 + (run_len - 3));
 			dst[di++] = val;
 		} else {
@@ -1660,10 +1661,10 @@ static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_m
 					break;
 				}
 				si++;
-				if (si - lit_start >= 128) break;
+				if (si - lit_start >= 128) { break; }
 			}
 			int lit_len = si - lit_start;
-			if (di + 1 + lit_len > dst_max) return -1;
+			if (di + 1 + lit_len > dst_max) { return -1; }
 			dst[di++] = (uint8_t)(lit_len - 1);
 			memcpy(dst + di, src + lit_start, lit_len);
 			di += lit_len;
@@ -1691,7 +1692,7 @@ _Bool send_histogram_data_cmp(void) {
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
 	for (int i = 0; i < CAMERA_COUNT; ++i) {
-		if (ready_bits & (1 << i)) {
+		if ((ready_bits & (1 << i)) != 0) {
 			count++;
 		}
 	}
@@ -1825,7 +1826,7 @@ _Bool send_fake_data(void) {
 
 	uint8_t count = 0;
 	for (int i = 0; i < CAMERA_COUNT ; ++i) {
-		if (event_bits_enabled & (1 << i)) {
+		if ((event_bits_enabled & (1 << i)) != 0) {
 			count++;
 		}
 	}
@@ -1899,7 +1900,7 @@ _Bool send_fake_data(void) {
 }
 
 _Bool start_data_reception(uint8_t cam_id){
-	if(verbose_on) printf("Start data reception on camera: %d... ",cam_id+1);
+	if(verbose_on) { printf("Start data reception on camera: %d... ",cam_id+1); }
 	HAL_StatusTypeDef status;
 
 	if (!camera_request_is_valid(cam_id)) {
@@ -1958,12 +1959,12 @@ _Bool start_data_reception(uint8_t cam_id){
 		abort_data_reception(cam_id);
 		return false;
 	}
-	if(verbose_on) printf("done\r\n");
+	if(verbose_on) { printf("done\r\n"); }
 	return true;
 }
 
 _Bool abort_data_reception(uint8_t cam_id){
-	if(verbose_on) printf("Abort data reception C: %d... ",cam_id);
+	if(verbose_on) { printf("Abort data reception C: %d... ",cam_id); }
 	HAL_StatusTypeDef status;
 
 	if (!camera_request_is_valid(cam_id)) {
@@ -1973,16 +1974,18 @@ _Bool abort_data_reception(uint8_t cam_id){
 	// disable the reception
 	CameraDevice* cam = get_camera_byID(cam_id);
 	if(cam->useUsart) {
-		if(cam->useDma)
+		if(cam->useDma) {
 			status = HAL_USART_Abort(cam->pUart);
-		else
+		} else {
 			status = HAL_USART_Abort_IT(cam->pUart);
+		}
 	}
 	else{
-		if(cam->useDma)
+		if(cam->useDma) {
 			status = HAL_SPI_Abort(cam->pSpi);
-		else
+		} else {
 			status = HAL_SPI_Abort_IT(cam->pSpi);
+		}
 	}
 	if (status != HAL_OK) {
 		return false;
@@ -2002,7 +2005,7 @@ _Bool abort_data_reception(uint8_t cam_id){
             return false;
         }
     }
-	if(verbose_on) printf("done\r\n");
+	if(verbose_on) { printf("done\r\n"); }
 	return true;
 }
 

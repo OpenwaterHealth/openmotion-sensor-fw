@@ -19,7 +19,7 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
     for (size_t i = 0; i < len; i++) {
         crc ^= ((uint16_t)data[i] << 8);
         for (int b = 0; b < 8; b++) {
-            if (crc & 0x8000u) {
+            if ((crc & 0x8000u) != 0u) {
                 crc = (uint16_t)((crc << 1) ^ 0x1021u);
             } else {
                 crc <<= 1;
@@ -88,14 +88,63 @@ static bool motion_cfg_is_valid(const motion_cfg_t *cfg)
     return true;
 }
 
-// Do a complete write of g_cfg into flash page.
+// True if the serial slot (top of the sector) holds anything other than
+// erased (0xFF) flash. Copies the raw 32 bytes into out_rec either way.
+static bool motion_cfg_serial_slot_programmed(uint8_t *out_rec)
+{
+    Flash_Read_Bytes(FLASH_SERIAL_START_ADDR, out_rec, FLASH_SERIAL_RECORD_SIZE);
+    for (uint32_t i = 0; i < FLASH_SERIAL_RECORD_SIZE; i++) {
+        if (out_rec[i] != 0xFFu) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Rewrite the whole config sector in a single erase: the config page at the
+// base and the 32-byte serial record at the top. Pass NULL for serial_rec to
+// leave the serial slot erased (unprogrammed). Caller has prepared g_cfg.
+//
+// The serial number co-habits sector 7 because it is the only flash sector
+// above the firmware image, so it is the only place a value survives a full
+// firmware flash. The two tenants share one erase granularity, so every
+// rewrite of either must carry the other through. See sensor_serial.c.
+static HAL_StatusTypeDef motion_cfg_rewrite_sector(const uint8_t *serial_rec)
+{
+    HAL_StatusTypeDef st;
+
+    st = Flash_Erase(MOTION_CFG_PAGE_ADDR, MOTION_CFG_PAGE_END);
+    if (st != HAL_OK) {
+        return st;
+    }
+
+    // Program the config struct word-by-word at the base of the sector.
+    st = Flash_Write(MOTION_CFG_PAGE_ADDR,
+                     (uint32_t *)&g_cfg,
+                     (uint32_t)(sizeof(motion_cfg_t) / sizeof(uint32_t)));
+    if (st != HAL_OK) {
+        return st;
+    }
+
+    // Restore the serial record at the top of the sector, if present.
+    if (serial_rec != NULL) {
+        st = Flash_Write_Bytes(FLASH_SERIAL_START_ADDR,
+                               serial_rec,
+                               FLASH_SERIAL_RECORD_SIZE);
+    }
+
+    return st;
+}
+
+// Do a complete write of g_cfg into the flash sector.
 // - bumps seq
 // - normalizes json
 // - recomputes crc
-// - erases page and writes words
+// - erases the sector and writes words, preserving the serial slot
 static HAL_StatusTypeDef motion_cfg_writeback(void)
 {
-    HAL_StatusTypeDef st;
+    uint8_t serial_rec[FLASH_SERIAL_RECORD_SIZE];
+    bool have_serial = motion_cfg_serial_slot_programmed(serial_rec);
 
     // bump monotonic sequence
     g_cfg.seq++;
@@ -103,18 +152,7 @@ static HAL_StatusTypeDef motion_cfg_writeback(void)
     motion_cfg_normalize_json(&g_cfg);
     g_cfg.crc = motion_cfg_calc_crc(&g_cfg);
 
-    // Erase page [ADDR_FLASH_PAGE_62 .. ADDR_FLASH_PAGE_63)
-    st = Flash_Erase(MOTION_CFG_PAGE_ADDR, MOTION_CFG_PAGE_END);
-    if (st != HAL_OK) {
-        return st;
-    }
-
-    // Program entire struct word-by-word
-    st = Flash_Write(MOTION_CFG_PAGE_ADDR,
-                     (uint32_t *)&g_cfg,
-                     (uint32_t)(sizeof(motion_cfg_t) / sizeof(uint32_t)));
-
-    return st;
+    return motion_cfg_rewrite_sector(have_serial ? serial_rec : NULL);
 }
 
 // Raw load from flash into g_cfg
@@ -284,6 +322,17 @@ HAL_StatusTypeDef motion_cfg_commit(void)
     motion_cfg_ensure_loaded();
     // Write current g_cfg (useful if caller directly edited *motion_cfg_get()).
     return motion_cfg_writeback();
+}
+
+HAL_StatusTypeDef motion_cfg_persist_serial(const uint8_t *serial_rec)
+{
+    if (serial_rec == NULL) {
+        return HAL_ERROR;
+    }
+    // Ensure g_cfg is valid before we erase and rewrite the sector that holds
+    // it; otherwise the rewrite would program a stale/blank config.
+    motion_cfg_ensure_loaded();
+    return motion_cfg_rewrite_sector(serial_rec);
 }
 
 HAL_StatusTypeDef motion_cfg_factory_reset(void)

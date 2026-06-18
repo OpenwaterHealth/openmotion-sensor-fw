@@ -91,7 +91,7 @@ __ALIGN_BEGIN static uint8_t USBD_Histo_GetDeviceQualifierDescriptor[USB_LEN_DEV
 #endif /* USE_USBD_COMPOSITE  */
 
 extern uint8_t HISTO_InstID;
-uint8_t* pTxHistoBuff = 0;
+static uint8_t* pTxHistoBuff = 0;
 static uint16_t tx_histo_total_len = 0;
 static uint16_t tx_histo_ptr = 0;
 static __IO uint8_t histo_ep_enabled = 0;
@@ -172,7 +172,7 @@ static uint8_t USBD_Histo_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   pdev->ep_in[HISTOInEpAdd & 0xFU].total_length = 0U;
   histo_ep_enabled = 0;
 
-  if(pTxHistoBuff){
+  if(pTxHistoBuff != NULL){
     pTxHistoBuff = 0;
   }
 
@@ -218,7 +218,7 @@ static uint8_t histo_queue_is_full(void)
 
 static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length)
 {
-  if (histo_queue_is_full()) {
+  if (histo_queue_is_full() != 0) {
     printf("HISTO enqueue fail: queue full (count=%u size=%u enq=%lu deq=%lu datain=%lu txfail=%lu)\r\n",
            histo_queue_count, (uint8_t)HISTO_QUEUE_SIZE,
            (unsigned long)histo_enq_count,
@@ -248,7 +248,7 @@ static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length)
 
 static uint8_t histo_queue_dequeue(uint8_t **data, uint16_t *length)
 {
-  if (histo_queue_is_empty()) {
+  if (histo_queue_is_empty() != 0) {
     return USBD_FAIL;
   }
 
@@ -272,7 +272,7 @@ static uint8_t histo_process_queue(void)
     return USBD_FAIL;
   }
 
-  if (histo_queue_is_empty()) {
+  if (histo_queue_is_empty() != 0) {
     return USBD_OK;
   }
 
@@ -436,7 +436,7 @@ uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint1
   return ret;
 }
 
-uint8_t USBD_HISTO_RegisterInterface(USBD_HandleTypeDef *pdev, uint8_t *buffer)
+static uint8_t USBD_HISTO_RegisterInterface(USBD_HandleTypeDef *pdev, uint8_t *buffer)
 {
   UNUSED(pdev);
   UNUSED(buffer);

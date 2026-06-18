@@ -9,7 +9,7 @@
 #include "utils.h"
 #include <stdio.h>
 
-volatile _Bool ext_fsin_enabled = false;
+static volatile _Bool ext_fsin_enabled = false;
 #define I2C_TIMEOUT 1000 // Set an appropriate timeout for I2C transactions
 
 static int X02C1B_write(I2C_HandleTypeDef * pI2c, uint16_t reg, uint8_t val)
@@ -271,13 +271,13 @@ float X02C1B_read_temp(CameraDevice *cam)
     return temperature;
 }
 
-int X02C1B_set_gain(CameraDevice *cam)
+static int X02C1B_set_gain(CameraDevice *cam)
 {
 
 	return 0;
 }
 
-int X02C1B_get_gain(CameraDevice *cam)
+static int X02C1B_get_gain(CameraDevice *cam)
 {
 
 	return 0;
@@ -286,7 +286,7 @@ int X02C1B_get_gain(CameraDevice *cam)
 
 int X02C1B_FSIN_EXT_enable()
 {
-	if(ext_fsin_enabled) return HAL_OK;
+	if(ext_fsin_enabled) { return HAL_OK; }
     printf("Enabling FSIN_EXT\r\n");
 
     /*Configure GPIO pin Output Level */
@@ -310,7 +310,7 @@ int X02C1B_FSIN_EXT_enable()
 
 int X02C1B_FSIN_EXT_status(bool *is_enabled)
 {
-    if (is_enabled == NULL) return -1;
+    if (is_enabled == NULL) { return -1; }
     *is_enabled = ext_fsin_enabled;
     return HAL_OK;
 }
@@ -318,7 +318,7 @@ int X02C1B_FSIN_EXT_status(bool *is_enabled)
 int X02C1B_FSIN_EXT_disable()
 {
     printf("Disabling FSIN_EXT\r\n");
-	if(!ext_fsin_enabled) return HAL_OK;
+	if(!ext_fsin_enabled) { return HAL_OK; }
     /*Configure GPIO pin : FSIN_EN_Pin */
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin = FSIN_Pin;
