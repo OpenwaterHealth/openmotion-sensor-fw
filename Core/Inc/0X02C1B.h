@@ -40,11 +40,11 @@ int X02C1B_stream_off(CameraDevice *cam);
 int X02C1B_configure_sensor(CameraDevice *cam);
 int X02C1B_set_test_pattern(CameraDevice *cam, uint8_t test_pattern);
 int X02C1B_detect(CameraDevice *cam);
-int X02C1B_fsin_on();
-int X02C1B_fsin_off();
+int X02C1B_fsin_on(void);
+int X02C1B_fsin_off(void);
 float X02C1B_read_temp(CameraDevice *cam);
-int X02C1B_FSIN_EXT_enable();
-int X02C1B_FSIN_EXT_disable();
+int X02C1B_FSIN_EXT_enable(void);
+int X02C1B_FSIN_EXT_disable(void);
 int X02C1B_FSIN_EXT_status(bool *is_enabled);
 int X02C1B_read_security_uid(CameraDevice *cam, uint8_t uid_bytes[6], uint64_t *uid_value);
 #endif /* INC_0X02C1B_H_ */

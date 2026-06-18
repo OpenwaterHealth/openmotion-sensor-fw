@@ -10,10 +10,10 @@
 #include "utils.h"
 #include <stdio.h>
 // testing crc calculations
-uint32_t startTime = 0, endTime = 0, duration = 0;
+static uint32_t startTime = 0, endTime = 0, duration = 0;
 
 // CRC16-ccitt lookup table
-const uint16_t crc16_tab[256] = {
+static const uint16_t crc16_tab[256] = {
 	0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
 	0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
 	0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
@@ -75,7 +75,7 @@ uint16_t util_hw_crc16(uint8_t* buf, uint32_t size)
 }
 
 void print_hex_buf(const char *label, uint8_t *buf, size_t len) {
-    if (label) printf("%s: ", label);
+    if (label != NULL) { printf("%s: ", label); }
     for (size_t i = 0; i < len; i++) {
         printf("%02X ", buf[i]);
     }
@@ -100,7 +100,7 @@ void delay_us(uint32_t us)
     uint32_t start = DWT->CYCCNT;
     uint32_t delay_cycles = us * cycles_per_us;
 
-    while ((DWT->CYCCNT - start) < delay_cycles);
+    while ((DWT->CYCCNT - start) < delay_cycles) { }
 }
 
 // get timestamp ms will grab the current timestamp in milliseconds as counted by tim5

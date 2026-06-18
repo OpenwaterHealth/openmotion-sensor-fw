@@ -13,8 +13,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
- void init_dma_logging();
- bool is_using_dma();
+ void init_dma_logging(void);
+ bool is_using_dma(void);
  void logging_pump(void);
  void logging_set_debug_flags(uint32_t flags);
  uint32_t logging_get_debug_flags(void);

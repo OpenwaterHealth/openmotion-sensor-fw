@@ -90,7 +90,7 @@ __ALIGN_BEGIN static uint8_t USBD_Comms_GetDeviceQualifierDescriptor[USB_LEN_DEV
 #endif /* USE_USBD_COMPOSITE  */
 
 extern uint8_t COMMS_InstID;
-uint8_t* pTxCommsBuff = 0;
+static uint8_t* pTxCommsBuff = 0;
 static uint16_t tx_comms_total_len = 0;
 static uint16_t tx_comms_ptr = 0;
 static __IO uint8_t comms_ep_enabled = 0;
@@ -190,7 +190,7 @@ static uint8_t USBD_Comms_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   pdev->ep_in[COMMSInEpAdd & 0xFU].total_length = 0U;
   comms_ep_enabled = 0;
 
-  if(pTxCommsBuff){
+  if(pTxCommsBuff != NULL){
     pTxCommsBuff = 0;
   }
 
@@ -235,7 +235,7 @@ static uint8_t comms_queue_is_full(void)
 
 static uint8_t comms_queue_enqueue(uint8_t *data, uint16_t length)
 {
-  if (comms_queue_is_full()) {
+  if (comms_queue_is_full() != 0) {
     printf("COMMS enqueue fail: queue full (count=%u size=%u enq=%lu deq=%lu datain=%lu txfail=%lu)\r\n",
            comms_queue_count, (uint8_t)COMMS_QUEUE_SIZE,
            (unsigned long)comms_enq_count,
@@ -263,7 +263,7 @@ static uint8_t comms_queue_enqueue(uint8_t *data, uint16_t length)
 
 static uint8_t comms_queue_dequeue(uint8_t **data, uint16_t *length)
 {
-  if (comms_queue_is_empty()) {
+  if (comms_queue_is_empty() != 0) {
     return USBD_FAIL;
   }
 
@@ -286,7 +286,7 @@ static uint8_t comms_process_queue(void)
     return USBD_FAIL;
   }
 
-  if (comms_queue_is_empty()) {
+  if (comms_queue_is_empty() != 0) {
     return USBD_OK;
   }
 

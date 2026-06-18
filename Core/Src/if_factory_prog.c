@@ -15,8 +15,8 @@ extern I2C_HandleTypeDef hi2c1;
 
 static uint8_t i2c_list[128] = {0};
 
-uint8_t i2c_write_buf[256] = {0};
-uint8_t i2c_read_buf[256] = {0};
+static uint8_t i2c_write_buf[256] = {0};
+static uint8_t i2c_read_buf[256] = {0};
 
 static int iRet;
 static uint32_t _creset_state = 0;

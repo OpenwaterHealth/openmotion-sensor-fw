@@ -27,7 +27,9 @@ static uint32_t GetSector(uint32_t Address)
     }
 
     if (sector > FLASH_SECTOR_7)
+    {
         sector = FLASH_SECTOR_7;
+    }
 
     return sector;
 }
@@ -70,7 +72,9 @@ HAL_StatusTypeDef Flash_Write(uint32_t address, const uint32_t *data, uint32_t s
         );
 
         if (status != HAL_OK)
+        {
             break;
+        }
     }
 
     HAL_FLASH_Lock();
@@ -135,7 +139,9 @@ HAL_StatusTypeDef Flash_Write_Bytes(uint32_t address,
         );
 
         if (status != HAL_OK)
+        {
             break;
+        }
     }
 
     HAL_FLASH_Lock();
@@ -170,9 +176,13 @@ HAL_StatusTypeDef Flash_Erase(uint32_t start_address, uint32_t end_address)
     uint32_t bank;
 
     if (start_address < FLASH_BANK2_BASE)
+    {
         bank = FLASH_BANK_1;
+    }
     else
+    {
         bank = FLASH_BANK_2;
+    }
 
     HAL_FLASH_Unlock();
     SCB_DisableICache();

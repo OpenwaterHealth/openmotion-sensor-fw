@@ -26,10 +26,10 @@ extern uint8_t rxBuffer[COMMAND_MAX_SIZE];
 extern uint8_t txBuffer[COMMAND_MAX_SIZE];
 extern DMA_HandleTypeDef hdma_memtomem_dma2_stream1;
 
-volatile uint32_t ptrReceive;
-volatile uint8_t rx_flag = 0; // start in idle state (0)
+static volatile uint32_t ptrReceive;
+static volatile uint8_t rx_flag = 0; // start in idle state (0)
 volatile uint8_t tx_flag = 1; // Start in idle state (1)
-const uint32_t zero_val = 0;
+static const uint32_t zero_val = 0;
 static uint8_t cmd_data_buf[COMMAND_MAX_SIZE];
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
@@ -81,7 +81,7 @@ static void print_uart_packet(const UartPacket *pkt)
     printf("}\r\n");
 }
 
-void ClearBuffer_DMA(void)
+static void ClearBuffer_DMA(void)
 {
     // Clear using 32-bit writes (COMMAND_MAX_SIZE must be divisible by 4)
     HAL_DMA_Start(&hdma_memtomem_dma2_stream1,

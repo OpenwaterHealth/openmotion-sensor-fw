@@ -12,16 +12,16 @@
 #include <stdint.h>
 
 static bool bInit_dma = false;
-volatile bool bPrintfTransferComplete = false;
+static volatile bool bPrintfTransferComplete = false;
 static volatile uint32_t debug_flags = 0x00000000;
 
 static uint8_t usart_start_tx_dma_transfer(void);
 static bool logging_uart_dma_write(const uint8_t *src, size_t count);
 
 /* Ring buffer for TX data */
-lwrb_t usart_tx_buff;
-uint8_t usart_tx_buff_data[1512];
-volatile size_t usart_tx_dma_current_len;
+static lwrb_t usart_tx_buff;
+static uint8_t usart_tx_buff_data[1512];
+static volatile size_t usart_tx_dma_current_len;
 static bool usart_drop_marker_pending = false;
 
 /* Ring buffer for accumulating printf messages to send over command and control endpoint */

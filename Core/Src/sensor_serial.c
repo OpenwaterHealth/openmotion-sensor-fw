@@ -36,9 +36,9 @@ static bool char_is_serial_ok(char c)
 
 static bool record_valid(const serial_record_t *rec)
 {
-    if (rec->magic != SERIAL_RECORD_MAGIC)         return false;
-    if (rec->version != SERIAL_RECORD_VERSION)     return false;
-    if (rec->len < 1 || rec->len > SERIAL_MAX_LEN)  return false;
+    if (rec->magic != SERIAL_RECORD_MAGIC)         { return false; }
+    if (rec->version != SERIAL_RECORD_VERSION)     { return false; }
+    if (rec->len < 1 || rec->len > SERIAL_MAX_LEN)  { return false; }
     uint16_t want = serial_crc16(rec, offsetof(serial_record_t, crc16));
     return rec->crc16 == want;
 }
