@@ -60,16 +60,72 @@ defined in linker script */
 Reset_Handler:
   ldr   sp, =_estack      /* set stack pointer */
 
+/* ---------------------------------------------------------------------------
+   Seed 64-bit SECDED ECC across every SRAM bank BEFORE any C stack is used.
+
+   Why first, and why register-only:
+     1. The first sub-64-bit store to a never-written ECC line latches a
+        spurious SEDCF+DEDF; seeding each line with a clean 64-bit zero makes
+        every later [ECC] event a real fault. ExitRun0Mode / SystemInit below
+        then push onto an already-seeded stack.
+     2. This zeroes RAM_D1 (0x24000000..0x24080000), which holds the active
+        stack, so it MUST NOT spill anything (return address, loop counters)
+        to the stack. The previous C ram_scrub() ran after SystemInit and
+        returned through its own just-zeroed stack frame -> branched to 0x0
+        -> HardFault. It only survived at -O0 because the zero loop happened
+        to clobber its own on-stack loop counter and abort early; at -Os the
+        counter lived in a register, the loop completed, and the saved return
+        address was wiped. See docs/ram_scrub-release-hardfault.md.
+
+   Register-only (clobbers r0-r3, dead here), no stack, falls through. -------- */
+  ldr   r0, =0x580244DC          /* RCC->AHB2ENR (RCC_BASE 0x58024400 + 0xDC) */
+  ldr   r1, [r0]
+  orr   r1, r1, #0xE0000000      /* SRAM1EN(29) | SRAM2EN(30) | SRAM3EN(31) */
+  str   r1, [r0]
+  ldr   r1, [r0]                 /* read back so the clocks are up before use */
+  movs  r2, #0
+  movs  r3, #0
+  ldr   r0, =0x20000000          /* DTCM   128 KB @ 0x20000000 */
+  ldr   r1, =0x20020000
+1:
+  strd  r2, r3, [r0], #8
+  cmp   r0, r1
+  blo   1b
+  ldr   r0, =0x24000000          /* AXI SRAM (RAM_D1) 512 KB - holds the stack */
+  ldr   r1, =0x24080000
+2:
+  strd  r2, r3, [r0], #8
+  cmp   r0, r1
+  blo   2b
+  ldr   r0, =0x30000000          /* SRAM1  128 KB @ 0x30000000 */
+  ldr   r1, =0x30020000
+3:
+  strd  r2, r3, [r0], #8
+  cmp   r0, r1
+  blo   3b
+  ldr   r0, =0x30020000          /* SRAM2  128 KB @ 0x30020000 */
+  ldr   r1, =0x30040000
+4:
+  strd  r2, r3, [r0], #8
+  cmp   r0, r1
+  blo   4b
+  ldr   r0, =0x30040000          /* SRAM3   32 KB @ 0x30040000 */
+  ldr   r1, =0x30048000
+5:
+  strd  r2, r3, [r0], #8
+  cmp   r0, r1
+  blo   5b
+  ldr   r0, =0x38000000          /* SRAM4   64 KB @ 0x38000000 (D3) */
+  ldr   r1, =0x38010000
+6:
+  strd  r2, r3, [r0], #8
+  cmp   r0, r1
+  blo   6b
+
 /* Call the ExitRun0Mode function to configure the power supply */
   bl  ExitRun0Mode
 /* Call the clock system initialization function.*/
   bl  SystemInit
-
-/* Seed ECC syndromes on every SRAM bank before .data/.bss init so that
-   the first byte/halfword store to a never-written 64-bit line does not
-   latch spurious SEDCF+DEDF in the RAMECC controller. ram_scrub() uses
-   only its own stack frame and no global/static state. */
-  bl  ram_scrub
 
 /* Copy the data segment initializers from flash to SRAM */
   ldr r0, =_sdata
