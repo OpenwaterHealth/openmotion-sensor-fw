@@ -30,16 +30,16 @@
 
 #define CROSSLINK_I2C_TIMEOUT_MS 1000U
 
-volatile uint8_t txComplete = 0;
-volatile uint8_t rxComplete = 0;
-volatile uint8_t i2cError = 0;
+static volatile uint8_t txComplete = 0;
+static volatile uint8_t rxComplete = 0;
+static volatile uint8_t i2cError = 0;
 
-unsigned char activation_key[5] = {0xFF, 0xA4, 0xC6, 0xF4, 0x8A};
-uint8_t expected_idcode[] = {0x01, 0x2C, 0x00, 0x43};
-unsigned char write_buf[4];
-unsigned char read_buf[4];
+static unsigned char activation_key[5] = {0xFF, 0xA4, 0xC6, 0xF4, 0x8A};
+static uint8_t expected_idcode[] = {0x01, 0x2C, 0x00, 0x43};
+static unsigned char write_buf[4];
+static unsigned char read_buf[4];
 
-const uint8_t max_attempts = 3;
+static const uint8_t max_attempts = 3;
 extern uint8_t bitstream_buffer[];
 extern uint32_t bitstream_len;
 
@@ -57,25 +57,27 @@ int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *w
     rxComplete = 0;
     i2cError = 0;
 
-    if (HAL_I2C_Master_Seq_Transmit_IT(hi2c, DevAddress << 1, wbuf, wlen, I2C_FIRST_FRAME) != HAL_OK)
+    if (HAL_I2C_Master_Seq_Transmit_IT(hi2c, DevAddress << 1, wbuf, wlen, I2C_FIRST_FRAME) != HAL_OK) {
         return -1;
+    }
 
     // Wait for the transmission to complete
     while (!txComplete && !i2cError) {}
 
-    if (i2cError)
+    if (i2cError != 0)
     {
         return HAL_ERROR;
     }
 
 
-    if (HAL_I2C_Master_Seq_Receive_IT(hi2c, DevAddress << 1, rbuf, rlen, I2C_LAST_FRAME) != HAL_OK)
+    if (HAL_I2C_Master_Seq_Receive_IT(hi2c, DevAddress << 1, rbuf, rlen, I2C_LAST_FRAME) != HAL_OK) {
         return -1;
+    }
 
     // Wait for the reception to complete
     while (!rxComplete && !i2cError) {}
 
-    if (i2cError)
+    if (i2cError != 0)
     {
         return HAL_ERROR;
     }
@@ -135,7 +137,7 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
         // Wait for the transmission to complete
         while (!txComplete && !i2cError) {}
 
-        if (i2cError)
+        if (i2cError != 0)
         {
             return HAL_ERROR;
         }
@@ -149,9 +151,9 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
 int fpga_send_activation(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
 	// Step 1: Initialize
-	if(verbose_on) printf("Step 1: Send Activation Key\r\n");
+	if(verbose_on) { printf("Step 1: Send Activation Key\r\n"); }
 	if (xi2c_write_bytes(hi2c, DevAddress, activation_key, 5) != HAL_OK) {
-		if(verbose_on) printf("failed to send activation key\r\n");
+		if(verbose_on) { printf("failed to send activation key\r\n"); }
 	    return 1;  // Exit if writing activation key fails
 	}
 
@@ -161,24 +163,24 @@ int fpga_send_activation(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 int fpga_checkid(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
     // Step 2: Check IDCODE (Optional)
-    if(verbose_on) printf("Step 2: Check IDCODE (Optional)\r\n");
+    if(verbose_on) { printf("Step 2: Check IDCODE (Optional)\r\n"); }
     write_buf[0] = 0xE0; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4) != HAL_OK) {
-        if(verbose_on) printf("failed to send IDCODE Command\r\n");
+        if(verbose_on) { printf("failed to send IDCODE Command\r\n"); }
         return 1;  // Exit if write/read fails
     }
 
-    if(verbose_on) print_hex_buf("IDCODE", read_buf, 4);
+    if(verbose_on) { print_hex_buf("IDCODE", read_buf, 4); }
 	return 0;
 }
 
 int fpga_enter_sram_prog_mode(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
     // Step 3: Enable SRAM Programming Mode
-    if(verbose_on) printf("Step 3: Enable SRAM Programming Mode\r\n");
+    if(verbose_on) { printf("Step 3: Enable SRAM Programming Mode\r\n"); }
     write_buf[0] = 0xC6; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_bytes(hi2c, DevAddress, write_buf, 4) != HAL_OK) {
-        if(verbose_on) printf("failed to send SRAM Command\r\n");
+        if(verbose_on) { printf("failed to send SRAM Command\r\n"); }
         return 1;  // Exit if writing fails
     }
     delay_ms(1);
@@ -189,10 +191,10 @@ int fpga_exit_prog_mode(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
 
     // Step 11: Exit Programming Mode
-    if(verbose_on) printf("Step 10: Exit Programming Mode\r\n");
+    if(verbose_on) { printf("Step 10: Exit Programming Mode\r\n"); }
     write_buf[0] = 0x26; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_bytes(hi2c, DevAddress, write_buf, 4) != HAL_OK) {
-        if(verbose_on) printf("failed to send Exit Command\r\n");
+        if(verbose_on) { printf("failed to send Exit Command\r\n"); }
         return 1;  // Exit if writing fails
     }
 
@@ -202,14 +204,14 @@ int fpga_exit_prog_mode(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 uint32_t fpga_read_status(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
     // Step 5: Read Status Register
-    if(verbose_on) printf("Read Status Register\r\n");
+    if(verbose_on) { printf("Read Status Register\r\n"); }
     write_buf[0] = 0x3C; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4) != HAL_OK) {
-        if(verbose_on) printf("failed to send READ Status Command\r\n");
+        if(verbose_on) { printf("failed to send READ Status Command\r\n"); }
         return 1;  // Exit if write/read fails
     }
 
-    if(verbose_on) print_hex_buf("Erase Status", read_buf, 4);
+    if(verbose_on) { print_hex_buf("Erase Status", read_buf, 4); }
     return 0;
 
 }
@@ -217,14 +219,14 @@ uint32_t fpga_read_status(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 uint32_t fpga_read_usercode(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
     // Step 9: Read USERCODE (Optional)
-    if(verbose_on) printf("Step 9: Verify USERCODE (Optional)\r\n");
+    if(verbose_on) { printf("Step 9: Verify USERCODE (Optional)\r\n"); }
     write_buf[0] = 0xC0; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4) != HAL_OK) {
-        if(verbose_on) printf("failed to send USERCODE Command\r\n");
+        if(verbose_on) { printf("failed to send USERCODE Command\r\n"); }
         return 1;  // Exit if write/read fails
     }
 
-    if(verbose_on) print_hex_buf("User Register", read_buf, 4);
+    if(verbose_on) { print_hex_buf("User Register", read_buf, 4); }
     return 0;
 }
 
@@ -232,7 +234,7 @@ uint32_t fpga_read_usercode(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 static void nvcm_log_buf(const char *label, const uint8_t *buf, int len)
 {
     printf("NVCM %s:", label);
-    for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
+    for (int i = 0; i < len; i++) { printf(" %02X", buf[i]); }
     printf("\r\n");
 }
 
@@ -244,7 +246,7 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
     uint8_t wbuf[4];
 
     memset(out, 0, sizeof(*out));
-    if (num_rows > FPGA_NVCM_MAX_ROWS) num_rows = FPGA_NVCM_MAX_ROWS;
+    if (num_rows > FPGA_NVCM_MAX_ROWS) { num_rows = FPGA_NVCM_MAX_ROWS; }
 
     printf("NVCM probe: isc_operand=0x%02X num_rows=%u boot_test=%u addr=0x%02X\r\n",
            isc_operand, (unsigned)num_rows, (unsigned)do_boot_test, (unsigned)DevAddress);
@@ -357,7 +359,7 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
      *         0x40 gone  -> programmed
      *     Ends by re-asserting CRESETB low to halt any booted user design and
      *     free the shared I2C bus (TCA-safe). */
-    if (do_boot_test) {
+    if (do_boot_test != 0) {
         HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);  /* assert reset */
         delay_ms(5);
         HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);    /* release, NO activation key */
@@ -381,22 +383,22 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
 int fpga_erase_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
     // Step 4: Erase SRAM
-    if(verbose_on) printf("Step 4: Erase SRAM...");
+    if(verbose_on) { printf("Step 4: Erase SRAM..."); }
     write_buf[0] = 0x0E; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_bytes(hi2c, DevAddress, write_buf, 4) != HAL_OK) {
-        if(verbose_on) printf("\r\nFAILED to send SRAM Erase Command\r\n");
+        if(verbose_on) { printf("\r\nFAILED to send SRAM Erase Command\r\n"); }
         return 1;  // Exit if writing fails
     }
-    if(verbose_on) printf("COMPLETED\r\n");
+    if(verbose_on) { printf("COMPLETED\r\n"); }
     return 0;
 }
 
 int fpga_program_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len)
 {
-    if(verbose_on) printf("Program SRAM\r\n");
+    if(verbose_on) { printf("Program SRAM\r\n"); }
     write_buf[0] = 0x46; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
     if (xi2c_write_bytes(hi2c, DevAddress, write_buf, 4)!= HAL_OK) {
-        if(verbose_on) printf("failed to send Exit Command\r\n");
+        if(verbose_on) { printf("failed to send Exit Command\r\n"); }
         return 1;  // Exit if writing fails
     }
 
@@ -422,7 +424,7 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
 	uint8_t attempt = 0;
 	_Bool idcode_match = false;
 
-	if(verbose_on) printf("Starting FPGA configuration...\r\n");
+	if(verbose_on) { printf("Starting FPGA configuration...\r\n"); }
 
     // Set GPIO HIGH
     HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
@@ -451,7 +453,7 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
 		memset(read_buf, 0, 4);
 		memcpy(write_buf, (uint8_t[]){0xE0,0x00,0x00,0x00}, 4);
 		xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-		if(verbose_on) print_hex_buf("IDCODE", read_buf, 4);
+		if(verbose_on) { print_hex_buf("IDCODE", read_buf, 4); }
 
 	    // Check if IDCODE matches expected
 	    if (memcmp(read_buf, expected_idcode, 4) == 0) {
@@ -465,7 +467,7 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
         // Optionally return or handle error
         return HAL_ERROR;
     } else {
-        if(verbose_on) printf("IDCODE matched successfully.\r\n");
+        if(verbose_on) { printf("IDCODE matched successfully.\r\n"); }
         // Proceed with the next steps
     }
 
@@ -483,7 +485,7 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
     memset(read_buf, 0, 4);
     memcpy(write_buf, (uint8_t[]){0x3C,0x00,0x00,0x00}, 4);
     xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-    if(verbose_on) print_hex_buf("Erase Status", read_buf, 4);
+    if(verbose_on) { print_hex_buf("Erase Status", read_buf, 4); }
 
     // Program Command
     memcpy(write_buf, (uint8_t[]){0x46,0x00,0x00,0x00}, 4);
@@ -499,21 +501,21 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
     memset(read_buf, 0, 4);
     memcpy(write_buf, (uint8_t[]){0xC0,0x00,0x00,0x00}, 4);
     xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-    if(verbose_on) print_hex_buf("User Register", read_buf, 4);
+    if(verbose_on) { print_hex_buf("User Register", read_buf, 4); }
 
     // Final Status
     memset(read_buf, 0, 4);
     memcpy(write_buf, (uint8_t[]){0x3C,0x00,0x00,0x00}, 4);
     xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-    if(verbose_on) print_hex_buf("Program Status", read_buf, 4);
+    if(verbose_on) { print_hex_buf("Program Status", read_buf, 4); }
 
-    if(read_buf[2] != 0x0F) ret_status = 1;
+    if(read_buf[2] != 0x0F) { ret_status = 1; }
 
     // Exit Program Mode
     memcpy(write_buf, (uint8_t[]){0x26,0x00,0x00,0x00}, 4);
     xi2c_write_bytes(hi2c, DevAddress, write_buf, 4);
 
-    if(verbose_on) printf("FPGA configuration complete.\r\n");
+    if(verbose_on) { printf("FPGA configuration complete.\r\n"); }
     return ret_status;
 }
 

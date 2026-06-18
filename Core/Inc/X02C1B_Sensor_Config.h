@@ -10,69 +10,69 @@
 
 #include "0X02C1B.h"
 
-struct regval_list X02C1B_test_gradient_bar[] = {
+static struct regval_list X02C1B_test_gradient_bar[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x80},
 		{0x5102, 0x20},
 		{0x5103, 0x04},
 };
 
-struct regval_list X02C1B_test_gradient_rgb_bar[] = {
+static struct regval_list X02C1B_test_gradient_rgb_bar[] = {
 		{0x5100, 0x80},
 		{0x5103, 0x00},
 };
 
-struct regval_list X02C1B_test_solid_a[] = {
+static struct regval_list X02C1B_test_solid_a[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x80},
 		{0x5102, 0x00},
 		{0x5103, 0x01},
 };
-struct regval_list X02C1B_test_solid_b[] = {
+static struct regval_list X02C1B_test_solid_b[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x80},
 		{0x5102, 0x00},
 		{0x5103, 0x01},
 };
-struct regval_list X02C1B_test_solid_c[] = {
+static struct regval_list X02C1B_test_solid_c[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x80},
 		{0x5102, 0x00},
 		{0x5103, 0x01},
 };
-struct regval_list X02C1B_test_random_seed[] = {
+static struct regval_list X02C1B_test_random_seed[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x81},
 };
-struct regval_list X02C1B_test_square[] = {
+static struct regval_list X02C1B_test_square[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x82},
 		{0x5103, 0x04},
 };
-struct regval_list X02C1B_test_disable[] = {
+static struct regval_list X02C1B_test_disable[] = {
 		{0x5000, 0x3e},
 		{0x5100, 0x00},
 };
-struct regval_list X02C1B_test_gradient_cont[] = {
+static struct regval_list X02C1B_test_gradient_cont[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0x80},
 		{0x5102, 0x30},
 		{0x5103, 0x04},
 };
-struct regval_list X02C1B_test_gradient_bar_rolling[] = {
+static struct regval_list X02C1B_test_gradient_bar_rolling[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0xC0},
 		{0x5102, 0x20},
 		{0x5103, 0x04},
 };
-struct regval_list X02C1B_exp_252[] = {
+static struct regval_list X02C1B_exp_252[] = {
 		{0x5000, 0x3f},
 		{0x5100, 0xC0},
 		{0x5102, 0x20},
 		{0x5103, 0x04},
 };
 
-struct regval_list X02C1B_SENSOR_CONFIG[] = {
+static struct regval_list X02C1B_SENSOR_CONFIG[] = {
 		{0x0105, 0x04},
 		{0x0104, 0x00},
 		{0x3d85, 0x0B},

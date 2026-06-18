@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 
-volatile uint8_t current_bank = 0;
+static volatile uint8_t current_bank = 0;
 
 static inline HAL_StatusTypeDef ICM_readBytes(uint8_t reg, uint8_t *pData, uint16_t size)
 {
@@ -22,14 +22,23 @@ static inline HAL_StatusTypeDef ICM_readBytes(uint8_t reg, uint8_t *pData, uint1
     for (int attempt = 0; attempt < retries; attempt++)
     {
         result = HAL_I2C_Master_Transmit(&ICM_I2C, ICM20948_ADDR << 1, &reg, 1, 100);
-        if (result != HAL_BUSY) break;
+        if (result != HAL_BUSY)
+        {
+            break;
+        }
     }
-    if (result != HAL_OK) return result;
+    if (result != HAL_OK)
+    {
+        return result;
+    }
 
     for (int attempt = 0; attempt < retries; attempt++)
     {
         result = HAL_I2C_Master_Receive(&ICM_I2C, ICM20948_ADDR << 1, pData, size, 100);
-        if (result != HAL_BUSY) break;
+        if (result != HAL_BUSY)
+        {
+            break;
+        }
     }
     return result;
 }
@@ -40,7 +49,10 @@ static HAL_StatusTypeDef ICM_WriteBytes(uint8_t reg, uint8_t *pData, uint16_t si
     int retries = 3;
     uint8_t buffer[16];
 
-    if (size > sizeof(buffer) - 1) return HAL_ERROR; // prevent buffer overflow
+    if (size > sizeof(buffer) - 1)
+    {
+        return HAL_ERROR; // prevent buffer overflow
+    }
 
     buffer[0] = reg;
     memcpy(&buffer[1], pData, size);
@@ -48,7 +60,10 @@ static HAL_StatusTypeDef ICM_WriteBytes(uint8_t reg, uint8_t *pData, uint16_t si
     for (int attempt = 0; attempt < retries; attempt++)
     {
     	result = HAL_I2C_Master_Transmit(&ICM_I2C, ICM20948_ADDR << 1, buffer, size + 1, 100);
-        if (result != HAL_BUSY) break;
+        if (result != HAL_BUSY)
+        {
+            break;
+        }
     }
     return result;
 }
@@ -69,14 +84,23 @@ static HAL_StatusTypeDef AK_ReadBytes(uint8_t reg, uint8_t *pData, uint16_t size
     for (int attempt = 0; attempt < retries; attempt++)
     {
         result = HAL_I2C_Master_Transmit(&ICM_I2C, AK09916_I2C_ADDR << 1, &reg, 1, 100);
-        if (result != HAL_BUSY) break;
+        if (result != HAL_BUSY)
+        {
+            break;
+        }
     }
-    if (result != HAL_OK) return result;
+    if (result != HAL_OK)
+    {
+        return result;
+    }
 
     for (int attempt = 0; attempt < retries; attempt++)
     {
         result = HAL_I2C_Master_Receive(&ICM_I2C, AK09916_I2C_ADDR << 1, pData, size, 100);
-        if (result != HAL_BUSY) break;
+        if (result != HAL_BUSY)
+        {
+            break;
+        }
     }
     return result;
 }
@@ -90,7 +114,10 @@ static HAL_StatusTypeDef AK_WriteByte(uint8_t reg, uint8_t value)
     for (int attempt = 0; attempt < retries; attempt++)
     {
         result = HAL_I2C_Master_Transmit(&ICM_I2C, AK09916_I2C_ADDR << 1, buffer, 2, 100);
-        if (result != HAL_BUSY) break;
+        if (result != HAL_BUSY)
+        {
+            break;
+        }
     }
     return result;
 }
@@ -98,7 +125,10 @@ static HAL_StatusTypeDef AK_WriteByte(uint8_t reg, uint8_t value)
 
 static inline void ICM_SelectBank(uint8_t bank)
 {
-	if (current_bank == bank) return;
+	if (current_bank == bank)
+	{
+		return;
+	}
     uint8_t val = bank;
     if (HAL_I2C_Mem_Write(&ICM_I2C, ICM20948_ADDR << 1, ICM20948_REG_BANK_SEL, I2C_MEMADD_SIZE_8BIT, &val, 1, 5) == HAL_OK)
     {
@@ -139,33 +169,51 @@ uint8_t ICM_Init(void)
     uint8_t reset_cmd = 0x80;
     status = ICM_WriteBytes(ICM20948_PWR_MGMT_1, &reset_cmd, 1);
     delay_ms(100);  // Wait for reset
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
 
     // 3. Wake up and set clock source
     uint8_t pwr_mgmt_1 = 0x01;  // sleep=0, clock=auto
     status = ICM_WriteBytes(ICM20948_PWR_MGMT_1, &pwr_mgmt_1, 1);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
     delay_ms(10);
 
     // 4. Enable all sensors (Accel, Gyro, Temp)
     uint8_t pwr_mgmt_2 = 0x00; // All on
     status = ICM_WriteBytes(ICM20948_PWR_MGMT_2, &pwr_mgmt_2, 1);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
 
     // 4.5 Disable Low Power Mode (LP_EN = 0)
     uint8_t lp_config = 0x00;
     status = ICM_WriteBytes(ICM20948_LP_CONFIG, &lp_config, 1);  // LP_CONFIG register (bank 0)
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
 
     // 5. Keep the aux I2C master OFF and route the internal AK09916 onto
     // the host bus via BYPASS_EN (mag then answers directly at 0x0C).
     // BYPASS_EN only engages while I2C_MST_EN is clear.
     uint8_t user_ctrl = 0x00;
     status = ICM_WriteBytes(ICM20948_USER_CTRL, &user_ctrl, 1);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
     uint8_t int_pin_cfg = 0x02; // BYPASS_EN
     status = ICM_WriteBytes(ICM20948_INT_PIN_CFG, &int_pin_cfg, 1);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
     delay_ms(5);
 
     // 6. Select USER BANK 2 for gyro and accel config
@@ -175,12 +223,18 @@ uint8_t ICM_Init(void)
     // anti-aliasing for the 40 Hz sample stream (Nyquist 20 Hz).
     uint8_t gyro_config_1 = 0x2F; // DLPFCFG=5 (11.6Hz), FS_SEL=3 (±2000dps), FCHOICE=1
     status = ICM_WriteBytes(ICM20948_GYRO_CONFIG_1, &gyro_config_1, 1);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
 
     // 8. Configure accelerometer: ±16g, DLPF enabled at 11.5 Hz BW.
     uint8_t accel_config = 0x2F; // DLPFCFG=5 (11.5Hz), FS_SEL=3 (±16g), FCHOICE=1
     status = ICM_WriteBytes(ICM20948_ACCEL_CONFIG, &accel_config, 1);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
 
     // 8.5 Bring up the AK09916 magnetometer directly over the bypass bus.
     ICM_SelectBank(ICM20948_USER_BANK_0);
@@ -198,12 +252,18 @@ uint8_t ICM_Init(void)
     // and the AK09916 keeps its mode across MCU resets, so start from a
     // known state.
     status = AK_WriteByte(0x32, 0x01); // CNTL3 = SRST
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
     delay_ms(10);
 
     // Continuous measurement mode at 100 Hz via CNTL2.
     status = AK_WriteByte(0x31, 0x08);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+    {
+        return status;
+    }
     delay_ms(10); // Let mag config complete
 
     // 9. Return to USER BANK 0
@@ -240,7 +300,9 @@ uint8_t ICM_ReadAccel(ICM_Axis3D *accel)
     ICM_SelectBank(ICM20948_USER_BANK_0);
 
     if (ICM_readBytes(ICM20948_ACCEL_XOUT_H, rawData, 6) != HAL_OK)
+    {
         return HAL_ERROR;
+    }
 
     accel->x = (int16_t)((rawData[0] << 8) | rawData[1]);
     accel->y = (int16_t)((rawData[2] << 8) | rawData[3]);
@@ -255,7 +317,9 @@ uint8_t ICM_ReadGyro(ICM_Axis3D *gyro)
     ICM_SelectBank(ICM20948_USER_BANK_0);
 
     if (ICM_readBytes(ICM20948_GYRO_XOUT_H, rawData, 6) != HAL_OK)
+    {
         return HAL_ERROR;
+    }
 
     gyro->x = (int16_t)((rawData[0] << 8) | rawData[1]);
     gyro->y = (int16_t)((rawData[2] << 8) | rawData[3]);
@@ -271,7 +335,9 @@ uint8_t ICM_ReadMag(ICM_Axis3D *mag)
     uint8_t magData[9]; // ST1, HXL..HZH, TMPS, ST2
 
     if (AK_ReadBytes(0x10, magData, 9) != HAL_OK)
+    {
         return HAL_ERROR;
+    }
 
     mag->x = (int16_t)((magData[2] << 8) | magData[1]);
     mag->y = (int16_t)((magData[4] << 8) | magData[3]);
@@ -289,12 +355,16 @@ uint8_t ICM_GetAllRawData(ICM_Axis3D *accel, float * pTemp, ICM_Axis3D *gyro, IC
     ICM_SelectBank(ICM20948_USER_BANK_0);
 
     if (ICM_readBytes(ICM20948_ACCEL_XOUT_H, rawData, 14) != HAL_OK)
+    {
         return HAL_ERROR;
+    }
 
     // Direct mag read over the bypass bus. The burst must end at ST2:
     // the AK09916 latches measurement data until ST2 is read.
     if (AK_ReadBytes(0x10, magData, 9) != HAL_OK)
+    {
         return HAL_ERROR;
+    }
 
     accel->x = (int16_t)((rawData[0] << 8) | rawData[1]);
     accel->y = (int16_t)((rawData[2] << 8) | rawData[3]);

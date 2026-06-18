@@ -15,7 +15,9 @@ static HistoFakeContext histo_ctx;
 void HistoFake_Init(uint32_t camera_count)
 {
     if (camera_count > HISTO_CAMERA_MAX_COUNT)
+    {
         camera_count = HISTO_CAMERA_MAX_COUNT;
+    }
 
     histo_ctx.camera_count = camera_count;
     histo_ctx.frame_id = 0;

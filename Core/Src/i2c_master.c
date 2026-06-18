@@ -15,7 +15,7 @@
 // I2C Expander specific
 #define TCA9548_ADDR 0x70
 
-uint8_t I2C_current_target = 0x00; // Default target address
+static uint8_t I2C_current_target = 0x00; // Default target address
 
 static void TCA9548A_ResetHardware(void)
 {
@@ -90,7 +90,7 @@ uint8_t I2C_scan(I2C_HandleTypeDef * pI2c, uint8_t* addr_list, size_t list_size,
         		printf("-- ");
         	}
         }
-        if (display && (address + 1) % 16 == 0)  printf("\r\n");
+        if (display && (address + 1) % 16 == 0) { printf("\r\n"); }
     }
 
 	if(display)
@@ -253,8 +253,9 @@ void I2C_BusRecovery(I2C_HandleTypeDef *hi2c)
         delay_us(5);
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
         delay_us(5);
-        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET)
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET) {
             break;
+        }
     }
 
     /* Generate STOP: SDA low → SCL high → SDA high. */

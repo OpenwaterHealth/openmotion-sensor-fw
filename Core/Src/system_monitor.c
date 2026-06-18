@@ -96,18 +96,18 @@ void system_monitor_capture_reset_cause(void)
     s_persist.boot_count++;
     s_persist.last_rcc_csr = rsr;
 
-    if (rsr & RCC_RSR_BORRSTF)   s_persist.bor_count++;
-    if (rsr & RCC_RSR_PORRSTF)   s_persist.por_count++;
-    if (rsr & RCC_RSR_PINRSTF)   s_persist.pin_count++;
-    if (rsr & RCC_RSR_SFTRSTF)   s_persist.sft_count++;
+    if (rsr & RCC_RSR_BORRSTF)   { s_persist.bor_count++; }
+    if (rsr & RCC_RSR_PORRSTF)   { s_persist.por_count++; }
+    if (rsr & RCC_RSR_PINRSTF)   { s_persist.pin_count++; }
+    if (rsr & RCC_RSR_SFTRSTF)   { s_persist.sft_count++; }
 #ifdef RCC_RSR_IWDG1RSTF
-    if (rsr & RCC_RSR_IWDG1RSTF) s_persist.iwdg_count++;
+    if (rsr & RCC_RSR_IWDG1RSTF) { s_persist.iwdg_count++; }
 #endif
 #ifdef RCC_RSR_WWDG1RSTF
-    if (rsr & RCC_RSR_WWDG1RSTF) s_persist.wwdg_count++;
+    if (rsr & RCC_RSR_WWDG1RSTF) { s_persist.wwdg_count++; }
 #endif
 #ifdef RCC_RSR_LPWRRSTF
-    if (rsr & RCC_RSR_LPWRRSTF)  s_persist.lpwr_count++;
+    if (rsr & RCC_RSR_LPWRRSTF)  { s_persist.lpwr_count++; }
 #endif
 }
 
@@ -129,7 +129,7 @@ void system_monitor_print_history(void)
                (unsigned long)s_persist.ecc_last_addr,
                (unsigned long)s_persist.ecc_last_monitor);
     }
-    if (s_persist.dma_err_count) {
+    if (s_persist.dma_err_count != 0u) {
         printf("DMA stats:  transfer-errors=%lu\r\n",
                (unsigned long)s_persist.dma_err_count);
     }
@@ -148,7 +148,7 @@ void system_monitor_ecc_enable(void)
     for (uint32_t i = 0; i < ECC_MON_COUNT; i++) {
         /* Drop any flags that latched during cold-boot reads of uninit RAM. */
         __HAL_RAMECC_CLEAR_FLAG(ecc_handles[i], RAMECC_FLAGS_ALL);
-        if (!ecc_enabled[i]) continue;
+        if (!ecc_enabled[i]) { continue; }
         (void)HAL_RAMECC_StartMonitor(ecc_handles[i]);
     }
 }
@@ -163,10 +163,10 @@ static uint32_t s_ecc_dbe_session;
 static void ecc_poll(void)
 {
     for (uint32_t i = 0; i < ECC_MON_COUNT; i++) {
-        if (!ecc_enabled[i]) continue;
+        if (!ecc_enabled[i]) { continue; }
         RAMECC_HandleTypeDef *h = ecc_handles[i];
         uint32_t sr = h->Instance->SR;
-        if (sr == 0u) continue;
+        if (sr == 0u) { continue; }
 
         uint32_t addr = HAL_RAMECC_GetFailingAddress(h);
         if (sr & RAMECC_SR_SEDCF) {
@@ -217,18 +217,18 @@ static void scan_dma_stream_bank(DMA_TypeDef *dma, bool high, uint8_t stream_bas
     volatile uint32_t * const isr = high ? &dma->HISR  : &dma->LISR;
     volatile uint32_t * const ifc = high ? &dma->HIFCR : &dma->LIFCR;
     uint32_t v = *isr;
-    if (v == 0u) return;
+    if (v == 0u) { return; }
 
     for (uint32_t s = 0; s < 4; s++) {
         uint32_t te = 1u << s_te_bit_lo[s];
         uint32_t fe = 1u << s_fe_bit_lo[s];
-        if (v & te) {
+        if ((v & te) != 0u) {
             s_persist.dma_err_count++;
             printf("[DMA] %s stream%lu transfer-error\r\n",
                    name, (unsigned long)(stream_base + s));
             *ifc = te;
         }
-        if (v & fe) {
+        if ((v & fe) != 0u) {
             /* FIFO errors are common during legitimate operation; only count,
              * don't spam. */
             *ifc = fe;
@@ -239,10 +239,10 @@ static void scan_dma_stream_bank(DMA_TypeDef *dma, bool high, uint8_t stream_bas
 static void scan_bdma(void)
 {
     uint32_t v = BDMA->ISR;
-    if (v == 0u) return;
+    if (v == 0u) { return; }
     for (uint32_t ch = 0; ch < 8; ch++) {
         uint32_t te = 1u << (3u + 4u * ch); /* TEIFx */
-        if (v & te) {
+        if ((v & te) != 0u) {
             s_persist.dma_err_count++;
             printf("[DMA] BDMA ch%lu transfer-error\r\n", (unsigned long)ch);
             BDMA->IFCR = te;
@@ -257,7 +257,7 @@ void system_monitor_poll(void)
     /* Periodic ECC and DMA error-flag scan */
     static uint32_t last_ms = 0;
     uint32_t now = HAL_GetTick();
-    if ((now - last_ms) < DMA_POLL_MS) return;
+    if ((now - last_ms) < DMA_POLL_MS) { return; }
     last_ms = now;
 
     ecc_poll();
