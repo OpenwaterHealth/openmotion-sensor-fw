@@ -2062,6 +2062,20 @@ _Bool enable_camera_stream(uint8_t cam_id){
 	event_bits &= ~(1u << cam_id);
 	__enable_irq();
 
+	/* Flush this camera's receive buffer before arming DMA. The FPGA is
+	 * re-programmed at every scan start (its frame counter resets to 1), but
+	 * the MCU's frame_buffer/spi6_buffer still holds the PREVIOUS scan's last
+	 * DMA'd frame — old FPGA frame_id and timestamp. If a send fires before
+	 * the first fresh DMA completes, that stale frame ships ahead of frame 1,
+	 * desyncing the host's frame-id unwrap and dark schedule (issue #172:
+	 * left-sensor "stale 255/173 with negative timestamps at scan start").
+	 * Zeroing it makes any premature send an obvious empty frame, not stale
+	 * data. capture_single_histogram() clears the buffer the same way. */
+	if (cam->pRecieveHistoBuffer != NULL) {
+		memset((uint8_t *)cam->pRecieveHistoBuffer, 0,
+			cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+	}
+
 	/* Arm DMA BEFORE stream_on so the receiver is ready when the sensor
 	 * starts clocking data.  Arming after stream_on causes an immediate SPI
 	 * overrun on fast cameras (e.g. SPI4 / cam 8). */
