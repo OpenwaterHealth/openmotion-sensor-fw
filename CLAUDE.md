@@ -6,6 +6,18 @@ Cross-repo context + shared protocol: [../CLAUDE.md](../CLAUDE.md). Authoritativ
 
 > **Code references in this guide are by function/symbol name, not line number.** An earlier version pinned line numbers; the core files grew and every citation rotted. Grep for the symbol.
 
+## Reporting firmware issues (for agents)
+
+If you find a firmware bug or issue while working in this repo, **open a GitHub issue — do not file a background-task chip.** Use the `gh` CLI:
+
+```bash
+gh issue create --repo OpenwaterHealth/openmotion-sensor-fw \
+  --title "<concise summary>" \
+  --body "<what's wrong, where (file/function), how to reproduce or observe it, and impact>"
+```
+
+Write a self-contained description: the affected file/function, what's wrong, how it reproduces or how you observed it, and the impact. This keeps firmware issues tracked on the repo where the maintainers see them, rather than as ephemeral session chips.
+
 ## Build
 
 ```powershell
