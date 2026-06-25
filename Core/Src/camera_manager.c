@@ -78,6 +78,8 @@ static bool streaming_first_frame = false;
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
 static uint8_t camera_failure_counters[CAMERA_COUNT] = {0};  // Track consecutive cycles without event bits
+/* #68 instrumentation: per-camera RX overrun counts (set in main.c error callbacks). */
+volatile uint32_t cam_overrun_count[CAMERA_COUNT] = {0};
 
  __ALIGN_BEGIN __attribute__((section(".sram4"))) volatile uint8_t spi6_buffer[SPI_PACKET_LENGTH] __ALIGN_END;
 
@@ -1425,6 +1427,8 @@ _Bool send_data(void) {
 		streaming_start_time = get_timestamp_ms();
 		streaming_active = true;
 		streaming_first_frame = true;
+		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
+		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) { cam_overrun_count[ci] = 0; }
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
@@ -1481,6 +1485,13 @@ _Bool check_streaming(void){
 		}
 		if((current_time - most_recent_frame_time_local) > STREAMING_TIMEOUT_MS){
 			uint32_t elapsed = current_time - streaming_start_time;
+			/* #68: this terminal flush is NOT driven by a fresh FSIN, so the
+			 * ISR-captured fsin_timestamp_ms would be stale (the previous frame's
+			 * time) here. Stamp it now so the terminal frame carries a current
+			 * timestamp — i.e. the ~150 ms off-grid laser-off frame the host already
+			 * expects and re-times. Harmless if the dark frame was already sent by
+			 * its own off-grid FSIN (then there is no data left to flush). */
+			fsin_timestamp_ms = get_timestamp_ms();
 			send_data(); // send data one last frame to finish the buffers
 			if (total_frames_failed > 0) {
 				total_frames_failed--;  // first frame skip / last frame extra
@@ -1489,6 +1500,12 @@ _Bool check_streaming(void){
 			if(total_frames_failed > 0){
 				printf("%lu frames failed\r\n", total_frames_failed);
 			}
+			/* #68 instrumentation: per-camera RX overrun counts this scan. */
+			printf("[DIAG] overruns c1-c8: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+			       (unsigned long)cam_overrun_count[0], (unsigned long)cam_overrun_count[1],
+			       (unsigned long)cam_overrun_count[2], (unsigned long)cam_overrun_count[3],
+			       (unsigned long)cam_overrun_count[4], (unsigned long)cam_overrun_count[5],
+			       (unsigned long)cam_overrun_count[6], (unsigned long)cam_overrun_count[7]);
 			/* Print compression stats if compression was used */
 			if (cmp_frame_count > 0) {
 				uint32_t avg_ratio = (cmp_total_compressed * 100) / cmp_total_uncompressed;
@@ -1568,7 +1585,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1707,7 +1724,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1847,7 +1864,7 @@ _Bool send_fake_data(void) {
 	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);

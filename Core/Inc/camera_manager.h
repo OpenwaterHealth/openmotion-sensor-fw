@@ -96,6 +96,13 @@ _Bool capture_single_histogram(uint8_t cam_id);
 _Bool get_single_histogram(uint8_t cam_id, uint8_t* data, uint16_t* data_len);
 _Bool start_data_reception(uint8_t cam_id);
 _Bool abort_data_reception(uint8_t cam_id);
+/* #68 instrumentation: per-camera SPI/USART RX overrun counts for the current scan.
+ * Incremented in the HAL error callbacks (main.c); reset at scan start, dumped at
+ * scan end (camera_manager.c). */
+extern volatile uint32_t cam_overrun_count[CAMERA_COUNT];
+/* #68: frame-sync timestamp captured in the FSIN ISR (main.c); used as the
+ * histogram packet timestamp so it is correct regardless of deferred-send timing. */
+extern volatile uint32_t fsin_timestamp_ms;
 _Bool send_data(void);
 _Bool send_fake_data(void);
 _Bool send_histogram_data(void);
