@@ -726,12 +726,10 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 			uartResp->packet_type = OW_ACK;
 			break;
 		}
-		/* Scan start: drop any histogram packets left over from the previous
-		 * scan so they can't ship ahead of frame 1 with a stale timestamp /
-		 * frame_id (leftover-frame bug). Flush once, before arming cameras.
-		 * Enable path only (reserved==1). */
+		/* Scan start: clear any leftover frames before arming cameras — a
+		 * backstop to the stop-path drain below. Enable path only. */
 		if (cmd.reserved == 1) {
-			USBD_HISTO_FlushQueue();
+			USBD_HISTO_FlushQueue("start");
 		}
 		uint8_t status = 0;
 		for (uint8_t i = 0; i < 8; i++) {
@@ -744,6 +742,13 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 				}
 	        }
 	    }
+		/* Scan stop: drain any leftover frames so none carry into the next
+		 * scan. Cameras are already disabled above, so the queue can only
+		 * shrink from here. Disable path only — this is the primary "keep it
+		 * from getting dirty" guard; the start-path flush is just a backstop. */
+		if (cmd.reserved == 0) {
+			USBD_HISTO_FlushQueue("stop");
+		}
 		if(status != cmd.addr) // if the status bits are not true for all the cameras addressed, error
 		{
 			uartResp->packet_type = OW_ERROR;
