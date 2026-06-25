@@ -25,11 +25,18 @@ typedef struct {
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #endif
 
-/* Private variables */
+/* Private variables.
+ * head/tail/count are shared between the frame ISR (enqueue, via
+ * USBD_HISTO_SendData) and the USB OTG_HS ISR (dequeue, via USBD_Histo_DataIn).
+ * On the external-FSIN path the USB ISR (NVIC prio 0) can PREEMPT the frame ISR
+ * (prio 2) mid read-modify-write, so these must be volatile AND every mutation
+ * runs in a __disable_irq critical section (see enqueue/dequeue). Without that,
+ * a lost count++/count-- drifts the count, stranding a never-dequeued slot whose
+ * stale bytes re-ship into a later scan. */
 static histo_queue_entry_t histo_queue[HISTO_QUEUE_SIZE];
-static uint8_t histo_queue_head = 0;
-static uint8_t histo_queue_tail = 0;
-static uint8_t histo_queue_count = 0;
+static volatile uint8_t histo_queue_head = 0;
+static volatile uint8_t histo_queue_tail = 0;
+static volatile uint8_t histo_queue_count = 0;
 static USBD_HandleTypeDef *histo_pdev = NULL;
 
 /* Private function prototypes */
@@ -92,8 +99,8 @@ __ALIGN_BEGIN static uint8_t USBD_Histo_GetDeviceQualifierDescriptor[USB_LEN_DEV
 
 extern uint8_t HISTO_InstID;
 static uint8_t* pTxHistoBuff = 0;
-static uint16_t tx_histo_total_len = 0;
-static uint16_t tx_histo_ptr = 0;
+static volatile uint16_t tx_histo_total_len = 0;
+static volatile uint16_t tx_histo_ptr = 0;
 static __IO uint8_t histo_ep_enabled = 0;
 __IO uint8_t histo_ep_data = 0;
 static uint8_t HISTOInEpAdd = HISTO_IN_EP;
@@ -234,31 +241,45 @@ static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length)
     return USBD_FAIL;
   }
 
-  /* Copy data into queue entry buffer */
-  memcpy(histo_queue[histo_queue_tail].buffer, data, length);
-  histo_queue[histo_queue_tail].length = length;
+  /* Copy into the current tail slot BEFORE publishing it. enqueue runs only in
+   * the frame ISR (non-reentrant), so `tail` is private here and the slot stays
+   * invisible to the dequeue path until count++ commits below. The 32 KB memcpy
+   * is deliberately OUTSIDE the critical section — never hold off IRQs across it. */
+  uint8_t slot = histo_queue_tail;
+  memcpy(histo_queue[slot].buffer, data, length);
+  histo_queue[slot].length = length;
 
-  /* Update queue pointers */
-  histo_queue_tail = (histo_queue_tail + 1) % HISTO_QUEUE_SIZE;
+  /* Publish atomically: `count` is shared with the dequeue path (USB ISR), which
+   * can preempt this frame-ISR enqueue, so the RMW must not be interruptible. */
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  histo_queue_tail = (uint8_t)((slot + 1) % HISTO_QUEUE_SIZE);
   histo_queue_count++;
   histo_enq_count++;
+  __set_PRIMASK(primask);
 
   return USBD_OK;
 }
 
 static uint8_t histo_queue_dequeue(uint8_t **data, uint16_t *length)
 {
-  if (histo_queue_is_empty() != 0) {
+  /* Empty-check + head advance + count-- as one atomic step: dequeue is called
+   * from BOTH the frame ISR and the USB ISR, so two concurrent dequeues must not
+   * both claim the same head slot. */
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  if (histo_queue_count == 0) {
+    __set_PRIMASK(primask);
     return USBD_FAIL;
   }
-
-  *data = histo_queue[histo_queue_head].buffer;
-  *length = histo_queue[histo_queue_head].length;
-
-  /* Update queue pointers */
-  histo_queue_head = (histo_queue_head + 1) % HISTO_QUEUE_SIZE;
+  uint8_t slot = histo_queue_head;
+  histo_queue_head = (uint8_t)((slot + 1) % HISTO_QUEUE_SIZE);
   histo_queue_count--;
   histo_deq_count++;
+  __set_PRIMASK(primask);
+
+  *data = histo_queue[slot].buffer;
+  *length = histo_queue[slot].length;
 
   return USBD_OK;
 }
@@ -318,6 +339,9 @@ static uint8_t USBD_Histo_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
           if (ret != USBD_OK) {
             histo_tx_fail_count++;
             histo_ep_data = 0;
+            /* Mid-transfer failure: resume draining so a tx error doesn't wedge
+             * the EP and strand the rest of the queue until the next scan. */
+            histo_process_queue();
           }
       }
       else
@@ -397,6 +421,48 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
 
   /* Otherwise, add to queue */
   return histo_queue_enqueue(data, len);
+}
+
+/* Drop any histogram packets left in the software TX queue (and the
+ * hardware EP FIFO) from a previous scan.  The queue is otherwise only
+ * reset on USB (de)enumeration, so packets still queued when a scan stops
+ * drain into the NEXT scan carrying that scan's TIM5 timestamp and
+ * frame_id — the host renders them as negative scan-relative timestamps
+ * and out-of-order frame_ids (the leftover-frame / "stale frame" bug).
+ * Call this at scan start (OW_CAMERA_STREAM enable) BEFORE arming the
+ * cameras, so frame 1 of the new scan is the first packet the host sees.
+ * Touches state shared with the frame ISR (USBD_HISTO_SendData) and the
+ * USB ISR (USBD_Histo_DataIn), so it runs in a critical section. */
+void USBD_HISTO_FlushQueue(const char *who)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+
+  /* Snapshot what was still in the queue before we clear it. */
+  uint8_t pending  = histo_queue_count;
+  uint8_t inflight = histo_ep_data;
+  long    gap      = (long)histo_enq_count - (long)histo_deq_count;
+
+  /* Empty the software queue + abandon any in-flight transfer + drop the EP
+   * FIFO, so nothing from this scan can carry into the next. */
+  histo_queue_head = 0;
+  histo_queue_tail = 0;
+  histo_queue_count = 0;
+  histo_ep_data = 0;
+  tx_histo_ptr = 0;
+  tx_histo_total_len = 0;
+  if (histo_pdev != NULL && histo_ep_enabled != 0) {
+    USBD_LL_FlushEP(histo_pdev, HISTOInEpAdd);
+  }
+
+  __set_PRIMASK(primask);
+
+  /* Diagnostic (short, single-chunk — the USB printf channel splits long lines):
+   *   q  = frames still queued at the boundary (the leftover source)
+   *   ep = a transfer was still in flight
+   *   e-d= enq-deq; this should EQUAL q. If e-d != q the count was corrupted by
+   *        a cross-ISR race; if e-d == q > 0 the scan honestly left frames unsent. */
+  printf("HISTO flush(%s): q=%u ep=%u e-d=%ld\r\n", who, pending, inflight, gap);
 }
 
 uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)

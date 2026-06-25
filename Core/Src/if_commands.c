@@ -17,6 +17,7 @@
 #include "ICM20948.h"
 #include "0X02C1B.h"
 #include "histo_fake.h"
+#include "usbd_histo.h"
 #include "motion_config.h"
 #include "sensor_serial.h"
 #include "logging.h"
@@ -725,6 +726,11 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 			uartResp->packet_type = OW_ACK;
 			break;
 		}
+		/* Scan start: clear any leftover frames before arming cameras — a
+		 * backstop to the stop-path drain below. Enable path only. */
+		if (cmd.reserved == 1) {
+			USBD_HISTO_FlushQueue("start");
+		}
 		uint8_t status = 0;
 		for (uint8_t i = 0; i < 8; i++) {
 	        if (((cmd.addr >> i) & 0x01) != 0) {
@@ -736,6 +742,13 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 				}
 	        }
 	    }
+		/* Scan stop: drain any leftover frames so none carry into the next
+		 * scan. Cameras are already disabled above, so the queue can only
+		 * shrink from here. Disable path only — this is the primary "keep it
+		 * from getting dirty" guard; the start-path flush is just a backstop. */
+		if (cmd.reserved == 0) {
+			USBD_HISTO_FlushQueue("stop");
+		}
 		if(status != cmd.addr) // if the status bits are not true for all the cameras addressed, error
 		{
 			uartResp->packet_type = OW_ERROR;
