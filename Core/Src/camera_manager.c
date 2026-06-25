@@ -1485,6 +1485,13 @@ _Bool check_streaming(void){
 		}
 		if((current_time - most_recent_frame_time_local) > STREAMING_TIMEOUT_MS){
 			uint32_t elapsed = current_time - streaming_start_time;
+			/* #68: this terminal flush is NOT driven by a fresh FSIN, so the
+			 * ISR-captured fsin_timestamp_ms would be stale (the previous frame's
+			 * time) here. Stamp it now so the terminal frame carries a current
+			 * timestamp — i.e. the ~150 ms off-grid laser-off frame the host already
+			 * expects and re-times. Harmless if the dark frame was already sent by
+			 * its own off-grid FSIN (then there is no data left to flush). */
+			fsin_timestamp_ms = get_timestamp_ms();
 			send_data(); // send data one last frame to finish the buffers
 			if (total_frames_failed > 0) {
 				total_frames_failed--;  // first frame skip / last frame extra
@@ -1578,7 +1585,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1717,7 +1724,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1857,7 +1864,7 @@ _Bool send_fake_data(void) {
 	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);

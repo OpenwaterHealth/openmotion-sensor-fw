@@ -135,6 +135,11 @@ volatile uint8_t imu_sample_due = 0; // set by the TIM14 ISR, serviced by imu_se
  * flag and the main loop runs send_data() — moving the heavy per-frame send out of
  * interrupt context so it can't block/starve the camera SPI/USART transport IRQs. */
 volatile bool send_data_flag = false;
+/* #68: histogram-frame timestamp captured at the FSIN rising edge (in the ISR).
+ * The send path uses this instead of sampling the clock itself, so the packet
+ * timestamp reflects the frame-sync instant even when the send is deferred to
+ * the main loop (where it would otherwise lag by the main-loop service latency). */
+volatile uint32_t fsin_timestamp_ms = 0;
 
 ICM_Axis3D a;
 ICM_Axis3D m;
@@ -2008,6 +2013,7 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM4) // Call data sender (internal FSIN))
   {
+    fsin_timestamp_ms = get_timestamp_ms();  /* #68: stamp the frame at FSIN */
     /* #68 experiment: defer the heavy send to the main loop when enabled. */
     if ((logging_get_debug_flags() & DEBUG_FLAG_SEND_DEFER) != 0u) {
       send_data_flag = true;
@@ -2022,6 +2028,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == GPIO_PIN_13) // Call REAL data sender if interrupt hit and enabled
     {
       pulse_count++;
+      fsin_timestamp_ms = get_timestamp_ms();  /* #68: stamp the frame at the FSIN rising edge */
       /* #68 experiment: defer the heavy send to the main loop when enabled. */
       if ((logging_get_debug_flags() & DEBUG_FLAG_SEND_DEFER) != 0u) {
         send_data_flag = true;
