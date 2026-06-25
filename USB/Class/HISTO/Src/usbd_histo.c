@@ -399,6 +399,38 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
   return histo_queue_enqueue(data, len);
 }
 
+/* Drop any histogram packets left in the software TX queue (and the
+ * hardware EP FIFO) from a previous scan.  The queue is otherwise only
+ * reset on USB (de)enumeration, so packets still queued when a scan stops
+ * drain into the NEXT scan carrying that scan's TIM5 timestamp and
+ * frame_id — the host renders them as negative scan-relative timestamps
+ * and out-of-order frame_ids (the leftover-frame / "stale frame" bug).
+ * Call this at scan start (OW_CAMERA_STREAM enable) BEFORE arming the
+ * cameras, so frame 1 of the new scan is the first packet the host sees.
+ * Touches state shared with the frame ISR (USBD_HISTO_SendData) and the
+ * USB ISR (USBD_Histo_DataIn), so it runs in a critical section. */
+void USBD_HISTO_FlushQueue(void)
+{
+  __disable_irq();
+
+  /* Empty the software queue. */
+  histo_queue_head = 0;
+  histo_queue_tail = 0;
+  histo_queue_count = 0;
+
+  /* Abandon any in-flight / partially-sent transfer from the prior scan. */
+  histo_ep_data = 0;
+  tx_histo_ptr = 0;
+  tx_histo_total_len = 0;
+
+  /* Drop whatever the hardware EP FIFO still holds. */
+  if (histo_pdev != NULL && histo_ep_enabled != 0) {
+    USBD_LL_FlushEP(histo_pdev, HISTOInEpAdd);
+  }
+
+  __enable_irq();
+}
+
 uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)
 {
 	uint8_t ret = USBD_OK;

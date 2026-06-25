@@ -17,6 +17,7 @@
 #include "ICM20948.h"
 #include "0X02C1B.h"
 #include "histo_fake.h"
+#include "usbd_histo.h"
 #include "motion_config.h"
 #include "sensor_serial.h"
 #include "logging.h"
@@ -724,6 +725,13 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 			}
 			uartResp->packet_type = OW_ACK;
 			break;
+		}
+		/* Scan start: drop any histogram packets left over from the previous
+		 * scan so they can't ship ahead of frame 1 with a stale timestamp /
+		 * frame_id (leftover-frame bug). Flush once, before arming cameras.
+		 * Enable path only (reserved==1). */
+		if (cmd.reserved == 1) {
+			USBD_HISTO_FlushQueue();
 		}
 		uint8_t status = 0;
 		for (uint8_t i = 0; i < 8; i++) {
