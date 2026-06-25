@@ -31,6 +31,7 @@
 #define DEBUG_FLAG_COMM_VERBOSE (1u << 4)  /* Enable cmd id and "." response prints in uart_comms */
 #define DEBUG_FLAG_CMD_VERBOSE (1u << 5)  /* Enable printf in command handlers (if_commands.c) */
 #define DEBUG_FLAG_HISTO_CMP  (1u << 6)  /* Send compressed histogram packets (TYPE_HISTO_CMP) */
+#define DEBUG_FLAG_SEND_DEFER (1u << 7)  /* #68: FSIN ISR only flips send_data_flag; main loop runs send_data() */
 
 
 #define I2C_IRQ_PRIORITY 0

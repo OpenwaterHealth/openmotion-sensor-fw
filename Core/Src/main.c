@@ -35,6 +35,7 @@
 #include "ICM20948.h"
 #include "camera_manager.h"
 #include "system_monitor.h"
+#include "common.h"        /* DEBUG_FLAG_* (e.g. DEBUG_FLAG_SEND_DEFER) */
 
 #include <stdio.h>
 #include <string.h>
@@ -130,6 +131,10 @@ volatile uint16_t pulse_count = 0;
 extern volatile uint32_t imu_frame_counter;
 volatile bool _enter_dfu = false;
 volatile uint8_t imu_sample_due = 0; // set by the TIM14 ISR, serviced by imu_service()
+/* #68 experiment: when DEBUG_FLAG_SEND_DEFER is active, the FSIN ISRs only set this
+ * flag and the main loop runs send_data() — moving the heavy per-frame send out of
+ * interrupt context so it can't block/starve the camera SPI/USART transport IRQs. */
+volatile bool send_data_flag = false;
 
 ICM_Axis3D a;
 ICM_Axis3D m;
@@ -424,6 +429,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* #68 experiment: run the deferred per-frame send in thread context (set by the
+     * FSIN ISR when DEBUG_FLAG_SEND_DEFER is active). Runs below every interrupt, so it
+     * cannot block the camera SPI/USART transport IRQs the way the ISR-context send does. */
+    if (send_data_flag) { send_data_flag = false; send_data(); }
   	comms_host_check_received(); // check comms
     imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
     camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
@@ -1815,6 +1824,7 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
   {
     printf("Overrun error ");
     __HAL_USART_CLEAR_OREFLAG(husart);
+    if (cam_id >= 0) { cam_overrun_count[cam_id]++; }  /* #68 instrumentation */
   }
   if (husart->ErrorCode & HAL_USART_ERROR_DMA)
   {
@@ -1886,6 +1896,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
   {
     printf("Overrun error ");
     __HAL_SPI_CLEAR_OVRFLAG(hspi);
+    if (cam_id >= 0) { cam_overrun_count[cam_id]++; }  /* #68 instrumentation */
   }
   if (hspi->ErrorCode & HAL_SPI_ERROR_MODF)
   {
@@ -1997,7 +2008,12 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM4) // Call data sender (internal FSIN))
   {
-    send_data();
+    /* #68 experiment: defer the heavy send to the main loop when enabled. */
+    if ((logging_get_debug_flags() & DEBUG_FLAG_SEND_DEFER) != 0u) {
+      send_data_flag = true;
+    } else {
+      send_data();
+    }
   }
 }
 
@@ -2006,7 +2022,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == GPIO_PIN_13) // Call REAL data sender if interrupt hit and enabled
     {
       pulse_count++;
-      send_data();
+      /* #68 experiment: defer the heavy send to the main loop when enabled. */
+      if ((logging_get_debug_flags() & DEBUG_FLAG_SEND_DEFER) != 0u) {
+        send_data_flag = true;
+      } else {
+        send_data();
+      }
     }
 }
 
