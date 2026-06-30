@@ -90,6 +90,7 @@ typedef enum {
 
 typedef enum {
 	OW_CMD_PING = 0x00,
+	OW_CMD_DIAG_STATS = 0x01,  /* #70: cam_diag_stats_t snapshot, printf-independent */
 	OW_CMD_VERSION = 0x02,
 	OW_CMD_ECHO = 0x03,
 	OW_CMD_TOGGLE_LED = 0x04,

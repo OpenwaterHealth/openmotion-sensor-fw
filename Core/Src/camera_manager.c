@@ -65,9 +65,16 @@ static volatile uint32_t total_frames_failed = 0;
 static uint32_t cmp_total_uncompressed = 0;  // Sum of all uncompressed payload sizes
 static uint32_t cmp_total_compressed = 0;    // Sum of all compressed payload sizes
 static uint32_t cmp_frame_count = 0;         // Number of compressed frames sent
-static uint32_t cmp_fail_count = 0;          // Number of compression failures
+static uint32_t cmp_fail_count = 0;          // Number of compression failures (dst_max overflow)
 static uint32_t cmp_usb_fail_count = 0;      // Number of USB send failures (compressed)
 static uint32_t cmp_max_time_us = 0;         // Worst-case compression time in µs
+/* #70: rle_compress hit its hard time budget (still falls back to uncompressed,
+ * same as a dst_max overflow) — see CMP_BUDGET_HARD_US below. */
+static volatile uint32_t cmp_timeout_count = 0;
+/* #70: frames actually sent uncompressed because compression didn't finish in
+ * budget/space (cmp_timeout_count + cmp_fail_count, kept as its own counter so
+ * a query doesn't need to add two fields to know "how many frames fell back"). */
+static volatile uint32_t cmp_fallback_count = 0;
 
 #define STREAMING_TIMEOUT_MS 150
 static volatile uint32_t most_recent_frame_time = 0;
@@ -80,6 +87,22 @@ static bool streaming_first_frame = false;
 static uint8_t camera_failure_counters[CAMERA_COUNT] = {0};  // Track consecutive cycles without event bits
 /* #68 instrumentation: per-camera RX overrun counts (set in main.c error callbacks). */
 volatile uint32_t cam_overrun_count[CAMERA_COUNT] = {0};
+
+/* #70: printf-independent snapshot for OW_CMD_DIAG_STATS (if_commands.c) — see
+ * cam_diag_stats_t in camera_manager.h. Plain field copy, no critical section:
+ * these are diagnostic counters (worst case a torn read mixes adjacent scans'
+ * values briefly), same tolerance as the existing [DIAG] printf dump. */
+void camera_manager_get_diag_stats(cam_diag_stats_t *out) {
+	out->version = CAM_DIAG_STATS_VERSION;
+	out->reserved[0] = 0; out->reserved[1] = 0; out->reserved[2] = 0;
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		out->cam_overrun_count[i] = cam_overrun_count[i];
+	}
+	out->cmp_fail_count = cmp_fail_count;
+	out->cmp_timeout_count = cmp_timeout_count;
+	out->cmp_fallback_count = cmp_fallback_count;
+	out->cmp_max_time_us = cmp_max_time_us;
+}
 
  __ALIGN_BEGIN __attribute__((section(".sram4"))) volatile uint8_t spi6_buffer[SPI_PACKET_LENGTH] __ALIGN_END;
 
@@ -1429,6 +1452,15 @@ _Bool send_data(void) {
 		streaming_first_frame = true;
 		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
 		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) { cam_overrun_count[ci] = 0; }
+		/* #70: zero the compression-guard counters at scan START (not stop, like
+		 * cmp_total_uncompressed/cmp_frame_count etc below) — these are part of
+		 * cam_diag_stats_t (OW_CMD_DIAG_STATS), and a host naturally queries
+		 * diagnostics AFTER a scan finishes. Resetting at stop would zero them
+		 * before that query ever has a chance to read the scan's actual tally. */
+		cmp_fail_count = 0;
+		cmp_timeout_count = 0;
+		cmp_fallback_count = 0;
+		cmp_max_time_us = 0;
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
@@ -1506,6 +1538,12 @@ _Bool check_streaming(void){
 			       (unsigned long)cam_overrun_count[2], (unsigned long)cam_overrun_count[3],
 			       (unsigned long)cam_overrun_count[4], (unsigned long)cam_overrun_count[5],
 			       (unsigned long)cam_overrun_count[6], (unsigned long)cam_overrun_count[7]);
+			/* #70 instrumentation: compression budget-guard fallback counts this scan. */
+			if (cmp_timeout_count > 0 || cmp_fail_count > 0) {
+				printf("[DIAG] cmp fallback: timeout=%lu overflow=%lu total=%lu\r\n",
+				       (unsigned long)cmp_timeout_count, (unsigned long)cmp_fail_count,
+				       (unsigned long)cmp_fallback_count);
+			}
 			/* Print compression stats if compression was used */
 			if (cmp_frame_count > 0) {
 				uint32_t avg_ratio = (cmp_total_compressed * 100) / cmp_total_uncompressed;
@@ -1527,9 +1565,11 @@ _Bool check_streaming(void){
 			cmp_total_uncompressed = 0;
 			cmp_total_compressed = 0;
 			cmp_frame_count = 0;
-			cmp_fail_count = 0;
 			cmp_usb_fail_count = 0;
-			cmp_max_time_us = 0;
+			/* cmp_fail_count / cmp_timeout_count / cmp_fallback_count / cmp_max_time_us
+			 * are NOT reset here — see the #70 comment at their scan-START reset
+			 * in send_data(), above. They still get printed just above, before
+			 * this block runs, same as always. */
 			streaming_active = false;
 		}
 	}
@@ -1638,11 +1678,23 @@ _Bool send_histogram_data(void) {
 	return status;
 }
 
+/* #70: hard deadline for rle_compress, in microseconds. The frame period is
+ * ~25 ms (40 fps); 15 ms leaves headroom for the payload copy + USB send +
+ * per-camera re-arm that share the same budget. Above CMP_BUDGET_WARNING_US
+ * (10 ms) is just a yellow-flag printf; at CMP_BUDGET_HARD_US the compressor
+ * aborts and the caller falls back to an uncompressed frame instead of
+ * risking the next frame's SPI/USART overrun (sensor-fw#70). */
+#define CMP_BUDGET_HARD_US 15000UL  /* 15 ms */
+
 /*
  * PackBits-style byte-level RLE compressor.
  * Control byte < 0x80: literal run of (ctrl + 1) bytes follow (1–128).
  * Control byte >= 0x80: repeat run – next byte repeated (ctrl - 0x80 + 3) times (3–130).
- * Returns compressed size, or -1 if dst_max would be exceeded.
+ * Returns compressed size, -1 if dst_max would be exceeded, or -2 if
+ * deadline_cyccnt (a DWT->CYCCNT value) is reached before finishing — checked
+ * once per encoded run/literal chunk (at most ~130 bytes of overshoot, i.e.
+ * negligible next to the µs-scale budget). Both negative returns mean the
+ * caller should fall back to sending the frame uncompressed.
  *
  * NOTE: __attribute__((optimize("O3"))) forces GCC to compile this single
  * function at -O3 even when the rest of the file is built at -O0 or -Og.
@@ -1651,11 +1703,20 @@ _Bool send_histogram_data(void) {
  *   -O0 / compressible data:    ~9 ms   (barely OK for zeros/fake data)
  *   -O0 / incompressible data: ~37 ms   (EXCEEDS budget → SPI overrun!)
  *   -O3 / incompressible data: ~3–5 ms  (safe margin)
+ *   -O3 / pathological (camera brownout garbage): observed ~25 ms on hardware
+ *   (sensor-fw#70) — i.e. even -O3 doesn't bound the worst case; the deadline
+ *   check below does.
  */
 __attribute__((optimize("O3")))
-static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_max) {
+static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_max,
+                         uint32_t deadline_cyccnt) {
 	int si = 0, di = 0;
 	while (si < src_len) {
+		/* Wrap-safe "now >= deadline" check (same pattern as
+		 * camera_recovery_tick's cool-off timer elsewhere in this file). */
+		if ((int32_t)(DWT->CYCCNT - deadline_cyccnt) >= 0) {
+			return -2;
+		}
 		/* Try to find a run of identical bytes (min 3) */
 		uint8_t val = src[si];
 		int run_start = si;
@@ -1688,6 +1749,42 @@ static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_m
 		}
 	}
 	return di;
+}
+
+/* #70: ship the already-staged uncompressed payload (built in
+ * send_histogram_data_cmp before compression) as a plain TYPE_HISTO frame.
+ * Used when rle_compress can't finish in time/space, so a slow or
+ * incompressible frame is sent rather than silently dropped. Wire format is
+ * byte-identical to a normal TYPE_HISTO frame from send_histogram_data(), so
+ * the host needs no special handling — it just sees an uncompressed frame
+ * for that one interval. */
+static _Bool send_uncompressed_histo(const uint8_t *payload, int payload_len) {
+	uint32_t total_size = HISTO_HEADER_SIZE + (uint32_t)payload_len + HISTO_TRAILER_SIZE;
+	if (HISTO_JSON_BUFFER_SIZE < total_size) {
+		printf("[CMP] fallback packet too large (%lu), dropping frame\r\n",
+		       (unsigned long)total_size);
+		return false;
+	}
+
+	int offset = 0;
+	packet_buffer[offset++] = HISTO_SOF;
+	packet_buffer[offset++] = TYPE_HISTO;
+	packet_buffer[offset++] = (uint8_t)(total_size & 0xFF);
+	packet_buffer[offset++] = (uint8_t)((total_size >> 8) & 0xFF);
+	packet_buffer[offset++] = (uint8_t)((total_size >> 16) & 0xFF);
+	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
+
+	memcpy(packet_buffer + offset, payload, (size_t)payload_len);
+	offset += payload_len;
+
+	uint16_t crc = util_crc16(packet_buffer, offset - 1);
+	packet_buffer[offset++] = crc & 0xFF;
+	packet_buffer[offset++] = (crc >> 8) & 0xFF;
+	packet_buffer[offset++] = HISTO_EOF;
+
+	uint8_t tx_status = USBD_HISTO_SendData(&hUsbDeviceHS, packet_buffer, offset, 0);
+	frame_id++;
+	return tx_status == USBD_OK;
 }
 
 _Bool send_histogram_data_cmp(void) {
@@ -1757,8 +1854,9 @@ _Bool send_histogram_data_cmp(void) {
 	int dst_max = HISTO_JSON_BUFFER_SIZE - HISTO_HEADER_SIZE - HISTO_CMP_UNCMP_CRC_SIZE - HISTO_TRAILER_SIZE;
 
 	uint32_t cyc_start = DWT->CYCCNT;
+	uint32_t deadline_cyccnt = cyc_start + (SystemCoreClock / 1000000u) * CMP_BUDGET_HARD_US;
 	int cmp_len = rle_compress(uncmp_payload, p_off,
-	                           packet_buffer + HISTO_HEADER_SIZE, dst_max);
+	                           packet_buffer + HISTO_HEADER_SIZE, dst_max, deadline_cyccnt);
 	uint32_t cyc_elapsed = DWT->CYCCNT - cyc_start;
 	uint32_t elapsed_us = cyc_elapsed / (SystemCoreClock / 1000000u);
 
@@ -1767,10 +1865,23 @@ _Bool send_histogram_data_cmp(void) {
 	}
 
 	if (cmp_len < 0) {
-		cmp_fail_count++;
-		printf("[CMP] FAIL: compression overflow, %d cams, uncmp=%d, dst_max=%d, time=%luus (fail #%lu)\r\n",
-		       count, p_off, dst_max, (unsigned long)elapsed_us, (unsigned long)cmp_fail_count);
-		return false;
+		/* #70: compression couldn't finish in time (-2) or space (-1) — ship
+		 * the frame uncompressed instead of dropping it, so neither failure
+		 * mode costs data or leaves the next frame's SPI/USART re-arm late. */
+		if (cmp_len == -2) {
+			cmp_timeout_count++;
+			printf("[CMP] TIMEOUT: compression exceeded %lu us budget (ran %lu us), "
+			       "%d cams, falling back to uncompressed (#%lu)\r\n",
+			       (unsigned long)CMP_BUDGET_HARD_US, (unsigned long)elapsed_us, count,
+			       (unsigned long)cmp_timeout_count);
+		} else {
+			cmp_fail_count++;
+			printf("[CMP] OVERFLOW: compression overflow, %d cams, uncmp=%d, dst_max=%d, "
+			       "time=%luus, falling back to uncompressed (#%lu)\r\n",
+			       count, p_off, dst_max, (unsigned long)elapsed_us, (unsigned long)cmp_fail_count);
+		}
+		cmp_fallback_count++;
+		return send_uncompressed_histo(uncmp_payload, p_off);
 	}
 
 	/* Warn if compression time is eating into the frame budget.
