@@ -57,6 +57,16 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		uartResp->command = OW_CMD_NOP;
 		uartResp->packet_type = OW_RESP;
 		break;
+	case OW_CMD_DIAG_STATS: {
+		VERBOSE_CMD("[CMD] OW_CMD_DIAG_STATS\r\n");
+		uartResp->command = OW_CMD_DIAG_STATS;
+		uartResp->packet_type = OW_RESP;
+		static cam_diag_stats_t diag_stats_resp;
+		camera_manager_get_diag_stats(&diag_stats_resp);
+		uartResp->data_len = sizeof(diag_stats_resp);
+		uartResp->data = (uint8_t *)&diag_stats_resp;
+		break;
+	}
 	case OW_CMD_PING:
 		VERBOSE_CMD("[CMD] OW_CMD_PING\r\n");
 		uartResp->command = OW_CMD_PING;
