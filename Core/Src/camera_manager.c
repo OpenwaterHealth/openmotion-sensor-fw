@@ -1100,9 +1100,13 @@ _Bool configure_camera_testpattern(uint8_t cam_id, uint8_t test_pattern)
 
 static void poll_camera_temperatures(void)
 {
-    uint32_t now = get_timestamp_ms();
+    /* HAL_GetTick(), NOT get_timestamp_ms(): the TIM5-derived clock wraps at
+     * 2^32/100 ms (~11.93 h of uptime), so deadlines scheduled on it freeze
+     * this gate for hours — or forever, if scheduled within the last poll
+     * interval before the wrap (#73). */
+    uint32_t now = HAL_GetTick();
 
-    if ((next_temp_ms == 0u) || (now >= next_temp_ms))
+    if ((int32_t)(now - next_temp_ms) >= 0)
     {
         /* Schedule from current time to keep a constant cadence without catch-up bursts. */
         next_temp_ms = now + CAM_TEMP_POLL_INTERVAL_MS;
@@ -1197,7 +1201,9 @@ static void camera_death_isolate(uint8_t cam_id)
     cam->isProgrammed = false;
     cam->isConfigured = false;
     cam->streaming_enabled = false;
-    cam->recovery_repower_at = get_timestamp_ms() + CAMERA_RECOVERY_OFF_MS;
+    /* HAL_GetTick(), NOT get_timestamp_ms(): the TIM5-derived clock wraps at
+     * ~11.93 h, which stretched this 10 s cool-off into hours (#73). */
+    cam->recovery_repower_at = HAL_GetTick() + CAMERA_RECOVERY_OFF_MS;
 
     printf("Camera %d: rail off for %u ms (regulator cool-off)\r\n",
            cam_id + 1, (unsigned)CAMERA_RECOVERY_OFF_MS);
@@ -1210,7 +1216,7 @@ static void camera_death_isolate(uint8_t cam_id)
  * bring-up at the next scan. Main-loop only. */
 static void camera_recovery_tick(void)
 {
-    uint32_t now = get_timestamp_ms();
+    uint32_t now = HAL_GetTick();  /* must match camera_death_isolate's timebase */
 
     for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
         CameraDevice *cam = &cam_array[cam_id];
@@ -1361,10 +1367,12 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	HAL_GPIO_WritePin(FSIN_GPIO_Port, FSIN_Pin, GPIO_PIN_RESET);
 	delay_ms(2);
 
-	uint32_t timeout = get_timestamp_ms() + 5000; // 100ms timeout example
+	/* HAL_GetTick() + wrap-safe compare: a get_timestamp_ms() deadline set
+	 * within 5 s of its ~11.93 h wrap is unreachable → infinite loop (#73). */
+	uint32_t timeout = HAL_GetTick() + 5000;
 
 	while(!event_bits) {
-	    if (get_timestamp_ms() > timeout) {
+	    if ((int32_t)(HAL_GetTick() - timeout) >= 0) {
 	        printf("HISTO receive timeout!\r\n");
 	        if(cam->useUsart) {
 	            HAL_DMA_Abort(cam->pUart->hdmarx); // safely abort DMA
