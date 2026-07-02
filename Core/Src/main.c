@@ -2051,7 +2051,10 @@ void ExitRun0Mode(void) {
 static void wait_for_usb_queues_to_finish(void)
 {
   const uint32_t timeout_ms = 1000;  // Maximum wait time: 1 second
-  uint32_t start_time = get_timestamp_ms();
+  /* timestamp_ticks(), not get_timestamp_ms(): ms deltas of the /100 clock
+   * jump to ~4.25e9 at its non-power-of-two wrap (~11.93 h), firing this
+   * timeout spuriously (#73). Raw TIM5 tick deltas are wrap-exact. */
+  uint32_t start_ticks = timestamp_ticks();
   uint32_t elapsed = 0;
   
   printf("Waiting for USB queues to finish...\r\n");
@@ -2089,7 +2092,7 @@ static void wait_for_usb_queues_to_finish(void)
     
     // Small delay to avoid busy-waiting
     delay_ms(1);
-    elapsed = get_timestamp_ms() - start_time;
+    elapsed = timestamp_elapsed_ms(start_ticks);
   }
   
   printf("USB queue wait timeout after %lu ms (some data may not have been sent).\r\n", elapsed);

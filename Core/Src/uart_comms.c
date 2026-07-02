@@ -181,10 +181,14 @@ _Bool comms_interface_send(UartPacket *pResp) {
 	}
 
 	// Wait for the transmit complete flag with a timeout to avoid infinite loop.
-	uint32_t start_time = get_timestamp_ms();
+	/* Raw TIM5 ticks, not get_timestamp_ms(): the /100 ms-delta jumps to
+	 * ~4.25e9 at its non-power-of-two wrap (~11.93 h), spuriously "timing out"
+	 * an in-flight transmit — forcing tx_flag idle and flagging a TX failure
+	 * on a healthy endpoint (#73). Tick deltas are wrap-exact. */
+	uint32_t start_ticks = timestamp_ticks();
 
 	while (!tx_flag) {
-		if ((get_timestamp_ms() - start_time) >= TX_TIMEOUT) {
+		if (timestamp_elapsed_ms(start_ticks) >= TX_TIMEOUT) {
 			// Timeout handling: Log error and break out or reset the flag.
 			// printf before releasing send_in_progress so the message only
 			// buffers instead of re-entering this function.

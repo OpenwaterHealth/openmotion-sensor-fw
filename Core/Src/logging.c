@@ -129,14 +129,18 @@ static bool logging_uart_dma_write(const uint8_t *src, size_t count) {
 	}
 
 	size_t remaining = count;
-	uint32_t start_time = get_timestamp_ms();
+	/* Raw TIM5 ticks, not get_timestamp_ms(): the /100 ms value's ms-delta is
+	 * wrong at its non-power-of-two wrap (~11.93 h) — spurious instant timeout
+	 * and a bogus drop marker (#73). Tick deltas are wrap-exact, and TIM5 keeps
+	 * counting even when this runs from ISR context with the tick masked. */
+	uint32_t start_ticks = timestamp_ticks();
 	const uint32_t timeout_ms = 10u;
 
 	while (remaining > 0) {
 		size_t free_bytes = lwrb_get_free(&usart_tx_buff);
 		if (free_bytes == 0) {
 			usart_start_tx_dma_transfer();
-			if ((get_timestamp_ms() - start_time) >= timeout_ms) {
+			if (timestamp_elapsed_ms(start_ticks) >= timeout_ms) {
 				usart_drop_marker_pending = true;
 				break;
 			}

@@ -362,8 +362,10 @@ static uint8_t USBD_Histo_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
   return ret;
 }
 
-/* Last timestamp when a histogram packet was actually sent (for DEBUG_FLAG_HISTO_THROTTLE) */
-static uint32_t histo_last_send_ms = 0;
+/* Raw TIM5 ticks (timestamp_ticks()) of the last histogram packet actually
+ * sent (for DEBUG_FLAG_HISTO_THROTTLE). Tick deltas are wrap-exact; ms deltas
+ * of get_timestamp_ms() misbehave at its non-power-of-two wrap (#73). */
+static uint32_t histo_last_send_ticks = 0;
 
 uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t len, uint8_t ep_idx)
 {
@@ -392,12 +394,12 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
 
   /* Debug flag: only send histogram packet every 5 seconds; others pretend success */
   if ((logging_get_debug_flags() & DEBUG_FLAG_HISTO_THROTTLE) != 0u) {
-    uint32_t now_ms = get_timestamp_ms();
-    uint32_t elapsed = (histo_last_send_ms != 0u) ? (now_ms - histo_last_send_ms) : HISTO_THROTTLE_INTERVAL_MS;
+    uint32_t now_ticks = timestamp_ticks();
+    uint32_t elapsed = (histo_last_send_ticks != 0u) ? ((now_ticks - histo_last_send_ticks) / 100u) : HISTO_THROTTLE_INTERVAL_MS;
     if (elapsed < HISTO_THROTTLE_INTERVAL_MS) {
       return USBD_OK;  /* Pretend sent, do not enqueue or transmit */
     }
-    histo_last_send_ms = now_ms;
+    histo_last_send_ticks = now_ticks;
   }
 
   /* Ensure pdev is stored (in case called before Init, though this shouldn't happen) */

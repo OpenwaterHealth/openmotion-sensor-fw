@@ -116,6 +116,26 @@ uint32_t get_timestamp_ms(void)
     // printf("Timestamp: %d\r\n", timestamp);
     return timestamp;
 }
+
+/* Raw TIM5 counter (100 kHz, 10 us/tick). Wraps at exactly 2^32 ticks, so
+ * unsigned tick deltas (now - start) are wrap-exact — unlike ms deltas of
+ * get_timestamp_ms(), whose 2^32/100 wrap point is NOT a power of two,
+ * making (now_ms - start_ms) jump to ~4.25e9 once per ~11.93 h (#73).
+ * TIM5 is a free-running hardware counter: unlike HAL_GetTick()'s uwTick it
+ * keeps advancing in ISR context / with the tick interrupt masked, so these
+ * are the right primitives for busy-wait timeouts that may run there. */
+uint32_t timestamp_ticks(void)
+{
+    return TIM5->CNT;
+}
+
+/* Wrap-exact milliseconds elapsed since a timestamp_ticks() reading.
+ * Valid for intervals < 2^32 ticks (~11.93 h). */
+uint32_t timestamp_elapsed_ms(uint32_t start_ticks)
+{
+    return (uint32_t)(TIM5->CNT - start_ticks) / 100u;
+}
+
 void GPIO_SetHiZ(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};

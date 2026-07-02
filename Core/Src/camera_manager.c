@@ -77,8 +77,14 @@ static volatile uint32_t cmp_timeout_count = 0;
 static volatile uint32_t cmp_fallback_count = 0;
 
 #define STREAMING_TIMEOUT_MS 150
-static volatile uint32_t most_recent_frame_time = 0;
-static volatile uint32_t streaming_start_time = 0;
+/* Raw TIM5 ticks (100 kHz, via timestamp_ticks()), NOT get_timestamp_ms():
+ * ms deltas of the /100 clock are wrong at its non-power-of-two wrap
+ * (~11.93 h). A scan ending within STREAMING_TIMEOUT_MS of the wrap would
+ * park check_streaming()'s stall detection (current < most_recent) for
+ * hours, leaving streaming_active stuck with no terminal flush (#73).
+ * Raw tick deltas wrap at exactly 2^32 and stay exact. */
+static volatile uint32_t most_recent_frame_ticks = 0;
+static volatile uint32_t streaming_start_ticks = 0;
 static bool streaming_active = false;
 static bool streaming_first_frame = false;
 
@@ -1455,7 +1461,7 @@ _Bool send_data(void) {
 	// Take care of statistics
 	if(!streaming_active && event_bits_enabled != 0x00){
 		printf("Scan started\r\n");
-		streaming_start_time = get_timestamp_ms();
+		streaming_start_ticks = timestamp_ticks();
 		streaming_active = true;
 		streaming_first_frame = true;
 		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
@@ -1472,7 +1478,7 @@ _Bool send_data(void) {
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
-	if(get_timestamp_ms() - most_recent_frame_time < 15 ){
+	if(timestamp_elapsed_ms(most_recent_frame_ticks) < 15 ){
 		/* Rate-limit this warning: on boards with FSIN ringing it fires on
 		 * EVERY frame (40 Hz), and the printf flood over UART/USB has been
 		 * an amplifier in several USB-death cascades. Keep the signal,
@@ -1486,8 +1492,8 @@ _Bool send_data(void) {
 		return true;
 	}
 
-	most_recent_frame_time = get_timestamp_ms();
-	// printf("%lu\r\n", most_recent_frame_time);
+	most_recent_frame_ticks = timestamp_ticks();
+	// printf("%lu\r\n", most_recent_frame_ticks);
 	
 	// Check for camera failures before clearing event_bits
 	check_camera_failures();
@@ -1515,16 +1521,19 @@ _Bool send_data(void) {
 
 _Bool check_streaming(void){
 	if(streaming_active){
-		uint32_t current_time = get_timestamp_ms();
-		uint32_t most_recent_frame_time_local = most_recent_frame_time;
+		uint32_t current_ticks = timestamp_ticks();
+		uint32_t most_recent_frame_ticks_local = most_recent_frame_ticks;
 
-		if(current_time<most_recent_frame_time_local){
+		/* Signed tick delta: wrap-exact across TIM5's 2^32 rollover (real frame
+		 * ages here are ≤ seconds, far below the 2^31-tick ≈ 5.96 h limit). */
+		int32_t frame_age_ticks = (int32_t)(current_ticks - most_recent_frame_ticks_local);
+		if(frame_age_ticks < 0){
 			if(verbose_on) { printf("Current time is less than most recent frame time, passing.\r\n"); }
-			// This is an edge case that seems to happen due to this function being interrupted by the interrupt that sets most_recent_frame_time.
+			// This is an edge case that seems to happen due to this function being interrupted by the interrupt that sets most_recent_frame_ticks.
 			return streaming_active;
 		}
-		if((current_time - most_recent_frame_time_local) > STREAMING_TIMEOUT_MS){
-			uint32_t elapsed = current_time - streaming_start_time;
+		if(((uint32_t)frame_age_ticks / 100u) > STREAMING_TIMEOUT_MS){
+			uint32_t elapsed = timestamp_elapsed_ms(streaming_start_ticks);
 			/* #68: this terminal flush is NOT driven by a fresh FSIN, so the
 			 * ISR-captured fsin_timestamp_ms would be stale (the previous frame's
 			 * time) here. Stamp it now so the terminal frame carries a current
