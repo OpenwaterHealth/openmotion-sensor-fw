@@ -46,7 +46,7 @@ typedef struct {
 	 * thermal shutdown etc.); cleared when program_fpga() completes a real
 	 * bring-up or the host explicitly powers the camera off. */
 	bool		needs_recovery;
-	uint32_t	recovery_repower_at;	/* get_timestamp_ms() deadline to re-power the rail */
+	uint32_t	recovery_repower_at;	/* HAL_GetTick() deadline to re-power the rail */
 } CameraDevice;
 
 #define CAMERA_COUNT	8
