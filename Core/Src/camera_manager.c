@@ -82,6 +82,19 @@ static volatile uint32_t streaming_start_time = 0;
 static bool streaming_active = false;
 static bool streaming_first_frame = false;
 
+/* #75: DEBUG_FLAG_HISTO_STALL — deterministic host-visible stall repro for the
+ * bloodflow app's E-303 all-cameras-stalled watchdog (app#248/app#174/PR #294).
+ * When the flag is set, streaming runs normally for HISTO_STALL_TRIGGER_FRAMES
+ * frames, then send_data() silently stops emitting histogram USB frames while
+ * everything else stays healthy: cameras keep streaming, event bits keep being
+ * consumed, SPI receptions keep re-arming (so check_camera_failures() never
+ * trips and no rail-off recovery fires), temp polling and command handling
+ * continue, USB stays enumerated. This simulates the HOST-visible signature of
+ * the #68 FSIN-ISR starvation fault on demand. State resets at scan start. */
+#define HISTO_STALL_TRIGGER_FRAMES 1800u  /* ~45 s at 40 fps */
+static uint32_t histo_stall_frame_count = 0;
+static bool histo_stall_tripped = false;
+
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
 static uint8_t camera_failure_counters[CAMERA_COUNT] = {0};  // Track consecutive cycles without event bits
@@ -1450,6 +1463,26 @@ static void check_camera_failures(void) {
 	}
 }
 
+/* #75: consume this frame's camera data WITHOUT sending it to the host.
+ * Mirrors the event-bit consume + per-camera re-arm that send_histogram_data()
+ * would have done (same masking rationale — see the comment there), so the
+ * cameras/SPI pipeline keeps flowing and check_camera_failures() stays happy;
+ * only the USB HISTO frame is withheld. Short-circuits BEFORE compression, so
+ * the #70 cmp budget guard never runs on a suppressed frame. */
+static _Bool histo_stall_suppress_frame(void) {
+	uint8_t ready_bits;
+	__disable_irq();
+	ready_bits = event_bits & event_bits_enabled;
+	event_bits = 0x00;
+	__enable_irq();
+	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
+		if ((ready_bits & (1u << cam_id)) != 0) {
+			start_data_reception(cam_id);
+		}
+	}
+	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
+}
+
 _Bool send_data(void) {
 
 	// Take care of statistics
@@ -1469,6 +1502,14 @@ _Bool send_data(void) {
 		cmp_timeout_count = 0;
 		cmp_fallback_count = 0;
 		cmp_max_time_us = 0;
+		/* #75: re-arm the histo-stall repro each scan (stall persists until scan
+		 * stop; the next scan streams normally again until the trigger point). */
+		histo_stall_frame_count = 0;
+		histo_stall_tripped = false;
+		if ((logging_get_debug_flags() & DEBUG_FLAG_HISTO_STALL) != 0u) {
+			printf("DEBUG: histo stall armed, trips at frame %lu\r\n",
+			       (unsigned long)HISTO_STALL_TRIGGER_FRAMES);
+		}
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
@@ -1494,7 +1535,25 @@ _Bool send_data(void) {
 	
 	bool success = false;
 	uint32_t dflags = logging_get_debug_flags();
-	if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
+	 * suppress the send entirely (all modes: fake, compressed, plain). This
+	 * runs at the common send entry, so it behaves identically whether
+	 * send_data() was called from the FSIN ISR or deferred to the main loop
+	 * by DEBUG_FLAG_SEND_DEFER (#68). Unreachable with the flag clear. */
+	bool histo_stall_this_frame = false;
+	if ((dflags & DEBUG_FLAG_HISTO_STALL) != 0u) {
+		histo_stall_frame_count++;
+		histo_stall_this_frame =
+			(histo_stall_frame_count > HISTO_STALL_TRIGGER_FRAMES);
+		if (histo_stall_this_frame && !histo_stall_tripped) {
+			histo_stall_tripped = true;
+			printf("DEBUG: histo stall tripped at frame %lu\r\n",
+			       (unsigned long)histo_stall_frame_count);
+		}
+	}
+	if (histo_stall_this_frame) {
+		success = histo_stall_suppress_frame();
+	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
 		success = send_fake_data();
 	} else if ((dflags & DEBUG_FLAG_HISTO_CMP) != 0u) {
 		success = send_histogram_data_cmp();
