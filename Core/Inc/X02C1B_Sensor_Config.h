@@ -726,18 +726,18 @@ static struct regval_list X02C1B_SENSOR_CONFIG[] = {
 		{0x380f, 0xD0},
 		{0x386d, 0x09},
 		{0x386e, 0x04},
-		/* Exposure 70 rows = 630 us. The measured optical laser pulse is
-		 * 494 us regardless of the console gate width (fully captured at
-		 * >= 528 us of exposure; knee measured per-camera on both modules,
-		 * plus delay sweeps at 500 us and 600 us gates, 2026-07-02 drift
-		 * campaign). The previous 122 rows (1098 us) integrated ~570 us of
-		 * pure dark current past the pulse, doubling the gain-scaled
-		 * black-level drift for zero extra signal. 70 rows keeps ~136 us of
-		 * total timing slack (vs 64 us at the 62-row alternative) while
-		 * still cutting the dark-current integral 1.74x. LaserPulseDelayUsec
-		 * stays 100 (measured plateau center). */
+		/* Exposure 72 rows = 648 us (bench decision: ~650 us). The measured
+		 * optical laser pulse is 494 us regardless of the console gate width
+		 * (per-camera exposure staircase + delay sweeps at 500 us and 600 us
+		 * gates, 2026-07-02 drift campaign; capture knee at 528 us,
+		 * LaserPulseDelayUsec=100 = measured plateau center). The previous
+		 * 122 rows (1098 us) integrated ~570 us of pure dark current past
+		 * the pulse, doubling the gain-scaled black-level drift that shows
+		 * up as camera-to-camera image-mean divergence, for zero extra
+		 * signal. 72 rows keeps ~154 us of timing slack and cuts the
+		 * dark-current integral 1.7x. */
 		{0x3501, 0x00},
-		{0x3502, 0x46},
+		{0x3502, 0x48},
 		{0x3823, 0x20},
 		{0x382e, 0x03},
 		{0x3861, 0x00},
