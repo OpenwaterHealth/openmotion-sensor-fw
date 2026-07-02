@@ -726,8 +726,15 @@ static struct regval_list X02C1B_SENSOR_CONFIG[] = {
 		{0x380f, 0xD0},
 		{0x386d, 0x09},
 		{0x386e, 0x04},
+		/* Exposure 62 rows = 558 us. The measured optical laser pulse is
+		 * 494 us (fully captured at >= 528 us of exposure; knee measured
+		 * per-camera on both modules, 2026-07-02 drift campaign). The
+		 * previous 122 rows (1098 us) integrated ~570 us of pure dark
+		 * current past the pulse, doubling the gain-scaled black-level
+		 * drift for zero extra signal. 62 rows keeps ~30 us of margin at
+		 * both pulse edges with no laser timing change. */
 		{0x3501, 0x00},
-		{0x3502, 0x7a},
+		{0x3502, 0x3e},
 		{0x3823, 0x20},
 		{0x382e, 0x03},
 		{0x3861, 0x00},
@@ -738,6 +745,12 @@ static struct regval_list X02C1B_SENSOR_CONFIG[] = {
 		{0x3883, 0xd0},
 		{0x3880, 0x05},
 		{0x4800, 0x14},
+		/* Always leave test-pattern mode: 0x5100 was previously absent
+		 * from this table, and OW_CAMERA_SET_CONFIG skips cameras it
+		 * considers already configured — so a camera left in test-pattern
+		 * mode by tooling kept streaming synthetic data through later
+		 * scans while looking healthy. */
+		{0x5100, 0x00},
 };
 
 #endif /* INC_X02C1B_SENSOR_CONFIG_H_ */
