@@ -103,7 +103,13 @@ void delay_us(uint32_t us)
     while ((DWT->CYCCNT - start) < delay_cycles) { }
 }
 
-// get timestamp ms will grab the current timestamp in milliseconds as counted by tim5
+/* Frame/scan timestamp in ms, counted by free-running TIM5 (100 kHz).
+ * WARNING: wraps at 2^32/100 ms ≈ 11.93 h of uptime — NOT at 2^32 ms — so:
+ * (a) never schedule deadlines on this clock; use HAL_GetTick() instead (#73);
+ * (b) the host SDK unwraps histogram-frame timestamps assuming exactly this
+ *     period (MotionProcessing._TIMESTAMP_ROLLOVER_S = 2^32/100/1000 s) —
+ *     changing this timebase breaks host-side unwrapping unless the SDK
+ *     constant changes in lockstep. */
 uint32_t get_timestamp_ms(void)
 {
     uint32_t timestamp = TIM5->CNT/100;
