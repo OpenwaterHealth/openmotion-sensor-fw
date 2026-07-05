@@ -35,6 +35,16 @@ static uint8_t  next_cam_idx = 0;
  * is naturally serialized with every other hi2c1 user. */
 static volatile bool    cam_temp_poll_due = false;     /* set by send_data() */
 static volatile uint8_t cam_recovery_pending = 0;   /* set by check_camera_failures() (frame ISR); serviced by camera_i2c_service() */
+/* #68 restream recovery: the laser transient at 60 Hz can upset the
+ * camera/MIPI link itself (which also freezes the FPGA - its clocks derive
+ * from the camera MIPI clock, so no FPGA-side self-heal is possible). The
+ * cheap fix is an I2C stream-cycle of the camera, which restarts MIPI and
+ * lets the FPGA (NVCM or SRAM image) resume pushes. Tried up to
+ * CAM_RESTREAM_MAX_ATTEMPTS times per scan before falling back to the
+ * heavy rail-off death path. Serviced by camera_i2c_service (owns hi2c1). */
+#define CAM_RESTREAM_MAX_ATTEMPTS 3
+static volatile uint8_t cam_restream_pending = 0;
+static volatile uint8_t cam_restream_attempts[CAMERA_COUNT] = {0};
 /* #78: cameras whose reception aborted on an RX error, awaiting a
  * frame-boundary re-arm (camera_service_resync at send_data entry). */
 static volatile uint8_t cam_resync_bits = 0;
@@ -526,6 +536,7 @@ _Bool camera_set_capture_rate(uint8_t rate_hz)
 	 * to ~100 us via r_init_man/0x3823[4] runtime writes was attempted
 	 * and did NOT take effect (band unmoved; needs config-time writes
 	 * or different enable semantics) — follow-up on #68. */
+
 	_Bool ok = true;
 	for (int i = 0; i < CAMERA_COUNT; i++) {
 		CameraDevice *cam = &cam_array[i];
@@ -1346,6 +1357,32 @@ void camera_i2c_service(void)
         }
     }
 
+    /* #68: stream-cycle cameras flagged for restream recovery. */
+    if (cam_restream_pending != 0u) {
+        __disable_irq();
+        uint8_t restream = cam_restream_pending;
+        cam_restream_pending = 0u;
+        __enable_irq();
+        for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+            if ((restream & (1u << cam_id)) == 0u) {
+                continue;
+            }
+            CameraDevice *cam = &cam_array[cam_id];
+            if (TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
+                printf("restream: mux select failed Camera %d\r\n", cam_id + 1);
+                continue;
+            }
+            abort_data_reception(cam_id);
+            X02C1B_stream_off(cam);
+            delay_ms(2);
+            X02C1B_stream_on(cam);
+            /* Fresh reception at the next frame boundary (with the SPI
+             * FIFO flush the resync path does). */
+            camera_request_resync(cam_id);
+            printf("Camera %d: restream cycle done\r\n", cam_id + 1);
+        }
+    }
+
     if (cam_temp_poll_due) {
         cam_temp_poll_due = false;
         poll_camera_temperatures();
@@ -1516,6 +1553,19 @@ static void check_camera_failures(void) {
 
 				// Check if threshold reached
 				if (camera_failure_counters[cam_id] >= CAMERA_FAILURE_THRESHOLD_CYCLES) {
+					/* #68: before declaring death, try an I2C stream-cycle -
+					 * a laser-transient-upset camera resumes MIPI (and its
+					 * FPGA resumes pushes) after a restart, where the old
+					 * path parked it for the whole scan. */
+					if (cam_restream_attempts[cam_id] < CAM_RESTREAM_MAX_ATTEMPTS) {
+						cam_restream_attempts[cam_id]++;
+						cam_restream_pending |= (uint8_t)(1u << cam_id);
+						camera_failure_counters[cam_id] = 0;
+						cam_resync_grace[cam_id] = CAM_RESYNC_GRACE_FRAMES;
+						printf("Camera %d: restream recovery attempt %u\r\n",
+						       cam_id + 1, cam_restream_attempts[cam_id]);
+						continue;
+					}
 					// Only act once per failure (when threshold is exactly reached)
 					if (camera_failure_counters[cam_id] == CAMERA_FAILURE_THRESHOLD_CYCLES) {
 						/* Mark dead via needs_recovery — NOT isPresent, which keeps
@@ -1584,6 +1634,7 @@ _Bool send_data(void) {
 		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
 		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) {
 			cam_overrun_count[ci] = 0;
+			cam_restream_attempts[ci] = 0;
 			cam_rx_count[ci] = 0;
 			cam_rx_phase_ms[ci] = 0;
 			cam_err_phase_ms[ci] = 0;
