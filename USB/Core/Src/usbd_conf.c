@@ -400,7 +400,12 @@ USBD_StatusTypeDef USBD_LL_Init(USBD_HandleTypeDef *pdev)
   hpcd_USB_OTG_HS.Instance = USB_OTG_HS;
   hpcd_USB_OTG_HS.Init.dev_endpoints = 9;
   hpcd_USB_OTG_HS.Init.speed = PCD_SPEED_HIGH;
-  hpcd_USB_OTG_HS.Init.dma_enable = DISABLE;
+  /* #68: OTG internal DMA — the core fetches TX data from the (already
+   * 4-byte-aligned, D2-placed) class buffers itself instead of the CPU
+   * writing every packet into the FIFO at IRQ prio 0. Those CPU FIFO
+   * writes are the prime suspect for the bus contention that overruns
+   * the SPI camera links at 60 Hz x 16 cameras. */
+  hpcd_USB_OTG_HS.Init.dma_enable = ENABLE;
   hpcd_USB_OTG_HS.Init.phy_itface = USB_OTG_ULPI_PHY;
   /* Sof_enable kept ON so the EFT/lock-up watchdog in usb_device.c gets a
    * heartbeat from the host. NOTE: CubeMX defaults this to DISABLE - if the
