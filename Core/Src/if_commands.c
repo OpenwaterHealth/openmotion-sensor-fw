@@ -880,7 +880,12 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		if(cmd.reserved == 0){
 			result = X02C1B_fsin_off();
 		} else {
-			result = X02C1B_fsin_on();
+			/* #78: reserved carries the rate — 1 = legacy enable at 40 Hz,
+			 * 40/60 = enable at that rate. Anything else is an error. */
+			result = X02C1B_fsin_set_rate(cmd.reserved == 1 ? 40 : cmd.reserved);
+			if(result == 0){
+				result = X02C1B_fsin_on();
+			}
 		}
 
 		if(result != 0){

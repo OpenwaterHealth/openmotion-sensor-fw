@@ -1513,15 +1513,18 @@ _Bool send_data(void) {
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
-	if(get_timestamp_ms() - most_recent_frame_time < 15 ){
+	/* #78: window must stay well under the shortest supported frame period —
+	 * 16.7 ms at 60 Hz — or jitter on real frames gets swallowed. 10 ms is
+	 * still 2.5x the observed ~4 ms ringing. */
+	if(get_timestamp_ms() - most_recent_frame_time < 10 ){
 		/* Rate-limit this warning: on boards with FSIN ringing it fires on
-		 * EVERY frame (40 Hz), and the printf flood over UART/USB has been
+		 * EVERY frame, and the printf flood over UART/USB has been
 		 * an amplifier in several USB-death cascades. Keep the signal,
 		 * drop the volume. */
 		static uint32_t debounce_count = 0;
 		debounce_count++;
 		if ((debounce_count & 0xFF) == 1) {
-			printf("Frame sync debounce (<15ms): %lu events so far, passing.\r\n",
+			printf("Frame sync debounce (<10ms): %lu events so far, passing.\r\n",
 			       (unsigned long)debounce_count);
 		}
 		return true;
@@ -1745,13 +1748,16 @@ _Bool send_histogram_data(void) {
 	return status;
 }
 
-/* #70: hard deadline for rle_compress, in microseconds. The frame period is
- * ~25 ms (40 fps); 15 ms leaves headroom for the payload copy + USB send +
- * per-camera re-arm that share the same budget. Above CMP_BUDGET_WARNING_US
- * (10 ms) is just a yellow-flag printf; at CMP_BUDGET_HARD_US the compressor
+/* #70: hard deadline for rle_compress, in microseconds. Sized for the
+ * shortest supported frame period — 16.7 ms at 60 Hz (25 ms at 40 Hz) —
+ * leaving headroom for the payload copy + USB send + per-camera re-arm that
+ * share the same budget (sensor-fw#78). Above CMP_BUDGET_WARNING_US (7 ms)
+ * is just a yellow-flag printf; at CMP_BUDGET_HARD_US the compressor
  * aborts and the caller falls back to an uncompressed frame instead of
- * risking the next frame's SPI/USART overrun (sensor-fw#70). */
-#define CMP_BUDGET_HARD_US 15000UL  /* 15 ms */
+ * risking the next frame's SPI/USART overrun (sensor-fw#70). Normal data
+ * compresses in ~3-5 ms at -O3, so the tighter deadline only bites on
+ * pathological frames that were falling back at 15 ms anyway. */
+#define CMP_BUDGET_HARD_US 11000UL  /* 11 ms */
 
 /*
  * PackBits-style byte-level RLE compressor.
@@ -1952,11 +1958,12 @@ _Bool send_histogram_data_cmp(void) {
 	}
 
 	/* Warn if compression time is eating into the frame budget.
-	 * Frame period is ~25 ms (40 fps).  Anything above 10 ms is a yellow
-	 * flag worth watching; above ~20 ms risks SPI overrun on the next frame. */
-#define CMP_BUDGET_WARNING_US  10000UL  /* 10 ms */
+	 * Frame period is 16.7 ms at 60 Hz / 25 ms at 40 Hz.  Anything above
+	 * 7 ms is a yellow flag worth watching; near the period it risks SPI
+	 * overrun on the next frame. */
+#define CMP_BUDGET_WARNING_US  7000UL  /* 7 ms */
 	if (elapsed_us > CMP_BUDGET_WARNING_US) {
-		printf("[CMP] WARN: compression took %lu us (>10 ms warning threshold), %d cams, "
+		printf("[CMP] WARN: compression took %lu us (>7 ms warning threshold), %d cams, "
 		       "%d->%d bytes (ratio %d%%)\r\n",
 		       (unsigned long)elapsed_us, count, p_off, cmp_len,
 		       (p_off > 0) ? (cmp_len * 100 / p_off) : 0);
