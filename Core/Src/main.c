@@ -1844,6 +1844,7 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
    * reception aligns with the next frame instead of a random byte offset. */
   if (cam_id >= 0)
   {
+    camera_diag_note_error((uint8_t)cam_id);
     abort_data_reception((uint8_t)cam_id);
     camera_request_resync((uint8_t)cam_id);
     return;
@@ -1955,6 +1956,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
    * stream permanently misaligned (garbage completions → false death). */
   if (cam_id >= 0)
   {
+    camera_diag_note_error((uint8_t)cam_id);
     abort_data_reception((uint8_t)cam_id);
     camera_request_resync((uint8_t)cam_id);
     return;

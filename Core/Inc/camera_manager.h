@@ -83,6 +83,7 @@ _Bool camera_set_capture_rate(uint8_t rate_hz);
 void camera_rx_complete(uint8_t cam_id);
 const uint8_t *camera_staged_histo(uint8_t cam_id);
 void camera_request_resync(uint8_t cam_id);
+void camera_diag_note_error(uint8_t cam_id);
 void camera_service_resync(void);
 
 _Bool reset_camera(uint8_t cam_id);
