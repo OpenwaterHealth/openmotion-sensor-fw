@@ -472,6 +472,47 @@ CameraDevice* get_camera_byID(int id) {
 	return &cam_array[id];
 }
 
+/* #78/#80: per-rate OV2312 frame timing. The deployed sensor config is a
+ * native-40 fps mode: VTS 0x0AD0 (2768 rows x ~9.03 us = 25.0 ms frame,
+ * >half vertical blanking). The FSIN slave rule (datasheet p.42) requires
+ * 0 < FSIN period - frame period < half a row, so a faster trigger needs a
+ * matching VTS: 60 Hz -> 0x0735 (1845 rows = 16.664 ms vs the 16.667 ms
+ * period). Bench-validated 2026-07-05 (issue #80). NOTE: shrinking the
+ * blanking moves the exposed-row band relative to FSIN — the console's
+ * LaserPulseDelayUsec must move with it (100 us at 40 Hz -> 8436 us at
+ * 60 Hz; owned by the SDK trigger overrides, sdk#129). */
+_Bool camera_set_capture_rate(uint8_t rate_hz)
+{
+	uint16_t vts;
+	switch (rate_hz) {
+	case 40: vts = 0x0AD0; break;
+	case 60: vts = 0x0735; break;
+	default: return false;
+	}
+	_Bool ok = true;
+	for (int i = 0; i < CAMERA_COUNT; i++) {
+		CameraDevice *cam = &cam_array[i];
+		if (!cam->isPowered || !cam->isConfigured) {
+			continue;
+		}
+		if (TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
+			printf("set_capture_rate: failed to select Camera %d channel\r\n", i+1);
+			ok = false;
+			continue;
+		}
+		if (X02C1B_write_reg(cam, 0x380E, (uint8_t)(vts >> 8)) != 0 ||
+		    X02C1B_write_reg(cam, 0x380F, (uint8_t)(vts & 0xFF)) != 0) {
+			printf("set_capture_rate: VTS write failed Camera %d\r\n", i+1);
+			ok = false;
+		}
+	}
+	if (ok) {
+		printf("Capture rate %u Hz: VTS 0x%04X applied to configured cameras\r\n",
+		       rate_hz, vts);
+	}
+	return ok;
+}
+
 uint8_t get_cameras_present(void) {
 	uint8_t mask = 0;
 	for (int i = 0; i < CAMERA_COUNT; ++i) {

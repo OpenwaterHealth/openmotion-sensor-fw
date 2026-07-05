@@ -203,6 +203,14 @@ int X02C1B_detect(CameraDevice *cam)
     return 0;
 }
 
+/* #78/#80: public single-register write (camera_manager's per-rate VTS
+ * writer iterates cameras and owns the mux selection; the raw writer here
+ * is static). */
+int X02C1B_write_reg(CameraDevice *cam, uint16_t reg, uint8_t val)
+{
+    return X02C1B_write(cam->pI2c, reg, val);
+}
+
 /* #78: internal FSIN rate select. TIM4 runs at 240 MHz / (PSC 1000 + 1) ≈
  * 239.76 kHz, so ARR 5999 ≈ 40 Hz and ARR 3999 ≈ 60 Hz (CCR2 keeps the 50%
  * duty the camera FSIN input expects). ARR preload is disabled, so writes

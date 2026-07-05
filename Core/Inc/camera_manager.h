@@ -79,6 +79,7 @@ void init_camera_sensors(void);
 CameraDevice* get_active_cam(void);
 CameraDevice* set_active_camera(int id);
 CameraDevice* get_camera_byID(int id);
+_Bool camera_set_capture_rate(uint8_t rate_hz);
 
 _Bool reset_camera(uint8_t cam_id);
 _Bool reset_camera_usart(uint8_t cam_id);

@@ -43,6 +43,7 @@ int X02C1B_detect(CameraDevice *cam);
 int X02C1B_fsin_on(void);
 int X02C1B_fsin_off(void);
 int X02C1B_fsin_set_rate(uint8_t rate_hz);
+int X02C1B_write_reg(CameraDevice *cam, uint16_t reg, uint8_t val);
 float X02C1B_read_temp(CameraDevice *cam);
 int X02C1B_FSIN_EXT_enable(void);
 int X02C1B_FSIN_EXT_disable(void);
