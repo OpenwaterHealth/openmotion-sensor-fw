@@ -156,8 +156,8 @@ static uint8_t USBD_Histo_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
     pdev->ep_in[HISTOInEpAdd & 0xFU].bInterval = 0;
     pdev->ep_in[HISTOInEpAdd & 0xFU].is_used = 1U;
 
-	/* Send ZLP */
-	ret = USBD_LL_Transmit (pdev, HISTOInEpAdd, NULL, 0U);
+	/* #68: init-time ZLP removed — no protocol purpose, and a NULL-address
+	 * transmit wedges the IN EP in OTG DMA mode (see usbd_comms.c). */
 
     return ret;
 }

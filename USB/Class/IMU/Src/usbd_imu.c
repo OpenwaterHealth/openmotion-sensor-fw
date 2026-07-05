@@ -215,7 +215,8 @@ static uint8_t USBD_IMU_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   pdev->ep_in[IMUInEpAdd & 0xFU].bInterval = 0;
   pdev->ep_in[IMUInEpAdd & 0xFU].is_used = 1U;
 
-  USBD_LL_Transmit(pdev, IMUInEpAdd, NULL, 0U);
+  /* #68: init-time ZLP removed — no protocol purpose, and a NULL-address
+   * transmit wedges the IN EP in OTG DMA mode (see usbd_comms.c). */
 
   return (uint8_t)USBD_OK;
 }

@@ -116,6 +116,11 @@ static uint8_t read_to_idle_enabled = 0;
 USB_RAM_D2 __ALIGN_BEGIN static uint8_t comms_tx_buffer[USB_COMMS_MAX_SIZE] __ALIGN_END;
 USB_RAM_D2 __ALIGN_BEGIN static uint8_t comms_queue_buffers[COMMS_QUEUE_SIZE][USB_COMMS_MAX_SIZE] __ALIGN_END;
 USB_RAM_D2 __ALIGN_BEGIN static uint8_t rx_buffers[USB_RX_BUFFER_COUNT][USB_COMMS_MAX_SIZE] __ALIGN_END;
+/* #68 (OTG DMA mode): reception always lands in this aligned staging
+ * packet — the assembly offset &rx_buffers[i][rxIndex] is arbitrary
+ * (commands advance it by their actual length), and the OTG core's DMA
+ * requires 4-byte-aligned target addresses. DataOut memcpy-appends. */
+USB_RAM_D2 __ALIGN_BEGIN static uint8_t comms_rx_packet[COMMS_HS_MAX_PACKET_SIZE] __ALIGN_END;
 static uint8_t current_rx_buf_index = 0;
 
 /* Private functions */
@@ -163,12 +168,13 @@ static uint8_t USBD_Comms_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 
     memset((uint32_t*)rx_buffers, 0, (USB_COMMS_MAX_SIZE * USB_RX_BUFFER_COUNT)/4);
     current_rx_buf_index = 0;
-    uint8_t *next_buffer = rx_buffers[current_rx_buf_index];
     rxIndex = 0;
-    (void)USBD_LL_PrepareReceive(pdev, COMMSOutEpAdd, next_buffer, packet_size);
+    (void)USBD_LL_PrepareReceive(pdev, COMMSOutEpAdd, comms_rx_packet, packet_size);
 
-    /* Send ZLP */
-    (void)USBD_LL_Transmit(pdev, COMMSInEpAdd, NULL, 0U);
+    /* #68: the init-time ZLP (USBD_LL_Transmit NULL/0) was removed — it
+     * serves no protocol purpose on a fresh bulk IN EP, and in OTG DMA
+     * mode a NULL-address transmit wedges the endpoint, blocking every
+     * subsequent response behind it. */
 
     return (uint8_t)USBD_OK;
 }
@@ -365,6 +371,9 @@ static uint8_t USBD_Comms_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
   /* Safe buffer handling */
   if(rxIndex + rx_len <= USB_COMMS_MAX_SIZE)
   {
+    /* #68 (OTG DMA mode): append the aligned staging packet at the
+     * current assembly offset. */
+    memcpy(&buf[rxIndex], comms_rx_packet, rx_len);
     rxIndex += rx_len;
 
     /* Determine packet completion based on length field */
@@ -401,7 +410,8 @@ static uint8_t USBD_Comms_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
     memset((uint32_t*)next_buffer, 0, USB_COMMS_MAX_SIZE/4);
   }
 
-  status = USBD_LL_PrepareReceive(pdev, COMMSOutEpAdd, &next_buffer[rxIndex], packet_size);
+  (void)next_buffer;
+  status = USBD_LL_PrepareReceive(pdev, COMMSOutEpAdd, comms_rx_packet, packet_size);
   return status;
 }
 
@@ -535,7 +545,7 @@ void USBD_COMMS_RecoverFromError(void)
   uint8_t *next_buffer = rx_buffers[current_rx_buf_index];
   memset((uint32_t*)next_buffer, 0, USB_COMMS_MAX_SIZE/4);
   USBD_LL_PrepareReceive(&hUsbDeviceHS, COMMS_OUT_EP,
-		  next_buffer, COMMS_FS_MAX_PACKET_SIZE);
+		  comms_rx_packet, COMMS_FS_MAX_PACKET_SIZE);
   __enable_irq();
 }
 
