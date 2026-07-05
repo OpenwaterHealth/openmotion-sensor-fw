@@ -437,7 +437,7 @@ int main(void)
     /* #68 experiment: run the deferred per-frame send in thread context (set by the
      * FSIN ISR when DEBUG_FLAG_SEND_DEFER is active). Runs below every interrupt, so it
      * cannot block the camera SPI/USART transport IRQs the way the ISR-context send does. */
-    if (send_data_flag) { send_data_flag = false; camera_send_pending(); }
+    if (send_data_flag) { send_data_flag = false; send_data(); }
   	comms_host_check_received(); // check comms
     imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
     camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
@@ -2029,10 +2029,12 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM4) // Call data sender (internal FSIN))
   {
     fsin_timestamp_ms = get_timestamp_ms();  /* #68: stamp the frame at FSIN */
-    /* #68 rework: the ISR does only the hard-deadline work (snapshot,
-     * re-arm, failure check); the main loop assembles/compresses/sends. */
-    camera_frame_isr_tick();
-    send_data_flag = true;
+    /* #68 experiment: defer the heavy send to the main loop when enabled. */
+    if ((logging_get_debug_flags() & DEBUG_FLAG_SEND_DEFER) != 0u) {
+      send_data_flag = true;
+    } else {
+      send_data();
+    }
   }
 }
 
@@ -2042,10 +2044,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
       pulse_count++;
       fsin_timestamp_ms = get_timestamp_ms();  /* #68: stamp the frame at the FSIN rising edge */
-      /* #68 rework: hard-deadline work in the ISR, heavy send in the main
-       * loop (see camera_frame_isr_tick). */
-      camera_frame_isr_tick();
-      send_data_flag = true;
+      /* #68 experiment: defer the heavy send to the main loop when enabled. */
+      if ((logging_get_debug_flags() & DEBUG_FLAG_SEND_DEFER) != 0u) {
+        send_data_flag = true;
+      } else {
+        send_data();
+      }
     }
 }
 

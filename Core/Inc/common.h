@@ -31,10 +31,7 @@
 #define DEBUG_FLAG_COMM_VERBOSE (1u << 4)  /* Enable cmd id and "." response prints in uart_comms */
 #define DEBUG_FLAG_CMD_VERBOSE (1u << 5)  /* Enable printf in command handlers (if_commands.c) */
 #define DEBUG_FLAG_HISTO_CMP  (1u << 6)  /* Send compressed histogram packets (TYPE_HISTO_CMP) */
-#define DEBUG_FLAG_SEND_DEFER (1u << 7)  /* #68: OBSOLETE no-op — the ISR-tick /
-                                          * main-loop-send split is now the only
-                                          * architecture. Bit kept reserved so old
-                                          * hosts setting it change nothing. */
+#define DEBUG_FLAG_SEND_DEFER (1u << 7)  /* #68: FSIN ISR only flips send_data_flag; main loop runs send_data() */
 #define DEBUG_FLAG_HISTO_STALL (1u << 8) /* #75: stop sending histogram frames after HISTO_STALL_TRIGGER_FRAMES;
                                           * cameras/SPI/USB stay alive — deterministic host-visible stall repro */
 
