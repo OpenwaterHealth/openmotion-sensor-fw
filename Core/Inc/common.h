@@ -47,6 +47,14 @@
 #define USART6_IRQ_PRIORITY 4
 #define UART4_IRQ_PRIORITY 4
 #define DMA_IRQ_PRIORITY 0
+/* Bench note (2026-07-05, #78/#80): raising this to 0 was tried and made
+ * 60 Hz WORSE — the send ISR then fires deterministically before several
+ * cameras' RX completions, and since the send only re-arms snapshot
+ * cameras, those cameras' re-arm slipped a full frame (overrun → false
+ * death). The prio-2 timing was accidentally masking that coupling via
+ * USB preemption delay. Real fix: completion-time re-arm (staging
+ * copy in HAL_SPI/USART_RxCpltCallback), which decouples re-arm latency
+ * from FSIN/send timing at any rate. */
 #define FSIN_IRQ_PRIORITY 2
 #define USB_IRQ_PRIORITY 0
 
