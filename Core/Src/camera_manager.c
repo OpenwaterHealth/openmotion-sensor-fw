@@ -35,6 +35,16 @@ static uint8_t  next_cam_idx = 0;
  * is naturally serialized with every other hi2c1 user. */
 static volatile bool    cam_temp_poll_due = false;     /* set by send_data() */
 static volatile uint8_t cam_recovery_pending = 0;   /* set by check_camera_failures() (frame ISR); serviced by camera_i2c_service() */
+/* #68 restream recovery: the laser transient at 60 Hz can upset the
+ * camera/MIPI link itself (which also freezes the FPGA - its clocks derive
+ * from the camera MIPI clock, so no FPGA-side self-heal is possible). The
+ * cheap fix is an I2C stream-cycle of the camera, which restarts MIPI and
+ * lets the FPGA (NVCM or SRAM image) resume pushes. Tried up to
+ * CAM_RESTREAM_MAX_ATTEMPTS times per scan before falling back to the
+ * heavy rail-off death path. Serviced by camera_i2c_service (owns hi2c1). */
+#define CAM_RESTREAM_MAX_ATTEMPTS 3
+static volatile uint8_t cam_restream_pending = 0;
+static volatile uint8_t cam_restream_attempts[CAMERA_COUNT] = {0};
 /* #78: cameras whose reception aborted on an RX error, awaiting a
  * frame-boundary re-arm (camera_service_resync at send_data entry). */
 static volatile uint8_t cam_resync_bits = 0;
@@ -42,8 +52,25 @@ static volatile uint8_t cam_resync_bits = 0;
  * recoverable overrun (one lost frame) isn't misdiagnosed as camera death
  * (3-miss threshold -> 10 s rail-off) while the re-armed reception waits
  * for its first full frame. */
-#define CAM_RESYNC_GRACE_FRAMES 4
+/* Enough headroom for 2-3 flush+re-arm convergence attempts if the first
+ * re-arm lands mid-push. */
+#define CAM_RESYNC_GRACE_FRAMES 8
 static volatile uint8_t cam_resync_grace[CAMERA_COUNT] = {0};
+/* #68 debug instrumentation (60 Hz x 16 SPI3/4 dark-frame failure):
+ * per-camera completion count, last completion/error phase relative to
+ * FSIN (ms), and resync count — dumped at scan stop. */
+static volatile uint32_t cam_rx_count[CAMERA_COUNT] = {0};
+static volatile uint32_t cam_rx_phase_ms[CAMERA_COUNT] = {0};
+static volatile uint32_t cam_err_phase_ms[CAMERA_COUNT] = {0};
+static volatile uint32_t cam_resync_req_count[CAMERA_COUNT] = {0};
+static volatile uint32_t cam_resync_ok_count[CAMERA_COUNT] = {0};
+
+void camera_diag_note_error(uint8_t cam_id)
+{
+	if (cam_id < CAMERA_COUNT) {
+		cam_err_phase_ms[cam_id] = get_timestamp_ms() - fsin_timestamp_ms;
+	}
+}
 
 #define FPGA_I2C_ADDRESS 0x40  // Replace with your FPGA's I2C address
 #define HISTO_JSON_BUFFER_SIZE 34000
@@ -498,6 +525,18 @@ _Bool camera_set_capture_rate(uint8_t rate_hz)
 	case 60: vts = 0x0735; break;
 	default: return false;
 	}
+	/* NOTE (#68 root cause, bench-proven 2026-07-05): with the 60 Hz VTS
+	 * the exposed-row band drifts to ~8.4 ms after FSIN (the sensor's
+	 * auto tc_r sync latches a config-time-VTS-derived init value:
+	 * 2760 mod 1845 = 915 rows ≈ 8.4 ms), so the laser pulse must fire
+	 * mid-frame — INSIDE the FPGA SPI push window — and its driver
+	 * transient glitches the marginal SPI links (cams 6/8) at scan
+	 * start. Parking the pulse outside the push window (delay 2 ms)
+	 * gives a clean 16/16, proving the mechanism. Re-pinning the band
+	 * to ~100 us via r_init_man/0x3823[4] runtime writes was attempted
+	 * and did NOT take effect (band unmoved; needs config-time writes
+	 * or different enable semantics) — follow-up on #68. */
+
 	_Bool ok = true;
 	for (int i = 0; i < CAMERA_COUNT; i++) {
 		CameraDevice *cam = &cam_array[i];
@@ -1318,6 +1357,32 @@ void camera_i2c_service(void)
         }
     }
 
+    /* #68: stream-cycle cameras flagged for restream recovery. */
+    if (cam_restream_pending != 0u) {
+        __disable_irq();
+        uint8_t restream = cam_restream_pending;
+        cam_restream_pending = 0u;
+        __enable_irq();
+        for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+            if ((restream & (1u << cam_id)) == 0u) {
+                continue;
+            }
+            CameraDevice *cam = &cam_array[cam_id];
+            if (TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
+                printf("restream: mux select failed Camera %d\r\n", cam_id + 1);
+                continue;
+            }
+            abort_data_reception(cam_id);
+            X02C1B_stream_off(cam);
+            delay_ms(2);
+            X02C1B_stream_on(cam);
+            /* Fresh reception at the next frame boundary (with the SPI
+             * FIFO flush the resync path does). */
+            camera_request_resync(cam_id);
+            printf("Camera %d: restream cycle done\r\n", cam_id + 1);
+        }
+    }
+
     if (cam_temp_poll_due) {
         cam_temp_poll_due = false;
         poll_camera_temperatures();
@@ -1488,6 +1553,19 @@ static void check_camera_failures(void) {
 
 				// Check if threshold reached
 				if (camera_failure_counters[cam_id] >= CAMERA_FAILURE_THRESHOLD_CYCLES) {
+					/* #68: before declaring death, try an I2C stream-cycle -
+					 * a laser-transient-upset camera resumes MIPI (and its
+					 * FPGA resumes pushes) after a restart, where the old
+					 * path parked it for the whole scan. */
+					if (cam_restream_attempts[cam_id] < CAM_RESTREAM_MAX_ATTEMPTS) {
+						cam_restream_attempts[cam_id]++;
+						cam_restream_pending |= (uint8_t)(1u << cam_id);
+						camera_failure_counters[cam_id] = 0;
+						cam_resync_grace[cam_id] = CAM_RESYNC_GRACE_FRAMES;
+						printf("Camera %d: restream recovery attempt %u\r\n",
+						       cam_id + 1, cam_restream_attempts[cam_id]);
+						continue;
+					}
 					// Only act once per failure (when threshold is exactly reached)
 					if (camera_failure_counters[cam_id] == CAMERA_FAILURE_THRESHOLD_CYCLES) {
 						/* Mark dead via needs_recovery — NOT isPresent, which keeps
@@ -1554,7 +1632,15 @@ _Bool send_data(void) {
 		streaming_active = true;
 		streaming_first_frame = true;
 		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
-		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) { cam_overrun_count[ci] = 0; }
+		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) {
+			cam_overrun_count[ci] = 0;
+			cam_restream_attempts[ci] = 0;
+			cam_rx_count[ci] = 0;
+			cam_rx_phase_ms[ci] = 0;
+			cam_err_phase_ms[ci] = 0;
+			cam_resync_req_count[ci] = 0;
+			cam_resync_ok_count[ci] = 0;
+		}
 		/* #70: zero the compression-guard counters at scan START (not stop, like
 		 * cmp_total_uncompressed/cmp_frame_count etc below) — these are part of
 		 * cam_diag_stats_t (OW_CMD_DIAG_STATS), and a host naturally queries
@@ -1670,6 +1756,30 @@ _Bool check_streaming(void){
 			       (unsigned long)cam_overrun_count[2], (unsigned long)cam_overrun_count[3],
 			       (unsigned long)cam_overrun_count[4], (unsigned long)cam_overrun_count[5],
 			       (unsigned long)cam_overrun_count[6], (unsigned long)cam_overrun_count[7]);
+			printf("[DIAG] rx_count  c1-c8: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+			       (unsigned long)cam_rx_count[0], (unsigned long)cam_rx_count[1],
+			       (unsigned long)cam_rx_count[2], (unsigned long)cam_rx_count[3],
+			       (unsigned long)cam_rx_count[4], (unsigned long)cam_rx_count[5],
+			       (unsigned long)cam_rx_count[6], (unsigned long)cam_rx_count[7]);
+			printf("[DIAG] rx_phase  c1-c8: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+			       (unsigned long)cam_rx_phase_ms[0], (unsigned long)cam_rx_phase_ms[1],
+			       (unsigned long)cam_rx_phase_ms[2], (unsigned long)cam_rx_phase_ms[3],
+			       (unsigned long)cam_rx_phase_ms[4], (unsigned long)cam_rx_phase_ms[5],
+			       (unsigned long)cam_rx_phase_ms[6], (unsigned long)cam_rx_phase_ms[7]);
+			printf("[DIAG] err_phase c1-c8: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+			       (unsigned long)cam_err_phase_ms[0], (unsigned long)cam_err_phase_ms[1],
+			       (unsigned long)cam_err_phase_ms[2], (unsigned long)cam_err_phase_ms[3],
+			       (unsigned long)cam_err_phase_ms[4], (unsigned long)cam_err_phase_ms[5],
+			       (unsigned long)cam_err_phase_ms[6], (unsigned long)cam_err_phase_ms[7]);
+			printf("[DIAG] resync req/ok c1-c8: %lu/%lu %lu/%lu %lu/%lu %lu/%lu %lu/%lu %lu/%lu %lu/%lu %lu/%lu\r\n",
+			       (unsigned long)cam_resync_req_count[0], (unsigned long)cam_resync_ok_count[0],
+			       (unsigned long)cam_resync_req_count[1], (unsigned long)cam_resync_ok_count[1],
+			       (unsigned long)cam_resync_req_count[2], (unsigned long)cam_resync_ok_count[2],
+			       (unsigned long)cam_resync_req_count[3], (unsigned long)cam_resync_ok_count[3],
+			       (unsigned long)cam_resync_req_count[4], (unsigned long)cam_resync_ok_count[4],
+			       (unsigned long)cam_resync_req_count[5], (unsigned long)cam_resync_ok_count[5],
+			       (unsigned long)cam_resync_req_count[6], (unsigned long)cam_resync_ok_count[6],
+			       (unsigned long)cam_resync_req_count[7], (unsigned long)cam_resync_ok_count[7]);
 			/* #70 instrumentation: compression budget-guard fallback counts this scan. */
 			if (cmp_timeout_count > 0 || cmp_fail_count > 0) {
 				printf("[DIAG] cmp fallback: timeout=%lu overflow=%lu total=%lu\r\n",
@@ -2199,6 +2309,7 @@ void camera_request_resync(uint8_t cam_id)
 	if (cam_id < CAMERA_COUNT) {
 		cam_resync_bits |= (uint8_t)(1u << cam_id);
 		cam_resync_grace[cam_id] = CAM_RESYNC_GRACE_FRAMES;
+		cam_resync_req_count[cam_id]++;
 	}
 }
 
@@ -2234,6 +2345,8 @@ void camera_rx_complete(uint8_t cam_id)
 		return;
 	}
 	CameraDevice *cam = &cam_array[cam_id];
+	cam_rx_count[cam_id]++;
+	cam_rx_phase_ms[cam_id] = get_timestamp_ms() - fsin_timestamp_ms;
 	if (cam->pRecieveHistoBuffer != NULL) {
 		memcpy(histo_staging[cam_id], (const uint8_t *)cam->pRecieveHistoBuffer,
 		       cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
