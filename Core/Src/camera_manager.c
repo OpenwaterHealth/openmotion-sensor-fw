@@ -1518,29 +1518,38 @@ static void check_camera_failures(void) {
 	}
 }
 
-/* #75: consume this frame's camera data WITHOUT sending it to the host.
- * Mirrors the event-bit consume + per-camera re-arm that send_histogram_data()
- * would have done (same masking rationale — see the comment there), so the
- * cameras/SPI pipeline keeps flowing and check_camera_failures() stays happy;
- * only the USB HISTO frame is withheld. Short-circuits BEFORE compression, so
- * the #70 cmp budget guard never runs on a suppressed frame. */
-static _Bool histo_stall_suppress_frame(void) {
-	uint8_t ready_bits;
-	__disable_irq();
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-	/* SPI re-arm happens in the RX completion callback (#78); USART cams
-	 * still re-arm at consume time. */
-	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
-		if ((ready_bits & (1u << cam_id)) != 0 && cam_array[cam_id].useUsart) {
-			start_data_reception(cam_id);
-		}
-	}
-	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
-}
+/* #75 note: the histo-stall suppression (consume the frame, withhold only
+ * the USB send) now falls out of the tick/send split — the ISR tick always
+ * consumes bits + re-arms, and camera_send_pending() simply skips the
+ * build/send for a stall-flagged frame. */
 
-_Bool send_data(void) {
+/* #68 rework: the per-frame work is split in two.
+ *
+ *   camera_frame_isr_tick()  — FSIN ISR. Cheap + hard-deadline work only:
+ *       resync service, debounce, failure check, event-bit snapshot,
+ *       USART re-arm (must be early and high-priority; USART can't re-arm
+ *       in its own completion callback — see camera_rx_complete), latch
+ *       the frame descriptor for the main loop.
+ *   camera_send_pending()    — main loop. The heavy, deadline-tolerant
+ *       work: payload assembly from the staging copies, compression, USB
+ *       hand-off. Fully preemptible, so RX DMA completions, SPI error
+ *       recovery and the USB ISR are never blocked behind it.
+ *
+ * This is the old DEBUG_FLAG_SEND_DEFER experiment done properly: the
+ * original deferral moved the USART re-arms into the main loop along with
+ * the send, which re-armed them late and killed the USART cams at 60 Hz.
+ * With staging (#78) the re-arms no longer depend on the send at all.
+ *
+ * If the main loop hasn't consumed frame N when FSIN N+1 latches, frame N
+ * is dropped (send_overrun_drops) — correct back-pressure when the send
+ * genuinely can't keep up, instead of stretching the ISR. */
+static volatile uint8_t  pending_bits = 0;
+static volatile uint32_t pending_ts = 0;
+static volatile bool     pending_stall = false;
+static volatile bool     frame_pending = false;
+static uint32_t          send_overrun_drops = 0;
+
+void camera_frame_isr_tick(void) {
 
 	/* #78: frame-boundary re-arm for cameras whose reception aborted on an
 	 * RX error — right after FSIN the FPGA is ~11 ms away from pushing, so
@@ -1589,22 +1598,20 @@ _Bool send_data(void) {
 			printf("Frame sync debounce (<10ms): %lu events so far, passing.\r\n",
 			       (unsigned long)debounce_count);
 		}
-		return true;
+		return;
 	}
 
 	most_recent_frame_time = get_timestamp_ms();
 	// printf("%lu\r\n", most_recent_frame_time);
-	
+
 	// Check for camera failures before clearing event_bits
 	check_camera_failures();
-	
-	bool success = false;
+
 	uint32_t dflags = logging_get_debug_flags();
 	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
-	 * suppress the send entirely (all modes: fake, compressed, plain). This
-	 * runs at the common send entry, so it behaves identically whether
-	 * send_data() was called from the FSIN ISR or deferred to the main loop
-	 * by DEBUG_FLAG_SEND_DEFER (#68). Unreachable with the flag clear. */
+	 * suppress the send entirely (all modes: fake, compressed, plain).
+	 * Counted here at the frame tick; the suppression itself is applied by
+	 * camera_send_pending(). Unreachable with the flag clear. */
 	bool histo_stall_this_frame = false;
 	if ((dflags & DEBUG_FLAG_HISTO_STALL) != 0u) {
 		histo_stall_frame_count++;
@@ -1616,25 +1623,75 @@ _Bool send_data(void) {
 			       (unsigned long)histo_stall_frame_count);
 		}
 	}
-	if (histo_stall_this_frame) {
-		success = histo_stall_suppress_frame();
-	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
-		success = send_fake_data();
-	} else if ((dflags & DEBUG_FLAG_HISTO_CMP) != 0u) {
-		success = send_histogram_data_cmp();
-	} else {
-		success = send_histogram_data();
+
+	/* Snapshot + consume this frame's event bits, then re-arm the USART
+	 * cams immediately (high priority, well before the ~11.6 ms FPGA push;
+	 * SPI cams re-armed in their completion callbacks — #78). */
+	uint8_t bits;
+	__disable_irq();
+	bits = event_bits & event_bits_enabled;
+	event_bits = 0x00;
+	__enable_irq();
+	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
+		if ((bits & (1u << cam_id)) != 0 && cam_array[cam_id].useUsart) {
+			start_data_reception(cam_id);
+		}
 	}
+
+	/* Latch the frame descriptor for the main-loop sender. */
+	if (frame_pending) {
+		send_overrun_drops++;
+		if ((send_overrun_drops & 0x3F) == 1) {
+			printf("send overrun: main loop missed %lu frame(s)\r\n",
+			       (unsigned long)send_overrun_drops);
+		}
+	}
+	pending_bits = bits;
+	pending_ts = fsin_timestamp_ms;
+	pending_stall = histo_stall_this_frame;
+	frame_pending = true;
+
 	/* Temperature polling does hi2c1 traffic, so it can't run here in the
 	 * frame ISR — flag it for camera_i2c_service() in the main loop. */
 	cam_temp_poll_due = true;
+}
 
-    if (success) {
+_Bool camera_send_pending(void) {
+	if (!frame_pending) {
+		return true;
+	}
+	__disable_irq();
+	uint8_t  bits  = pending_bits;
+	uint32_t ts    = pending_ts;
+	bool     stall = pending_stall;
+	frame_pending = false;
+	__enable_irq();
+
+	bool success;
+	uint32_t dflags = logging_get_debug_flags();
+	if (stall) {
+		success = true;  /* #75: suppress — bits already consumed at the tick */
+	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+		success = send_fake_data();
+	} else if ((dflags & DEBUG_FLAG_HISTO_CMP) != 0u) {
+		success = send_histogram_data_cmp(bits, ts);
+	} else {
+		success = send_histogram_data(bits, ts);
+	}
+
+	if (success) {
 		total_frames_sent++;
 	} else {
 		total_frames_failed++;
 	}
 	return success;
+}
+
+_Bool send_data(void) {
+	/* Legacy single-call form (terminal flush in check_streaming): tick +
+	 * immediate send, both in the caller's (main-loop) context. */
+	camera_frame_isr_tick();
+	return camera_send_pending();
 }
 
 _Bool check_streaming(void){
@@ -1708,23 +1765,15 @@ _Bool check_streaming(void){
 	return streaming_active;
 }
 
-_Bool send_histogram_data(void) {
+/* #68 rework: ready_bits (already masked + consumed by the ISR tick) and
+ * the FSIN timestamp arrive as parameters; this runs in the main loop. */
+_Bool send_histogram_data(uint8_t ready_bits, uint32_t frame_ts) {
 	_Bool status = true;
 	int offset = 0;
-	uint8_t ready_bits = 0;
 
 	if(event_bits_enabled == 0x00){
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled: a dead camera's aborted DMA can complete
-	 * on garbage clock edges while its regulator browns out, setting a stale
-	 * event bit. Unmasked, that bit would put its garbage buffer in the
-	 * frame AND re-arm reception below — re-wedging the peripheral in
-	 * BUSY_RX ("camera not READY" on the next scan, field-hit 2026-06-11). */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
 
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
@@ -1757,7 +1806,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = frame_ts;  /* stamped at FSIN by the ISR tick (#68) */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1785,10 +1834,6 @@ _Bool send_histogram_data(void) {
 			packet_buffer[offset++] = (uint8_t)((temp_bits >> 24) & 0xFF);
 
 			packet_buffer[offset++] = HISTO_EOH;
-
-			if (cam_array[cam_id].useUsart) {
-				start_data_reception(cam_id);
-			}
 		}
 	}
 
@@ -1923,20 +1968,15 @@ static _Bool send_uncompressed_histo(const uint8_t *payload, int payload_len) {
 	return tx_status == USBD_OK;
 }
 
-_Bool send_histogram_data_cmp(void) {
+/* #68 rework: ready_bits + timestamp arrive from the ISR tick; runs in
+ * the main loop. */
+_Bool send_histogram_data_cmp(uint8_t ready_bits, uint32_t frame_ts) {
 	_Bool status = true;
 	int p_off = 0;   /* offset into uncmp_payload (uncompressed staging) */
-	uint8_t ready_bits = 0;
 
 	if (event_bits_enabled == 0x00) {
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled — same rationale as send_histogram_data():
-	 * never include or re-arm a camera the stall detector disabled. */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
 
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
@@ -1957,7 +1997,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = frame_ts;  /* stamped at FSIN by the ISR tick (#68) */
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1982,10 +2022,6 @@ _Bool send_histogram_data_cmp(void) {
 			uncmp_payload[p_off++] = (uint8_t)((temp_bits >> 24) & 0xFF);
 
 			uncmp_payload[p_off++] = HISTO_EOH;
-
-			if (cam_array[cam_id].useUsart) {
-				start_data_reception(cam_id);
-			}
 		}
 	}
 
