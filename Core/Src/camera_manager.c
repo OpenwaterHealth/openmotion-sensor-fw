@@ -787,7 +787,7 @@ _Bool exit_sram_prog_fpga(uint8_t cam_id)
 		return false;
 	}
 
-	if(fpga_enter_sram_prog_mode(cam->pI2c, cam->device_address) == 1)
+	if(fpga_exit_prog_mode(cam->pI2c, cam->device_address) == 1)
 	{
 		printf("Activate FPGA Camera %d Failed\r\n", cam_id+1);
 		return false;
@@ -907,6 +907,15 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 	}else{
 		cam->isProgrammed = true;
 		camera_recovery_complete(cam);
+	}
+
+	/* Same USART realign the program_fpga() path performs: pin glitches
+	 * during configuration leave the USART receiver bit-shifted (data
+	 * arrives multiplied by a power of two). */
+	if(cam->useUsart)
+	{
+		cam->pUart->Instance->CR1 &= ~USART_CR1_UE;
+		cam->pUart->Instance->CR1 |= USART_CR1_UE;
 	}
 	printf("done\r\n");
 	return true;
