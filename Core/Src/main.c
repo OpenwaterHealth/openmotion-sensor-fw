@@ -195,6 +195,30 @@ static void imu_service(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/*
+ * Clear the custom secure bootloader's failsafe boot counter (RTC->BKP6R).
+ * The bootloader increments BKP6R on every launch attempt; after
+ * BL_BOOT_FAIL_MAX consecutive attempts that do not clear it, it enters USB DFU
+ * instead of launching us. Calling this early in boot signals a successful
+ * launch so the next normal reset starts from a clean count. No-op in bare-metal
+ * (no bootloader). HAL RTC module is not enabled, so use CMSIS directly. */
+#if !defined(BARE_METAL_BUILD)
+static void clear_boot_counter(void)
+{
+  PWR->CR1     |= PWR_CR1_DBP;            /* disable backup-domain write protect  */
+  RCC->APB4ENR |= RCC_APB4ENR_RTCAPBEN;  /* RTC register APB interface clock      */
+  RCC->CSR     |= RCC_CSR_LSION;          /* LSI on (RTC kernel clock source)      */
+  { uint32_t to = 0U;
+    while (((RCC->CSR & RCC_CSR_LSIRDY) == 0U) && (++to < 0x00100000U)) { } }
+  if ((RCC->BDCR & RCC_BDCR_RTCSEL) == 0U) {
+    RCC->BDCR = (RCC->BDCR & ~RCC_BDCR_RTCSEL) | RCC_BDCR_RTCSEL_1; /* LSI */
+  }
+  RCC->BDCR |= RCC_BDCR_RTCEN;            /* enable RTC                            */
+  RTC->BKP6R = 0U;                        /* successful boot: reset the attempt count */
+  __DSB();
+}
+#endif /* !BARE_METAL_BUILD */
+
 /* Print last reset cause - helps diagnose thermal/brownout (BOR) or watchdog (IWDG) */
 static void print_reset_cause(void)
 {
@@ -366,6 +390,13 @@ int main(void)
   system_monitor_ecc_enable();
   HAL_PWREx_EnableMonitoring();  /* Enable junction temp (TEMPH/TEMPL) monitoring */
   printf("Initializing, please wait ...\r\n");
+
+#if !defined(BARE_METAL_BUILD)
+  /* Signal a successful launch to the custom bootloader (clears its failsafe
+   * boot counter) early, before the camera/FPGA bring-up below, so a stalled
+   * FPGA init (e.g. bitstream not yet flashed) does not trip the DFU fallback. */
+  clear_boot_counter();
+#endif
 
   // enable HS USB MUX
   HAL_GPIO_WritePin(USB_MUX_GPIO_Port, USB_MUX_Pin, GPIO_PIN_RESET);
@@ -2212,7 +2243,32 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM15) {
     HAL_TIM_Base_Stop_IT(htim);
     if(_enter_dfu) {
-      *((uint32_t *)0x38000000) = 0xDEADBEEF; 
+#if defined(BARE_METAL_BUILD)
+      /* Bare-metal build: no custom bootloader. Arm the RAM magic that
+       * CheckBootloaderFlag() (system_stm32h7xx.c) reads after the reset below;
+       * it then jumps to the STM32 system-memory ROM DFU loader. D3 SRAM
+       * survives the software reset. */
+      *((uint32_t *)0x38000000) = 0xDEADBEEFU;
+      __DSB();
+#else
+      /* Custom-bootloader build: request DFU from our secure bootloader (NOT the
+       * STM32 ROM loader). It reads RTC->BKP7R on the next reset and, when it
+       * holds the magic, enters USB DFU instead of launching the app. The backup
+       * register lives in the VBAT/backup domain and survives the reset below.
+       * Direct CMSIS access (HAL RTC module not enabled): unlock backup domain
+       * (DBP), clock the RTC APB interface + kernel (LSI), then arm the magic. */
+      PWR->CR1     |= PWR_CR1_DBP;
+      RCC->APB4ENR |= RCC_APB4ENR_RTCAPBEN;
+      RCC->CSR     |= RCC_CSR_LSION;
+      { uint32_t to = 0U;
+        while (((RCC->CSR & RCC_CSR_LSIRDY) == 0U) && (++to < 0x00100000U)) { } }
+      if ((RCC->BDCR & RCC_BDCR_RTCSEL) == 0U) {
+        RCC->BDCR = (RCC->BDCR & ~RCC_BDCR_RTCSEL) | RCC_BDCR_RTCSEL_1; /* LSI */
+      }
+      RCC->BDCR |= RCC_BDCR_RTCEN;
+      RTC->BKP7R = 0xB007C0DEU;   /* BL_FORCE_DFU_MAGIC */
+      __DSB();
+#endif
     }
 
 

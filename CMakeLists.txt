@@ -71,11 +71,43 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
+# ---------------------------------------------------------------------------
+# Boot mode: run under the custom secure bootloader (default) or bare-metal.
+#   OFF (default): image runs from the bootloader's active slot (linked at
+#                  0x08020400, VTOR relocated there). A DFU request hands control
+#                  back to the custom bootloader via the RTC->BKP7R magic.
+#   ON           : bare-metal image at 0x08000000 with NO bootloader. A DFU
+#                  request jumps to the STM32 system-memory ROM bootloader
+#                  (0x1FF09800). Matches openmotion-console-fw.
+# ---------------------------------------------------------------------------
+option(BARE_METAL "Build a bare-metal image (no custom bootloader; runs at 0x08000000)" OFF)
+
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+# Select the linker script based on the BARE_METAL option. The matching
+# BARE_METAL_BUILD compile definition is applied to the stm32cubemx interface
+# library below so the STM32 drivers — notably system_stm32h7xx.c, which owns the
+# VTOR base address and the ROM-bootloader jump — pick it up alongside the app.
+if(BARE_METAL)
+    set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/STM32H743XX_FLASH_BARE.ld")
+    message(STATUS "Boot mode    : BARE METAL (0x08000000, DFU -> ROM bootloader)")
+else()
+    set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/STM32H743XX_FLASH.ld")
+    message(STATUS "Boot mode    : custom bootloader slot (0x08020400)")
+endif()
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -T "${LINKER_SCRIPT}")
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES LINK_DEPENDS "${LINKER_SCRIPT}")
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+
+# Propagate the boot-mode define to every translation unit (application sources
+# and the STM32 drivers), so system_stm32h7xx.c relocates VTOR and gates the
+# ROM-bootloader jump correctly.
+if(BARE_METAL)
+    target_compile_definitions(stm32cubemx INTERFACE BARE_METAL_BUILD=1)
+endif()
 
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
