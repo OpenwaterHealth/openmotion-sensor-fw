@@ -65,9 +65,16 @@ static volatile uint32_t total_frames_failed = 0;
 static uint32_t cmp_total_uncompressed = 0;  // Sum of all uncompressed payload sizes
 static uint32_t cmp_total_compressed = 0;    // Sum of all compressed payload sizes
 static uint32_t cmp_frame_count = 0;         // Number of compressed frames sent
-static uint32_t cmp_fail_count = 0;          // Number of compression failures
+static uint32_t cmp_fail_count = 0;          // Number of compression failures (dst_max overflow)
 static uint32_t cmp_usb_fail_count = 0;      // Number of USB send failures (compressed)
 static uint32_t cmp_max_time_us = 0;         // Worst-case compression time in µs
+/* #70: rle_compress hit its hard time budget (still falls back to uncompressed,
+ * same as a dst_max overflow) — see CMP_BUDGET_HARD_US below. */
+static volatile uint32_t cmp_timeout_count = 0;
+/* #70: frames actually sent uncompressed because compression didn't finish in
+ * budget/space (cmp_timeout_count + cmp_fail_count, kept as its own counter so
+ * a query doesn't need to add two fields to know "how many frames fell back"). */
+static volatile uint32_t cmp_fallback_count = 0;
 
 #define STREAMING_TIMEOUT_MS 150
 static volatile uint32_t most_recent_frame_time = 0;
@@ -75,9 +82,40 @@ static volatile uint32_t streaming_start_time = 0;
 static bool streaming_active = false;
 static bool streaming_first_frame = false;
 
+/* #75: DEBUG_FLAG_HISTO_STALL — deterministic host-visible stall repro for the
+ * bloodflow app's E-303 all-cameras-stalled watchdog (app#248/app#174/PR #294).
+ * When the flag is set, streaming runs normally for HISTO_STALL_TRIGGER_FRAMES
+ * frames, then send_data() silently stops emitting histogram USB frames while
+ * everything else stays healthy: cameras keep streaming, event bits keep being
+ * consumed, SPI receptions keep re-arming (so check_camera_failures() never
+ * trips and no rail-off recovery fires), temp polling and command handling
+ * continue, USB stays enumerated. This simulates the HOST-visible signature of
+ * the #68 FSIN-ISR starvation fault on demand. State resets at scan start. */
+#define HISTO_STALL_TRIGGER_FRAMES 1800u  /* ~45 s at 40 fps */
+static uint32_t histo_stall_frame_count = 0;
+static bool histo_stall_tripped = false;
+
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
 static uint8_t camera_failure_counters[CAMERA_COUNT] = {0};  // Track consecutive cycles without event bits
+/* #68 instrumentation: per-camera RX overrun counts (set in main.c error callbacks). */
+volatile uint32_t cam_overrun_count[CAMERA_COUNT] = {0};
+
+/* #70: printf-independent snapshot for OW_CMD_DIAG_STATS (if_commands.c) — see
+ * cam_diag_stats_t in camera_manager.h. Plain field copy, no critical section:
+ * these are diagnostic counters (worst case a torn read mixes adjacent scans'
+ * values briefly), same tolerance as the existing [DIAG] printf dump. */
+void camera_manager_get_diag_stats(cam_diag_stats_t *out) {
+	out->version = CAM_DIAG_STATS_VERSION;
+	out->reserved[0] = 0; out->reserved[1] = 0; out->reserved[2] = 0;
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		out->cam_overrun_count[i] = cam_overrun_count[i];
+	}
+	out->cmp_fail_count = cmp_fail_count;
+	out->cmp_timeout_count = cmp_timeout_count;
+	out->cmp_fallback_count = cmp_fallback_count;
+	out->cmp_max_time_us = cmp_max_time_us;
+}
 
  __ALIGN_BEGIN __attribute__((section(".sram4"))) volatile uint8_t spi6_buffer[SPI_PACKET_LENGTH] __ALIGN_END;
 
@@ -1075,9 +1113,13 @@ _Bool configure_camera_testpattern(uint8_t cam_id, uint8_t test_pattern)
 
 static void poll_camera_temperatures(void)
 {
-    uint32_t now = get_timestamp_ms();
+    /* HAL_GetTick(), NOT get_timestamp_ms(): the TIM5-derived clock wraps at
+     * 2^32/100 ms (~11.93 h of uptime), so deadlines scheduled on it freeze
+     * this gate for hours — or forever, if scheduled within the last poll
+     * interval before the wrap (#73). */
+    uint32_t now = HAL_GetTick();
 
-    if ((next_temp_ms == 0u) || (now >= next_temp_ms))
+    if ((int32_t)(now - next_temp_ms) >= 0)
     {
         /* Schedule from current time to keep a constant cadence without catch-up bursts. */
         next_temp_ms = now + CAM_TEMP_POLL_INTERVAL_MS;
@@ -1172,7 +1214,9 @@ static void camera_death_isolate(uint8_t cam_id)
     cam->isProgrammed = false;
     cam->isConfigured = false;
     cam->streaming_enabled = false;
-    cam->recovery_repower_at = get_timestamp_ms() + CAMERA_RECOVERY_OFF_MS;
+    /* HAL_GetTick(), NOT get_timestamp_ms(): the TIM5-derived clock wraps at
+     * ~11.93 h, which stretched this 10 s cool-off into hours (#73). */
+    cam->recovery_repower_at = HAL_GetTick() + CAMERA_RECOVERY_OFF_MS;
 
     printf("Camera %d: rail off for %u ms (regulator cool-off)\r\n",
            cam_id + 1, (unsigned)CAMERA_RECOVERY_OFF_MS);
@@ -1185,7 +1229,7 @@ static void camera_death_isolate(uint8_t cam_id)
  * bring-up at the next scan. Main-loop only. */
 static void camera_recovery_tick(void)
 {
-    uint32_t now = get_timestamp_ms();
+    uint32_t now = HAL_GetTick();  /* must match camera_death_isolate's timebase */
 
     for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
         CameraDevice *cam = &cam_array[cam_id];
@@ -1336,10 +1380,12 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	HAL_GPIO_WritePin(FSIN_GPIO_Port, FSIN_Pin, GPIO_PIN_RESET);
 	delay_ms(2);
 
-	uint32_t timeout = get_timestamp_ms() + 5000; // 100ms timeout example
+	/* HAL_GetTick() + wrap-safe compare: a get_timestamp_ms() deadline set
+	 * within 5 s of its ~11.93 h wrap is unreachable → infinite loop (#73). */
+	uint32_t timeout = HAL_GetTick() + 5000;
 
 	while(!event_bits) {
-	    if (get_timestamp_ms() > timeout) {
+	    if ((int32_t)(HAL_GetTick() - timeout) >= 0) {
 	        printf("HISTO receive timeout!\r\n");
 	        if(cam->useUsart) {
 	            HAL_DMA_Abort(cam->pUart->hdmarx); // safely abort DMA
@@ -1417,6 +1463,26 @@ static void check_camera_failures(void) {
 	}
 }
 
+/* #75: consume this frame's camera data WITHOUT sending it to the host.
+ * Mirrors the event-bit consume + per-camera re-arm that send_histogram_data()
+ * would have done (same masking rationale — see the comment there), so the
+ * cameras/SPI pipeline keeps flowing and check_camera_failures() stays happy;
+ * only the USB HISTO frame is withheld. Short-circuits BEFORE compression, so
+ * the #70 cmp budget guard never runs on a suppressed frame. */
+static _Bool histo_stall_suppress_frame(void) {
+	uint8_t ready_bits;
+	__disable_irq();
+	ready_bits = event_bits & event_bits_enabled;
+	event_bits = 0x00;
+	__enable_irq();
+	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
+		if ((ready_bits & (1u << cam_id)) != 0) {
+			start_data_reception(cam_id);
+		}
+	}
+	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
+}
+
 _Bool send_data(void) {
 
 	// Take care of statistics
@@ -1425,6 +1491,25 @@ _Bool send_data(void) {
 		streaming_start_time = get_timestamp_ms();
 		streaming_active = true;
 		streaming_first_frame = true;
+		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
+		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) { cam_overrun_count[ci] = 0; }
+		/* #70: zero the compression-guard counters at scan START (not stop, like
+		 * cmp_total_uncompressed/cmp_frame_count etc below) — these are part of
+		 * cam_diag_stats_t (OW_CMD_DIAG_STATS), and a host naturally queries
+		 * diagnostics AFTER a scan finishes. Resetting at stop would zero them
+		 * before that query ever has a chance to read the scan's actual tally. */
+		cmp_fail_count = 0;
+		cmp_timeout_count = 0;
+		cmp_fallback_count = 0;
+		cmp_max_time_us = 0;
+		/* #75: re-arm the histo-stall repro each scan (stall persists until scan
+		 * stop; the next scan streams normally again until the trigger point). */
+		histo_stall_frame_count = 0;
+		histo_stall_tripped = false;
+		if ((logging_get_debug_flags() & DEBUG_FLAG_HISTO_STALL) != 0u) {
+			printf("DEBUG: histo stall armed, trips at frame %lu\r\n",
+			       (unsigned long)HISTO_STALL_TRIGGER_FRAMES);
+		}
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
@@ -1450,7 +1535,25 @@ _Bool send_data(void) {
 	
 	bool success = false;
 	uint32_t dflags = logging_get_debug_flags();
-	if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
+	 * suppress the send entirely (all modes: fake, compressed, plain). This
+	 * runs at the common send entry, so it behaves identically whether
+	 * send_data() was called from the FSIN ISR or deferred to the main loop
+	 * by DEBUG_FLAG_SEND_DEFER (#68). Unreachable with the flag clear. */
+	bool histo_stall_this_frame = false;
+	if ((dflags & DEBUG_FLAG_HISTO_STALL) != 0u) {
+		histo_stall_frame_count++;
+		histo_stall_this_frame =
+			(histo_stall_frame_count > HISTO_STALL_TRIGGER_FRAMES);
+		if (histo_stall_this_frame && !histo_stall_tripped) {
+			histo_stall_tripped = true;
+			printf("DEBUG: histo stall tripped at frame %lu\r\n",
+			       (unsigned long)histo_stall_frame_count);
+		}
+	}
+	if (histo_stall_this_frame) {
+		success = histo_stall_suppress_frame();
+	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
 		success = send_fake_data();
 	} else if ((dflags & DEBUG_FLAG_HISTO_CMP) != 0u) {
 		success = send_histogram_data_cmp();
@@ -1481,6 +1584,13 @@ _Bool check_streaming(void){
 		}
 		if((current_time - most_recent_frame_time_local) > STREAMING_TIMEOUT_MS){
 			uint32_t elapsed = current_time - streaming_start_time;
+			/* #68: this terminal flush is NOT driven by a fresh FSIN, so the
+			 * ISR-captured fsin_timestamp_ms would be stale (the previous frame's
+			 * time) here. Stamp it now so the terminal frame carries a current
+			 * timestamp — i.e. the ~150 ms off-grid laser-off frame the host already
+			 * expects and re-times. Harmless if the dark frame was already sent by
+			 * its own off-grid FSIN (then there is no data left to flush). */
+			fsin_timestamp_ms = get_timestamp_ms();
 			send_data(); // send data one last frame to finish the buffers
 			if (total_frames_failed > 0) {
 				total_frames_failed--;  // first frame skip / last frame extra
@@ -1488,6 +1598,18 @@ _Bool check_streaming(void){
 			printf("Scan finished (%lu ms, %lu frames)\r\n", elapsed, total_frames_sent);
 			if(total_frames_failed > 0){
 				printf("%lu frames failed\r\n", total_frames_failed);
+			}
+			/* #68 instrumentation: per-camera RX overrun counts this scan. */
+			printf("[DIAG] overruns c1-c8: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+			       (unsigned long)cam_overrun_count[0], (unsigned long)cam_overrun_count[1],
+			       (unsigned long)cam_overrun_count[2], (unsigned long)cam_overrun_count[3],
+			       (unsigned long)cam_overrun_count[4], (unsigned long)cam_overrun_count[5],
+			       (unsigned long)cam_overrun_count[6], (unsigned long)cam_overrun_count[7]);
+			/* #70 instrumentation: compression budget-guard fallback counts this scan. */
+			if (cmp_timeout_count > 0 || cmp_fail_count > 0) {
+				printf("[DIAG] cmp fallback: timeout=%lu overflow=%lu total=%lu\r\n",
+				       (unsigned long)cmp_timeout_count, (unsigned long)cmp_fail_count,
+				       (unsigned long)cmp_fallback_count);
 			}
 			/* Print compression stats if compression was used */
 			if (cmp_frame_count > 0) {
@@ -1510,9 +1632,11 @@ _Bool check_streaming(void){
 			cmp_total_uncompressed = 0;
 			cmp_total_compressed = 0;
 			cmp_frame_count = 0;
-			cmp_fail_count = 0;
 			cmp_usb_fail_count = 0;
-			cmp_max_time_us = 0;
+			/* cmp_fail_count / cmp_timeout_count / cmp_fallback_count / cmp_max_time_us
+			 * are NOT reset here — see the #70 comment at their scan-START reset
+			 * in send_data(), above. They still get printed just above, before
+			 * this block runs, same as always. */
 			streaming_active = false;
 		}
 	}
@@ -1568,7 +1692,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1621,11 +1745,23 @@ _Bool send_histogram_data(void) {
 	return status;
 }
 
+/* #70: hard deadline for rle_compress, in microseconds. The frame period is
+ * ~25 ms (40 fps); 15 ms leaves headroom for the payload copy + USB send +
+ * per-camera re-arm that share the same budget. Above CMP_BUDGET_WARNING_US
+ * (10 ms) is just a yellow-flag printf; at CMP_BUDGET_HARD_US the compressor
+ * aborts and the caller falls back to an uncompressed frame instead of
+ * risking the next frame's SPI/USART overrun (sensor-fw#70). */
+#define CMP_BUDGET_HARD_US 15000UL  /* 15 ms */
+
 /*
  * PackBits-style byte-level RLE compressor.
  * Control byte < 0x80: literal run of (ctrl + 1) bytes follow (1–128).
  * Control byte >= 0x80: repeat run – next byte repeated (ctrl - 0x80 + 3) times (3–130).
- * Returns compressed size, or -1 if dst_max would be exceeded.
+ * Returns compressed size, -1 if dst_max would be exceeded, or -2 if
+ * deadline_cyccnt (a DWT->CYCCNT value) is reached before finishing — checked
+ * once per encoded run/literal chunk (at most ~130 bytes of overshoot, i.e.
+ * negligible next to the µs-scale budget). Both negative returns mean the
+ * caller should fall back to sending the frame uncompressed.
  *
  * NOTE: __attribute__((optimize("O3"))) forces GCC to compile this single
  * function at -O3 even when the rest of the file is built at -O0 or -Og.
@@ -1634,11 +1770,20 @@ _Bool send_histogram_data(void) {
  *   -O0 / compressible data:    ~9 ms   (barely OK for zeros/fake data)
  *   -O0 / incompressible data: ~37 ms   (EXCEEDS budget → SPI overrun!)
  *   -O3 / incompressible data: ~3–5 ms  (safe margin)
+ *   -O3 / pathological (camera brownout garbage): observed ~25 ms on hardware
+ *   (sensor-fw#70) — i.e. even -O3 doesn't bound the worst case; the deadline
+ *   check below does.
  */
 __attribute__((optimize("O3")))
-static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_max) {
+static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_max,
+                         uint32_t deadline_cyccnt) {
 	int si = 0, di = 0;
 	while (si < src_len) {
+		/* Wrap-safe "now >= deadline" check (same pattern as
+		 * camera_recovery_tick's cool-off timer elsewhere in this file). */
+		if ((int32_t)(DWT->CYCCNT - deadline_cyccnt) >= 0) {
+			return -2;
+		}
 		/* Try to find a run of identical bytes (min 3) */
 		uint8_t val = src[si];
 		int run_start = si;
@@ -1671,6 +1816,42 @@ static int rle_compress(const uint8_t *src, int src_len, uint8_t *dst, int dst_m
 		}
 	}
 	return di;
+}
+
+/* #70: ship the already-staged uncompressed payload (built in
+ * send_histogram_data_cmp before compression) as a plain TYPE_HISTO frame.
+ * Used when rle_compress can't finish in time/space, so a slow or
+ * incompressible frame is sent rather than silently dropped. Wire format is
+ * byte-identical to a normal TYPE_HISTO frame from send_histogram_data(), so
+ * the host needs no special handling — it just sees an uncompressed frame
+ * for that one interval. */
+static _Bool send_uncompressed_histo(const uint8_t *payload, int payload_len) {
+	uint32_t total_size = HISTO_HEADER_SIZE + (uint32_t)payload_len + HISTO_TRAILER_SIZE;
+	if (HISTO_JSON_BUFFER_SIZE < total_size) {
+		printf("[CMP] fallback packet too large (%lu), dropping frame\r\n",
+		       (unsigned long)total_size);
+		return false;
+	}
+
+	int offset = 0;
+	packet_buffer[offset++] = HISTO_SOF;
+	packet_buffer[offset++] = TYPE_HISTO;
+	packet_buffer[offset++] = (uint8_t)(total_size & 0xFF);
+	packet_buffer[offset++] = (uint8_t)((total_size >> 8) & 0xFF);
+	packet_buffer[offset++] = (uint8_t)((total_size >> 16) & 0xFF);
+	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
+
+	memcpy(packet_buffer + offset, payload, (size_t)payload_len);
+	offset += payload_len;
+
+	uint16_t crc = util_crc16(packet_buffer, offset - 1);
+	packet_buffer[offset++] = crc & 0xFF;
+	packet_buffer[offset++] = (crc >> 8) & 0xFF;
+	packet_buffer[offset++] = HISTO_EOF;
+
+	uint8_t tx_status = USBD_HISTO_SendData(&hUsbDeviceHS, packet_buffer, offset, 0);
+	frame_id++;
+	return tx_status == USBD_OK;
 }
 
 _Bool send_histogram_data_cmp(void) {
@@ -1707,7 +1888,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1740,8 +1921,9 @@ _Bool send_histogram_data_cmp(void) {
 	int dst_max = HISTO_JSON_BUFFER_SIZE - HISTO_HEADER_SIZE - HISTO_CMP_UNCMP_CRC_SIZE - HISTO_TRAILER_SIZE;
 
 	uint32_t cyc_start = DWT->CYCCNT;
+	uint32_t deadline_cyccnt = cyc_start + (SystemCoreClock / 1000000u) * CMP_BUDGET_HARD_US;
 	int cmp_len = rle_compress(uncmp_payload, p_off,
-	                           packet_buffer + HISTO_HEADER_SIZE, dst_max);
+	                           packet_buffer + HISTO_HEADER_SIZE, dst_max, deadline_cyccnt);
 	uint32_t cyc_elapsed = DWT->CYCCNT - cyc_start;
 	uint32_t elapsed_us = cyc_elapsed / (SystemCoreClock / 1000000u);
 
@@ -1750,10 +1932,23 @@ _Bool send_histogram_data_cmp(void) {
 	}
 
 	if (cmp_len < 0) {
-		cmp_fail_count++;
-		printf("[CMP] FAIL: compression overflow, %d cams, uncmp=%d, dst_max=%d, time=%luus (fail #%lu)\r\n",
-		       count, p_off, dst_max, (unsigned long)elapsed_us, (unsigned long)cmp_fail_count);
-		return false;
+		/* #70: compression couldn't finish in time (-2) or space (-1) — ship
+		 * the frame uncompressed instead of dropping it, so neither failure
+		 * mode costs data or leaves the next frame's SPI/USART re-arm late. */
+		if (cmp_len == -2) {
+			cmp_timeout_count++;
+			printf("[CMP] TIMEOUT: compression exceeded %lu us budget (ran %lu us), "
+			       "%d cams, falling back to uncompressed (#%lu)\r\n",
+			       (unsigned long)CMP_BUDGET_HARD_US, (unsigned long)elapsed_us, count,
+			       (unsigned long)cmp_timeout_count);
+		} else {
+			cmp_fail_count++;
+			printf("[CMP] OVERFLOW: compression overflow, %d cams, uncmp=%d, dst_max=%d, "
+			       "time=%luus, falling back to uncompressed (#%lu)\r\n",
+			       count, p_off, dst_max, (unsigned long)elapsed_us, (unsigned long)cmp_fail_count);
+		}
+		cmp_fallback_count++;
+		return send_uncompressed_histo(uncmp_payload, p_off);
 	}
 
 	/* Warn if compression time is eating into the frame budget.
@@ -1847,7 +2042,7 @@ _Bool send_fake_data(void) {
 	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = get_timestamp_ms();
+	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -2061,6 +2256,20 @@ _Bool enable_camera_stream(uint8_t cam_id){
 	__disable_irq();
 	event_bits &= ~(1u << cam_id);
 	__enable_irq();
+
+	/* Flush this camera's receive buffer before arming DMA. The FPGA is
+	 * re-programmed at every scan start (its frame counter resets to 1), but
+	 * the MCU's frame_buffer/spi6_buffer still holds the PREVIOUS scan's last
+	 * DMA'd frame — old FPGA frame_id and timestamp. If a send fires before
+	 * the first fresh DMA completes, that stale frame ships ahead of frame 1,
+	 * desyncing the host's frame-id unwrap and dark schedule (issue #172:
+	 * left-sensor "stale 255/173 with negative timestamps at scan start").
+	 * Zeroing it makes any premature send an obvious empty frame, not stale
+	 * data. capture_single_histogram() clears the buffer the same way. */
+	if (cam->pRecieveHistoBuffer != NULL) {
+		memset((uint8_t *)cam->pRecieveHistoBuffer, 0,
+			cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+	}
 
 	/* Arm DMA BEFORE stream_on so the receiver is ready when the sensor
 	 * starts clocking data.  Arming after stream_on causes an immediate SPI

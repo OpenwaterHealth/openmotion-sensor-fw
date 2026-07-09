@@ -46,7 +46,7 @@ typedef struct {
 	 * thermal shutdown etc.); cleared when program_fpga() completes a real
 	 * bring-up or the host explicitly powers the camera off. */
 	bool		needs_recovery;
-	uint32_t	recovery_repower_at;	/* get_timestamp_ms() deadline to re-power the rail */
+	uint32_t	recovery_repower_at;	/* HAL_GetTick() deadline to re-power the rail */
 } CameraDevice;
 
 #define CAMERA_COUNT	8
@@ -96,6 +96,32 @@ _Bool capture_single_histogram(uint8_t cam_id);
 _Bool get_single_histogram(uint8_t cam_id, uint8_t* data, uint16_t* data_len);
 _Bool start_data_reception(uint8_t cam_id);
 _Bool abort_data_reception(uint8_t cam_id);
+/* #68 instrumentation: per-camera SPI/USART RX overrun counts for the current scan.
+ * Incremented in the HAL error callbacks (main.c); reset at scan start, dumped at
+ * scan end (camera_manager.c). */
+extern volatile uint32_t cam_overrun_count[CAMERA_COUNT];
+
+/* #70: printf-independent diagnostics snapshot, queryable over OW_CMD_DIAG_STATS
+ * regardless of DEBUG_FLAG_USB_PRINTF. Fixed 8-byte-aligned wire layout returned
+ * verbatim — do not reorder fields without bumping CAM_DIAG_STATS_VERSION and the
+ * SDK parser (omotion/MotionSensor.py get_diag_stats()). */
+#define CAM_DIAG_STATS_VERSION 1u
+typedef struct __attribute__((packed)) {
+	uint8_t  version;                       /* = CAM_DIAG_STATS_VERSION */
+	uint8_t  reserved[3];                   /* pad to 4-byte alignment for the u32s below */
+	uint32_t cam_overrun_count[CAMERA_COUNT]; /* per-camera SPI/USART RX overruns, this scan */
+	uint32_t cmp_fail_count;                /* rle_compress dst_max overflow, this scan */
+	uint32_t cmp_timeout_count;              /* rle_compress hit its time budget, this scan */
+	uint32_t cmp_fallback_count;             /* frames sent uncompressed due to either above */
+	uint32_t cmp_max_time_us;                /* worst-case compression time this scan */
+} cam_diag_stats_t;
+
+/* Snapshot the live counters above into *out. Safe to call any time (main loop
+ * or command-handler context); does not reset anything. */
+void camera_manager_get_diag_stats(cam_diag_stats_t *out);
+/* #68: frame-sync timestamp captured in the FSIN ISR (main.c); used as the
+ * histogram packet timestamp so it is correct regardless of deferred-send timing. */
+extern volatile uint32_t fsin_timestamp_ms;
 _Bool send_data(void);
 _Bool send_fake_data(void);
 _Bool send_histogram_data(void);

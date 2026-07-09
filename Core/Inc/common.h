@@ -31,6 +31,9 @@
 #define DEBUG_FLAG_COMM_VERBOSE (1u << 4)  /* Enable cmd id and "." response prints in uart_comms */
 #define DEBUG_FLAG_CMD_VERBOSE (1u << 5)  /* Enable printf in command handlers (if_commands.c) */
 #define DEBUG_FLAG_HISTO_CMP  (1u << 6)  /* Send compressed histogram packets (TYPE_HISTO_CMP) */
+#define DEBUG_FLAG_SEND_DEFER (1u << 7)  /* #68: FSIN ISR only flips send_data_flag; main loop runs send_data() */
+#define DEBUG_FLAG_HISTO_STALL (1u << 8) /* #75: stop sending histogram frames after HISTO_STALL_TRIGGER_FRAMES;
+                                          * cameras/SPI/USB stay alive — deterministic host-visible stall repro */
 
 
 #define I2C_IRQ_PRIORITY 0
@@ -89,6 +92,7 @@ typedef enum {
 
 typedef enum {
 	OW_CMD_PING = 0x00,
+	OW_CMD_DIAG_STATS = 0x01,  /* #70: cam_diag_stats_t snapshot, printf-independent */
 	OW_CMD_VERSION = 0x02,
 	OW_CMD_ECHO = 0x03,
 	OW_CMD_TOGGLE_LED = 0x04,
