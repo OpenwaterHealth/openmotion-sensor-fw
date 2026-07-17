@@ -180,6 +180,7 @@ All command and response traffic on the COMMS interface uses a fixed binary pack
 | 4 | `DEBUG_FLAG_COMM_VERBOSE` | Enable verbose logging in `uart_comms.c` |
 | 5 | `DEBUG_FLAG_CMD_VERBOSE` | Enable `printf` inside command handlers |
 | 6 | `DEBUG_FLAG_HISTO_CMP` | Send compressed histogram packets (`TYPE_HISTO_CMP`) |
+| 9 | `DEBUG_FLAG_CAMERA_CROP` | Crop camera output to 1720×1280 (drop rightmost 200 columns) when cameras are (re)configured — misaligned-optic test |
 
 ---
 
