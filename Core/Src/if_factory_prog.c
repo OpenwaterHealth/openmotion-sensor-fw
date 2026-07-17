@@ -259,6 +259,29 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                     response->data = i2c_read_buf;
                     break;
                 }
+                case OW_FACTORY_NVCM_BOOT:
+                {
+                    /* Fast read-only NVCM bootability probe (#91): runs the
+                     * same pin-drive boot test the program paths use.
+                     * Params: data[0] = camera index 0-7 (mux-independent —
+                     * the probe is GPIO-only, no active-cam state needed).
+                     * Response: 1 byte, 1 = NVCM design booted, 0 = no boot.
+                     * OW_ERROR for a bad index or an unpowered camera. */
+                    response->command = OW_FACTORY_NVCM_BOOT;
+                    _Bool booted = 0;
+                    if (cmd->data_len < 1 ||
+                        !camera_nvcm_boot_probe(cmd->data[0], &booted))
+                    {
+                        response->packet_type = OW_ERROR;
+                        response->data_len = 0;
+                        response->data = NULL;
+                        break;
+                    }
+                    i2c_read_buf[0] = booted ? 1 : 0;
+                    response->data_len = 1;
+                    response->data = i2c_read_buf;
+                    break;
+                }
                 default:
                     response->packet_type = OW_UNKNOWN;
                     response->data_len = 0;
