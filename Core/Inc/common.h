@@ -36,6 +36,9 @@
                                           * cameras/SPI/USB stay alive — deterministic host-visible stall repro */
 #define DEBUG_FLAG_CAMERA_CROP (1u << 9) /* #86: crop camera output to 1720x1280 (drop right 200 columns) when
                                           * cameras are (re)configured — misaligned-optic A/B test. See 0X02C1B.c */
+#define DEBUG_FLAG_CAMERA_RAW (1u << 10) /* #89: raw "scientific sensor" mode — disable every on-sensor pixel
+                                          * correction (BLC/DC-BLC/dither/OTP-DPC) when cameras are
+                                          * (re)configured. See X02C1B_raw_sensor in 0X02C1B.c */
 
 
 #define I2C_IRQ_PRIORITY 0

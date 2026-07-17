@@ -25,6 +25,41 @@ static const struct regval_list X02C1B_crop_1720[] = {
     {0x3809, X02C1B_CROP_WIDTH & 0xff},
 };
 
+/*
+ * #89 raw "scientific sensor" mode: strip every on-sensor pixel correction so
+ * the output is the bare ADC codes (analog gain/exposure are signal chain, not
+ * processing, and keep their per-camera values). Register basis: OX02C1B DS 1.0
+ * + OVT AE thread (see issue #89 for the full proposal table).
+ *
+ * Functional changes vs the base table:
+ *   0x4001 0x23 -> 0x00  BLC block off ([0] blc_en, [1] dc_blc_en, [5] dither).
+ *                        No OB-row servo subtraction: the raw per-channel
+ *                        pedestal (~255 DN @1x, ~495 DN @16x gain) stays in the
+ *                        data and eats headroom on high-gain cameras.
+ *   0x5000 0x34 -> 0x30  [2] OTP static defect-pixel correction off — the last
+ *                        pixel modifier still enabled in production; defect
+ *                        pixels become visible. [3] DPC, [1] WB, [0] pre-ISP
+ *                        were already 0; [5] ISP + [4] window stay 1 so output
+ *                        geometry/timing are unchanged.
+ * The rest re-asserts states the base table already establishes (test pattern
+ * off, digital gain 1x, ISP manual overrides off, AEC/AGC manual): runtime
+ * register writes survive OW_CAMERA_SET_CONFIG (it skips already-configured
+ * cameras), so the flag must guarantee the raw contract, not assume it.
+ * The base table always programs the corrected values, so clearing the flag
+ * and reconfiguring (after a camera power-cycle) reverts. Test patterns rewrite
+ * 0x5000 (X02C1B_set_test_pattern) — don't combine them with raw mode.
+ */
+static const struct regval_list X02C1B_raw_sensor[] = {
+    {0x4001, 0x00},  /* BLC / DC-BLC / dither off            (was 0x23) */
+    {0x5000, 0x30},  /* OTP DPC off; window + ISP kept       (was 0x34) */
+    {0x5100, 0x00},  /* assert: test patterns off */
+    {0x350a, 0x01},  /* assert: digital gain 1.000x */
+    {0x350b, 0x00},
+    {0x350c, 0x00},
+    {0x5006, 0x00},  /* assert: ISP manual-override paths disabled */
+    {0x3503, 0xa8},  /* assert: AEC + AGC manual */
+};
+
 static volatile _Bool ext_fsin_enabled = false;
 #define I2C_TIMEOUT 1000 // Set an appropriate timeout for I2C transactions
 
@@ -126,6 +161,16 @@ int X02C1B_configure_sensor(CameraDevice *cam) {
         }
         printf("Camera %d cropped to %ux1280 (right %u cols dropped)\r\n",
                cam->id+1, X02C1B_CROP_WIDTH, 1920u - X02C1B_CROP_WIDTH);
+    }
+
+    /* #89: optional raw "scientific sensor" mode — no on-sensor corrections. */
+    if ((logging_get_debug_flags() & DEBUG_FLAG_CAMERA_RAW) != 0u) {
+        ret = X02C1B_write_array(cam->pI2c, X02C1B_raw_sensor, ARRAY_SIZE(X02C1B_raw_sensor));
+        if (ret < 0) {
+            printf("Camera %d raw-mode override failed\r\n", cam->id+1);
+            return ret;
+        }
+        printf("Camera %d RAW mode: BLC/DC-BLC/dither/OTP-DPC off\r\n", cam->id+1);
     }
 
 	delay_ms(100);

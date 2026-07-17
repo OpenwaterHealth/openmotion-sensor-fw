@@ -181,6 +181,7 @@ All command and response traffic on the COMMS interface uses a fixed binary pack
 | 5 | `DEBUG_FLAG_CMD_VERBOSE` | Enable `printf` inside command handlers |
 | 6 | `DEBUG_FLAG_HISTO_CMP` | Send compressed histogram packets (`TYPE_HISTO_CMP`) |
 | 9 | `DEBUG_FLAG_CAMERA_CROP` | Crop camera output to 1720×1280 (drop rightmost 200 columns) when cameras are (re)configured — misaligned-optic test |
+| 10 | `DEBUG_FLAG_CAMERA_RAW` | Raw "scientific sensor" mode: disable all on-sensor pixel corrections (BLC, DC-BLC, dither, OTP DPC) when cameras are (re)configured. Pedestal becomes the raw per-channel offset (~255 DN @1×, ~495 DN @16×); not for production scans |
 
 ---
 
