@@ -208,9 +208,10 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 	return false;
 }
 
-/* Host-facing wrapper for the pin-drive NVCM boot probe (#91, factory
- * command OW_FACTORY_NVCM_BOOT). Read-only with respect to flash and cached
- * camera state: no SRAM write, no isProgrammed/isConfigured mutation — but
+/* Host-facing wrapper for the pin-drive NVCM boot probe (#91 — verdict byte
+ * appended to the OW_FACTORY_NVCM_CHECK blob). Read-only with respect to
+ * flash and cached camera state: no SRAM write, no isProgrammed/isConfigured
+ * mutation — but
  * it does reset the FPGA, so a previously SRAM-configured blank part is left
  * unconfigured until the next program_fpga(). Returns false (probe refused)
  * for an out-of-range index or an unpowered camera, whose floating pins
