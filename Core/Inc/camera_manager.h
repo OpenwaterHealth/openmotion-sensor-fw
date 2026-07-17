@@ -90,6 +90,7 @@ _Bool enter_sram_prog_fpga(uint8_t cam_id);
 _Bool exit_sram_prog_fpga(uint8_t cam_id);
 _Bool erase_sram_fpga(uint8_t cam_id);
 _Bool program_fpga(uint8_t cam_id, _Bool force_update);
+_Bool camera_nvcm_boot_probe(uint8_t cam_id, _Bool *booted);
 _Bool configure_camera_sensor(uint8_t cam_id);
 _Bool configure_camera_testpattern(uint8_t cam_id, uint8_t test_pattern);
 _Bool capture_single_histogram(uint8_t cam_id);

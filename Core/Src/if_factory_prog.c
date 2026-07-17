@@ -237,7 +237,8 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                      *  [6..9] status, [10..17] feature_row, [18..19] feabits,
                      *  [20..23] usercode, [24] boot_probe_done,
                      *  [25] boot_0x40_responds, [26] num_rows_read,
-                     *  [27..] rows(16B each) */
+                     *  [27..] rows(16B each),
+                     *  [27+16*rows] pin-drive boot verdict (#91, see below) */
                     uint16_t n = 0;
                     memcpy(&i2c_read_buf[n], nvcm_probe.idcode, 4);       n += 4;
                     i2c_read_buf[n++] = nvcm_probe.idcode_ok;
@@ -255,6 +256,25 @@ _Bool process_factory_command(UartPacket *response, UartPacket *cmd)
                         memcpy(&i2c_read_buf[n], nvcm_probe.nvcm_rows, rb);
                         n += rb;
                     }
+                    /* #91: append the behavioral pin-drive boot verdict so
+                     * this command answers the actual "is it programmed"
+                     * question (does a design boot?), which the register
+                     * reads above cannot — STATUS bit 19 only mirrors the
+                     * Done fuse (openmotion-test-app#44). Trailing byte:
+                     * 1 = NVCM design booted, 0 = no boot, 0xFF = probe
+                     * refused (camera not powered). Old hosts ignore the
+                     * extra byte; new hosts detect pre-#91 firmware by its
+                     * absence. */
+                    _Bool nvcm_booted = 0;
+                    if (camera_nvcm_boot_probe(_active_cam->id, &nvcm_booted))
+                    {
+                        i2c_read_buf[n++] = nvcm_booted ? 1 : 0;
+                    }
+                    else
+                    {
+                        i2c_read_buf[n++] = 0xFF;
+                    }
+
                     response->data_len = n;
                     response->data = i2c_read_buf;
                     break;

@@ -139,14 +139,18 @@ static bool camera_request_is_valid(uint8_t cam_id) {
 
 
 /**
- * Detect whether a CrossLink FPGA has been permanently programmed via NVCM.
+ * Detect whether a CrossLink FPGA boots a working design from NVCM.
  *
- * Method: enter forced slave config mode (activation key + CRESETB), read the
- * STATUS register Done bit.  Done=1 means NVCM was fully programmed (the Done
- * bit is the last step burned during NVCM programming and gates auto-boot).
+ * Method: release CRESETB without the activation key (auto-boot window),
+ * then check that the booted user design is driving this camera's bus
+ * clk/data pins low. This is behavioral — it detects a *bootable* image,
+ * not just a burned Done fuse: a part with the Done fuse programmed but a
+ * non-booting image correctly reads "no boot" here even though the 0x6C
+ * probe's STATUS bit 19 (the SDM Enable fuse mirror) reads "programmed"
+ * (openmotion-test-app#44, 2026-07-17).
  *
- * The slave I2C config port at 0x40 requires the activation key to become
- * active — without it, 0x40 never responds regardless of NVCM state.
+ * Leaves the design running (CRESETB high) when it booted, or the FPGA
+ * held in reset (CRESETB low, SRAM cleared) when it did not.
  */
 static bool fpga_detect_nvcm(CameraDevice *cam)
 {
@@ -202,6 +206,29 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
 	return false;
+}
+
+/* Host-facing wrapper for the pin-drive NVCM boot probe (#91 — verdict byte
+ * appended to the OW_FACTORY_NVCM_CHECK blob). Read-only with respect to
+ * flash and cached camera state: no SRAM write, no isProgrammed/isConfigured
+ * mutation — but
+ * it does reset the FPGA, so a previously SRAM-configured blank part is left
+ * unconfigured until the next program_fpga(). Returns false (probe refused)
+ * for an out-of-range index or an unpowered camera, whose floating pins
+ * would fake a "booted" reading. */
+_Bool camera_nvcm_boot_probe(uint8_t cam_id, _Bool *booted)
+{
+	if (cam_id >= CAMERA_COUNT || booted == NULL) {
+		return false;
+	}
+	CameraDevice *cam = &cam_array[cam_id];
+	if (!cam->isPowered) {
+		printf("C%d: NVCM boot probe refused - camera not powered\r\n",
+		       cam_id + 1);
+		return false;
+	}
+	*booted = fpga_detect_nvcm(cam);
+	return true;
 }
 
 static void init_camera(CameraDevice *cam){
