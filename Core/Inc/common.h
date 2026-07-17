@@ -34,6 +34,8 @@
 #define DEBUG_FLAG_SEND_DEFER (1u << 7)  /* #68: FSIN ISR only flips send_data_flag; main loop runs send_data() */
 #define DEBUG_FLAG_HISTO_STALL (1u << 8) /* #75: stop sending histogram frames after HISTO_STALL_TRIGGER_FRAMES;
                                           * cameras/SPI/USB stay alive — deterministic host-visible stall repro */
+#define DEBUG_FLAG_CAMERA_CROP (1u << 9) /* #86: crop camera output to 1720x1280 (drop right 200 columns) when
+                                          * cameras are (re)configured — misaligned-optic A/B test. See 0X02C1B.c */
 
 
 #define I2C_IRQ_PRIORITY 0

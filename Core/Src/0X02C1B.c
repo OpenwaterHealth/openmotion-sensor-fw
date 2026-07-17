@@ -6,8 +6,24 @@
  */
 #include "0X02C1B.h"
 #include "X02C1B_Sensor_Config.h"
+#include "logging.h"
 #include "utils.h"
 #include <stdio.h>
+
+/*
+ * #86 debug crop: shrink horizontal output from 1920 to 1720, dropping the
+ * rightmost 200 columns of the active region (misaligned-optic A/B test).
+ * The output window is left-anchored (ISP X offset 0x3811 = 8), so only
+ * X_OUTPUT_SIZE (0x3808/0x3809) changes: 0x0780 (1920) -> 0x06B8 (1720).
+ * Left edge, height (1280), framerate and line timing are all untouched.
+ * Applied after the base config table (which always programs 1920), so
+ * clearing DEBUG_FLAG_CAMERA_CROP and reconfiguring reverts to full frame.
+ */
+#define X02C1B_CROP_WIDTH 1720u
+static const struct regval_list X02C1B_crop_1720[] = {
+    {0x3808, (X02C1B_CROP_WIDTH >> 8) & 0xff},
+    {0x3809, X02C1B_CROP_WIDTH & 0xff},
+};
 
 static volatile _Bool ext_fsin_enabled = false;
 #define I2C_TIMEOUT 1000 // Set an appropriate timeout for I2C transactions
@@ -100,6 +116,17 @@ int X02C1B_configure_sensor(CameraDevice *cam) {
 		printf("Camera %d Failed to stop streaming\r\n", cam->id+1);
 		return ret;
 	}
+
+    /* #86: optional debug crop to 1720x1280 (drop rightmost 200 columns). */
+    if ((logging_get_debug_flags() & DEBUG_FLAG_CAMERA_CROP) != 0u) {
+        ret = X02C1B_write_array(cam->pI2c, X02C1B_crop_1720, ARRAY_SIZE(X02C1B_crop_1720));
+        if (ret < 0) {
+            printf("Camera %d crop override failed\r\n", cam->id+1);
+            return ret;
+        }
+        printf("Camera %d cropped to %ux1280 (right %u cols dropped)\r\n",
+               cam->id+1, X02C1B_CROP_WIDTH, 1920u - X02C1B_CROP_WIDTH);
+    }
 
 	delay_ms(100);
     return 0;
