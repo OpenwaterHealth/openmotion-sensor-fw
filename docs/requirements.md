@@ -241,6 +241,29 @@ All command and response traffic on the COMMS interface uses a fixed binary pack
 | `OW_CAMERA_POWER_OFF` | 0x51 | Remove power from camera(s) in `addr` mask; manages FSIN_EXT disable/re-enable around power transitions |
 | `OW_CAMERA_POWER_STATUS` | 0x52 | Return 1-byte bitmask of powered cameras (bit N = camera N powered) |
 | `OW_CAMERA_READ_SECURITY_UID` | 0x53 | Read 6-byte security UID from camera specified by `cmd.addr` (0–7) |
+| `OW_CAMERA_GET_TELEMETRY` | 0x54 | Return the cached 628-byte `cam_telemetry_response_t` snapshot (see Camera Telemetry below); no I2C in the handler |
+
+#### Camera Telemetry (#94)
+
+Firmware continuously sweeps every powered camera's condition registers in the
+background (`camera_telemetry_service()`, driven from `camera_i2c_service()`):
+supply rails AVDD/DOVDD/DVDD from the on-die voltage monitor, dual junction
+temperatures + cross-check alarm, voltage/charge-pump fault latches, watchdog
+fault roll-up + sensor state machine, OTP CRC status, MIPI frame counter,
+FSIN trigger-error flag, on-chip frame mean (Yavg), commanded vs applied
+exposure/gain, correction-state bytes (0x4001/0x5000/0x3503/0x3A93), and the
+eight applied BLC channel offsets.
+
+- One camera sweep (1 write + 22 burst reads, ~85 raw bytes) starts every
+  `CAM_TELEM_SWEEP_INTERVAL_MS` (125 ms), round-robin → ~1 s full-fleet
+  refresh; sweeps run in chunks of ≤6 transactions per main-loop pass.
+- Values are raw register bytes (MSB-first); the SDK converts to volts
+  (`code × 6/4096`), °C (8.8 format, >0xC000 negative), and gain factors.
+- A failed transaction aborts that sweep; the cache keeps the camera's last
+  completed snapshot (`updated_ms` reveals staleness, `i2c_err_count` counts
+  failures, `sweep_count` proves liveness).
+- Firmware prints a one-line notice when a camera's fault latches change
+  between sweeps.
 
 #### FSIN Management During Power Transitions
 

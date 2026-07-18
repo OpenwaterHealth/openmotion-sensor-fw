@@ -16,6 +16,7 @@
 #include "i2c_protocol.h"
 #include "ICM20948.h"
 #include "0X02C1B.h"
+#include "camera_telemetry.h"
 #include "histo_fake.h"
 #include "usbd_histo.h"
 #include "motion_config.h"
@@ -940,6 +941,16 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 				uartResp->data = (uint8_t *)&cam_temp; // Point to the static temp variable
 			}
 		}
+		break;
+	case OW_CAMERA_GET_TELEMETRY:
+		/* #94: background-collected per-camera condition snapshot (rails,
+		 * temps, faults, counters). No I2C here — returns the cache that
+		 * camera_telemetry_service() maintains from the main loop. */
+		VERBOSE_CMD("[CMD] OW_CAMERA_GET_TELEMETRY\r\n");
+		uartResp->command = OW_CAMERA_GET_TELEMETRY;
+		uartResp->packet_type = OW_RESP;
+		uartResp->data_len = sizeof(cam_telemetry_response_t);
+		uartResp->data = (uint8_t *)camera_telemetry_get();
 		break;
 	case OW_CAMERA_FSIN_EXTERNAL:
 		VERBOSE_CMD("[CMD] OW_CAMERA_FSIN_EXTERNAL reserved=%u (%s)\r\n", cmd.reserved, cmd.reserved == 0 ? "disable" : "enable");

@@ -163,6 +163,7 @@ typedef enum {
 	OW_CAMERA_POWER_OFF = 0x51,
 	OW_CAMERA_POWER_STATUS = 0x52,
 	OW_CAMERA_READ_SECURITY_UID = 0x53,
+	OW_CAMERA_GET_TELEMETRY = 0x54,  /* #94: cached cam_telemetry_response_t snapshot (camera_telemetry.h) */
 
 } MotionCameraCommands;
 

@@ -9,6 +9,7 @@
 #include "logging.h"
 #include "crosslink.h"
 #include "0X02C1B.h"
+#include "camera_telemetry.h"
 #include "i2c_master.h"
 #include "uart_comms.h"
 #include "utils.h"
@@ -1301,6 +1302,11 @@ void camera_i2c_service(void)
     }
 
     camera_recovery_tick();  /* Re-power dead cameras whose cool-off elapsed */
+
+    /* #94: advance the background telemetry sweep by one bounded chunk.
+     * Unlike the temp poll it self-schedules on HAL_GetTick(), so telemetry
+     * keeps refreshing while idle (no frames driving cam_temp_poll_due). */
+    camera_telemetry_service();
 }
 /* -------- END CAMERA I2C FUNCTIONS -------- */
 
