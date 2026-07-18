@@ -33,7 +33,6 @@
  * masking reserved bits — mask/convert host-side. */
 typedef struct __attribute__((packed)) {
 	uint32_t updated_ms;     /* HAL_GetTick() at sweep completion; 0 = never swept */
-	uint32_t frame_counter;  /* 0x4900-0x4903, MIPI SOF count (byte order verified on HW via increment check) */
 	uint32_t dgain_cmd;      /* 0x350A-0x350C raw bytes (b0<<16|b1<<8|b2); 14-bit gain/1024 packed per DS */
 	uint16_t avdd_raw;       /* 0x4E20/21 — V = (raw & 0xFFF) * 6 / 4096 */
 	uint16_t dovdd_raw;      /* 0x4E22/23 */
@@ -41,7 +40,9 @@ typedef struct __attribute__((packed)) {
 	uint16_t tpm_avg_raw;    /* 0x4D2A/2B — 8.8 °C, >0xC000 = negative (see X02C1B_read_temp) */
 	uint16_t tpm0_raw;       /* 0x4D56/57 */
 	uint16_t tpm1_raw;       /* 0x4D58/59 */
-	uint16_t tc_row;         /* 0x3890/91 — timing-counter row readback */
+	uint16_t tc_row;         /* 0x3892/93 — LIVE timing-counter row readback (bench-verified moving
+	                          * while streaming; 0x3890/91 read constant 0). Nonzero/changing =
+	                          * the sensor is actually scanning rows. */
 	uint16_t expo_cmd;       /* 0x3501/02 — commanded coarse exposure (rows) */
 	uint16_t expo_applied;   /* 0x350E/0F — applied coarse exposure (rows) */
 	uint16_t again_cmd;      /* 0x3508/09 — commanded analog gain, code/16 = x */
@@ -68,16 +69,27 @@ typedef struct __attribute__((packed)) {
 	uint8_t  sweep_count;    /* completed sweeps (wraps) — liveness/staleness check */
 } cam_telemetry_t;
 
+/* NOTE on frame counting: the OX02C1B's documented "32-bit frame counter"
+ * (DS §10.5.25) has NO readable value register in the DS 1.0 SCCB map —
+ * 0x4900-0x4903 are the FC *control* bytes (bench-verified static 08 00 00 81
+ * while streaming) and the value is only emitted via embedded-data rows. The
+ * frames-triggered ground truth here is therefore firmware-side: the FSIN
+ * pulse counter in the response header below. */
 typedef struct __attribute__((packed)) {
 	uint8_t version;      /* = CAM_TELEMETRY_VERSION */
 	uint8_t valid_mask;   /* bit n: camera n has >=1 completed sweep (never cleared; check updated_ms for staleness) */
 	uint8_t struct_size;  /* = sizeof(cam_telemetry_t), parser sanity check */
 	uint8_t reserved;
+	uint32_t fsin_pulse_count;  /* firmware FSIN pulse counter (u16 zero-extended), sampled at query
+	                             * time. Counts EXTERNAL FSIN edges (EXTI pin 13) — i.e. console-driven
+	                             * scan frames. The internal TIM4 FSIN generator does NOT increment it
+	                             * (bench-verified 2026-07-17). */
+	uint32_t uptime_ms;         /* HAL_GetTick() at query time — reference for the per-camera updated_ms staleness */
 	cam_telemetry_t cam[CAMERA_COUNT];
 } cam_telemetry_response_t;
 
-_Static_assert(sizeof(cam_telemetry_t) == 78u, "cam_telemetry_t wire size changed - bump CAM_TELEMETRY_VERSION and fix the SDK parser");
-_Static_assert(sizeof(cam_telemetry_response_t) == 4u + 8u * 78u, "cam_telemetry_response_t wire size changed");
+_Static_assert(sizeof(cam_telemetry_t) == 74u, "cam_telemetry_t wire size changed - bump CAM_TELEMETRY_VERSION and fix the SDK parser");
+_Static_assert(sizeof(cam_telemetry_response_t) == 12u + 8u * 74u, "cam_telemetry_response_t wire size changed");
 
 /* Advance the background sweep by one bounded chunk (<= ~1.3 ms of I2C).
  * Call from camera_i2c_service() only: hi2c1 work must stay in the main

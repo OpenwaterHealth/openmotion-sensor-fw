@@ -45,8 +45,7 @@ static const struct telem_op telem_ops[] = {
 	{ 0x4F0Au, 6u },  /* watchdog 0x4F0A-0x4F0F */
 	{ 0x0108u, 1u },  /* sc_state */
 	{ 0x3DA7u, 2u },  /* OTP CRC status */
-	{ 0x4900u, 4u },  /* frame counter (MIPI SOF) */
-	{ 0x3890u, 2u },  /* timing-counter row readback */
+	{ 0x3892u, 2u },  /* LIVE row counter (0x3890/91 are constant-0; bench-verified) */
 	{ 0x3897u, 1u },  /* trigger-mode error flags */
 	{ 0x4C13u, 1u },  /* Yavg on-chip frame mean */
 	{ 0x3501u, 2u },  /* commanded coarse exposure */
@@ -61,7 +60,12 @@ static const struct telem_op telem_ops[] = {
 	{ 0x4072u, 30u }, /* applied BLC offsets ch0-7 ({MSB,LSB} at stride 4) */
 };
 #define TELEM_N_OPS (sizeof(telem_ops) / sizeof(telem_ops[0]))
-#define TELEM_RAW_BYTES 85u
+#define TELEM_RAW_BYTES 81u
+
+/* Firmware-side FSIN pulse counter (main.c, incremented per frame trigger):
+ * the frames-triggered ground truth for the response header — the sensor's
+ * own frame counter has no readable SCCB value register (see header note). */
+extern volatile uint16_t pulse_count;
 
 static cam_telemetry_response_t telem_resp = {
 	.version = CAM_TELEMETRY_VERSION,
@@ -81,6 +85,8 @@ static uint8_t  telem_staging[TELEM_RAW_BYTES];
 
 const cam_telemetry_response_t *camera_telemetry_get(void)
 {
+	telem_resp.fsin_pulse_count = (uint32_t)pulse_count;
+	telem_resp.uptime_ms = HAL_GetTick();
 	return &telem_resp;
 }
 
@@ -143,8 +149,6 @@ static void telem_publish(uint8_t cam_id, uint32_t now)
 	t->sc_state = rd8(&p);
 	t->otp_crc[0] = rd8(&p);
 	t->otp_crc[1] = rd8(&p);
-	t->frame_counter = ((uint32_t)rd16(&p) << 16);
-	t->frame_counter |= rd16(&p);
 	t->tc_row = rd16(&p);
 	t->trig_error = rd8(&p);
 	t->yavg = rd8(&p);

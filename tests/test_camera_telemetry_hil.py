@@ -11,8 +11,12 @@ the fleet (~1 s round-robin), then validates the cached snapshot end to end:
 - correction-state bytes match the production table (0x4001=0x23, 0x5000=0x34,
   AEC/AGC manual 0xA8) and commanded analog gain matches the per-slot ladder
 - sweeps stay live (sweep_count advances between polls)
-- the MIPI frame counter increases after single-histogram captures and by a
-  sane amount — this also pins down the 0x4900-03 byte order on real silicon
+- during a ~3 s stream_on + internal-FSIN burst, sweeps observe the probe
+  camera actually producing frames: sc_state reads 0x9 (streaming) and the
+  live row counter (0x3892) moves between fresh sweeps. (The sensor's own
+  "frame counter" has no readable SCCB value register on this silicon, and
+  the firmware's fsin_pulse_count counts external/console FSIN edges only —
+  both bench-verified 2026-07-17.)
 
 Requires the SDK with MotionSensor.get_camera_telemetry() (openmotion-sdk#...,
 same change series as fw PR for #94); skips with a clear message on older SDKs.
@@ -177,10 +181,10 @@ def test_camera_telemetry_snapshot(interface):
             if c["aec_mode"] != AEC_AGC_MANUAL:
                 failures.append(
                     f"[{side}] cam {cam_id}: AEC mode 0x{c['aec_mode']:02X} != 0xA8")
-            if c["again_cmd"] >> 4 != EXPECTED_GAIN[cam_id]:
+            if c["again_x"] != float(EXPECTED_GAIN[cam_id]):
                 failures.append(
-                    f"[{side}] cam {cam_id}: analog gain 0x{c['again_cmd']:04X} "
-                    f"!= expected 0x{EXPECTED_GAIN[cam_id]:02X}<<4")
+                    f"[{side}] cam {cam_id}: analog gain {c['again_x']}x "
+                    f"(raw 0x{c['again_cmd']:04X}) != expected {EXPECTED_GAIN[cam_id]}x")
             if c["expo_cmd"] != EXPECTED_EXPO_ROWS:
                 failures.append(
                     f"[{side}] cam {cam_id}: commanded exposure 0x{c['expo_cmd']:04X} "
@@ -197,23 +201,47 @@ def test_camera_telemetry_snapshot(interface):
         if ((second - first) & 0xFF) == 0:
             failures.append(f"[{side}] cam {probe_cam}: sweep_count stuck at {first}")
 
-        # Frame counter: a few single captures must nudge it by a small amount.
-        # Also pins the 0x4900-03 byte order (a swapped assembly would jump by
-        # ~2^24 per frame and fail the delta bound).
-        fc_before = sensor.get_camera_telemetry()["cameras"][probe_cam]["frame_counter"]
-        for _ in range(3):
-            sensor.camera_capture_histogram(1 << probe_cam)
-            time.sleep(0.1)
-        time.sleep(FLEET_REFRESH_S)
-        fc_after = sensor.get_camera_telemetry()["cameras"][probe_cam]["frame_counter"]
-        delta = (fc_after - fc_before) & 0xFFFFFFFF
-        print(f"frame_counter cam {probe_cam}: {fc_before} -> {fc_after} (delta {delta})")
-        if delta == 0:
+        # Frames-flowing proof: stream the probe camera with internal FSIN for
+        # ~3 s and let the background sweep observe it mid-burst. Fresh sweeps
+        # must show sc_state 0x9 (streaming) and a moving live row counter.
+        # No histogram stream is enabled, so no SPI/USB reception is armed
+        # (no endpoint wedge). fsin_pulse_count is external-FSIN-only, so it
+        # is printed for information, not asserted, in this internal-FSIN run.
+        from omotion.config import OW_CAMERA, OW_CAMERA_ON, OW_CAMERA_OFF
+
+        pc_before = sensor.get_camera_telemetry()["fsin_pulse_count"]
+        sensor.switch_camera(probe_cam)
+        sensor._send(packetType=OW_CAMERA, command=OW_CAMERA_ON)
+        sensor.enable_aggregator_fsin()
+        samples = []
+        t_end = time.monotonic() + 3.2
+        while time.monotonic() < t_end:
+            time.sleep(0.4)
+            c = sensor.get_camera_telemetry()["cameras"][probe_cam]
+            samples.append((c["updated_ms"], c["tc_row"], c["sc_state"]))
+        sensor.disable_aggregator_fsin()
+        sensor._send(packetType=OW_CAMERA, command=OW_CAMERA_OFF)
+        pc_after = sensor.get_camera_telemetry()["fsin_pulse_count"]
+
+        fresh = {}
+        for upd, tc, sc in samples:
+            fresh[upd] = (tc, sc)
+        print(f"burst sweeps for cam {probe_cam}: "
+              f"{[(u, t, hex(s)) for u, (t, s) in sorted(fresh.items())]} "
+              f"(ext-FSIN pulse count {pc_before} -> {pc_after})")
+        if len(fresh) < 2:
             failures.append(
-                f"[{side}] cam {probe_cam}: frame counter did not advance after captures")
-        elif delta > 1000:
-            failures.append(
-                f"[{side}] cam {probe_cam}: frame counter delta {delta} implausible "
-                f"(byte order?)")
+                f"[{side}] only {len(fresh)} fresh sweep(s) during 3 s burst")
+        else:
+            tc_vals = [t for t, _ in fresh.values()]
+            sc_vals = [s for _, s in fresh.values()]
+            if 0x9 not in sc_vals:
+                failures.append(
+                    f"[{side}] cam {probe_cam} never seen in streaming state "
+                    f"(sc_states {[hex(s) for s in sc_vals]})")
+            if len(set(tc_vals)) < 2:
+                failures.append(
+                    f"[{side}] cam {probe_cam} live row counter frozen at "
+                    f"{tc_vals[0]} across {len(tc_vals)} mid-stream sweeps")
 
     assert not failures, "telemetry failures:\n  " + "\n  ".join(failures)
