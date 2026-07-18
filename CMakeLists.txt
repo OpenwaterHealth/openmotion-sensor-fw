@@ -123,6 +123,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     USB/Class/IMU/Src/usbd_imu.c
     Core/Src/0X02C1B.c
     Core/Src/camera_manager.c
+    Core/Src/camera_telemetry.c
     Core/Src/crosslink.c
     Core/Src/histo_fake.c
     Core/Src/i2c_protocol.c
