@@ -2,7 +2,7 @@
 
 At startup the firmware brings up each camera one at a time and verifies
 that every expected I2C device responds: the TCA9548A mux (0x70), the
-ICM-20948 IMU (0x68), and all 8 cameras (OV2312 0x36) + 8 FPGAs
+ICM-20948 IMU (0x68), and all 8 cameras (OX02C1B 0x36) + 8 FPGAs
 (CrossLink 0x40) behind the mux. The result is cached and queryable over
 OW_CMD_I2C_STATUS (SDK: MotionSensor.get_i2c_health()).
 

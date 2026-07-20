@@ -22,7 +22,7 @@ extern IWDG_HandleTypeDef hiwdg1;
 
 #define MUX_I2C_ADDR        0x70u  /* TCA9548A */
 #define IMU_I2C_ADDR        0x68u  /* ICM-20948, AD0=0 */
-#define CAM_SENSOR_I2C_ADDR 0x36u  /* OV2312 */
+#define CAM_SENSOR_I2C_ADDR 0x36u  /* OX02C1B */
 
 /* HAL_I2C_IsDeviceReady tuning: a couple of trials, short bounded timeout so a
  * missing/wedged device can't stall the boot scan. */
@@ -39,7 +39,7 @@ static bool ping(uint8_t addr7)
 }
 
 /*
- * Probe one camera slot.  The OV2312 (0x36) and the CrossLink config port
+ * Probe one camera slot.  The OX02C1B (0x36) and the CrossLink config port
  * (0x40) are reachable in MUTUALLY-EXCLUSIVE FPGA states, so each is checked in
  * its own state within a single power cycle:
  *   - FPGA: rail on with CRESETB held low (forced slave-config) + activation
