@@ -854,9 +854,7 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 			if (cmd.data_len != 1 || cmd.data[0] == 0) {
 				VERBOSE_CMD("Invalid image mode payload\r\n");
 				uartResp->packet_type = OW_ERROR;
-				break;
-			}
-			if (!camera_image_mode_enter(cmd.data[0])) {
+			} else if (!camera_image_mode_enter(cmd.data[0])) {
 				uartResp->packet_type = OW_ERROR;
 			}
 		} else {
