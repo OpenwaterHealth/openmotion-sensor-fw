@@ -1874,8 +1874,15 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
    * Any error on a known camera USART is recoverable via abort+restart. */
   if (cam_id >= 0)
   {
-    abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    if (camera_image_mode_active((uint8_t)cam_id)) {
+      /* Image mode: recover to a fresh 2408-B line and count the loss --
+       * re-arming the 4100-B histogram reception here would wedge the
+       * line stream. */
+      camera_image_link_error((uint8_t)cam_id);
+    } else {
+      abort_data_reception((uint8_t)cam_id);
+      start_data_reception((uint8_t)cam_id);
+    }
     return;
   }
 
@@ -1982,8 +1989,15 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
    * Now any error on a known camera SPI triggers abort+restart instead. */
   if (cam_id >= 0)
   {
-    abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    if (camera_image_mode_active((uint8_t)cam_id)) {
+      /* Image mode: recover to a fresh 2408-B line and count the loss --
+       * re-arming the 4100-B histogram reception here would wedge the
+       * line stream. */
+      camera_image_link_error((uint8_t)cam_id);
+    } else {
+      abort_data_reception((uint8_t)cam_id);
+      start_data_reception((uint8_t)cam_id);
+    }
     return;
   }
 
@@ -2001,43 +2015,28 @@ void set_event_bit_atomic(uint32_t bit) {
 // Interrupt handler for SPI reception
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
-  if (hspi->Instance == SPI2)
-  {
-    set_event_bit_atomic(BIT_6);
-  }
-  else if (hspi->Instance == SPI3)
-  {
-    set_event_bit_atomic(BIT_5);
-  }
-  else if (hspi->Instance == SPI4)
-  {
-    set_event_bit_atomic(BIT_7);
-  }
-  else if (hspi->Instance == SPI6)
-  {
-    set_event_bit_atomic(BIT_1);
-  }
+  int8_t cam_id = -1;
+  if (hspi->Instance == SPI2)      { cam_id = 6; }
+  else if (hspi->Instance == SPI3) { cam_id = 5; }
+  else if (hspi->Instance == SPI4) { cam_id = 7; }
+  else if (hspi->Instance == SPI6) { cam_id = 1; }
+  if (cam_id < 0) { return; }
+  /* Drip-scan image mode: this completion is a 2408-B image line, not a
+   * histogram frame -- forwarded + re-armed by the image path. */
+  if (camera_image_mode_rx((uint8_t)cam_id)) { return; }
+  set_event_bit_atomic(1u << cam_id);
 }
 
 void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)
 {
-  if (husart->Instance == USART1)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_4);
-  }
-  else if (husart->Instance == USART2)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_0);
-  }
-  else if (husart->Instance == USART3)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_2);
-  }
-  else if (husart->Instance == USART6)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_3);
-  }
-
+  int8_t cam_id = -1;
+  if (husart->Instance == USART1)      { cam_id = 4; }
+  else if (husart->Instance == USART2) { cam_id = 0; }
+  else if (husart->Instance == USART3) { cam_id = 2; }
+  else if (husart->Instance == USART6) { cam_id = 3; }
+  if (cam_id < 0) { return; }
+  if (camera_image_mode_rx((uint8_t)cam_id)) { return; }
+  set_event_bit_atomic(1u << cam_id);
 }
 
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)

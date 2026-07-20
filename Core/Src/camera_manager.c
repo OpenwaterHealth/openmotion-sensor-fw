@@ -2467,6 +2467,97 @@ void camera_image_get_status(image_mode_resp_t *out)
 		out->gap_count[i] = image_gap_count[i];
 	}
 }
+
+/* Called from HAL_SPI_RxCpltCallback / HAL_USART_RxCpltCallback (main.c).
+ * Returns true when the completion belonged to the image path (the caller
+ * must then NOT set the histogram event bit). Builds the 2424-B USB envelope
+ * IN PLACE around the just-DMA'd line and queues it on the HISTO endpoint,
+ * then pends the LPTIM5 software IRQ to re-arm this camera's DMA.
+ *
+ * Buffer reuse is safe immediately: USBD_HISTO_SendData COPIES the packet
+ * before returning (memcpy into histo_tx_buffer on the direct path /
+ * histo_queue_buffers[slot] on the queued path -- usbd_histo.c).
+ *
+ * ISR budget: header/trailer writes + util_crc16 over 2420 B (~20-40 us at
+ * 480 MHz) + SendData's 2424-B copy. No printf (hot path).
+ *
+ * NOTE: DEBUG_FLAG_HISTO_THROTTLE / DEBUG_FLAG_HISTO_SPARSE act inside
+ * USBD_HISTO_SendData and would silently swallow image lines -- do not run
+ * image mode with those flags set (documented in CLAUDE.md). */
+bool camera_image_mode_rx(uint8_t cam_id)
+{
+	if (!camera_image_mode_active(cam_id)) {
+		return false;
+	}
+	CameraDevice *cam = &cam_array[cam_id];
+	uint8_t *pkt = cam->pRecieveHistoBuffer;
+	uint32_t ts = get_timestamp_ms(); /* same TIM5 timebase as histogram frames */
+	int offset = 0;
+
+	pkt[offset++] = HISTO_SOF;
+	pkt[offset++] = TYPE_IMAGE;
+	pkt[offset++] = (uint8_t)(IMAGE_PKT_TOTAL_SIZE & 0xFF);
+	pkt[offset++] = (uint8_t)((IMAGE_PKT_TOTAL_SIZE >> 8) & 0xFF);
+	pkt[offset++] = (uint8_t)((IMAGE_PKT_TOTAL_SIZE >> 16) & 0xFF);
+	pkt[offset++] = (uint8_t)((IMAGE_PKT_TOTAL_SIZE >> 24) & 0xFF);
+	pkt[offset++] = (uint8_t)(ts & 0xFF);
+	pkt[offset++] = (uint8_t)((ts >> 8) & 0xFF);
+	pkt[offset++] = (uint8_t)((ts >> 16) & 0xFF);
+	pkt[offset++] = (uint8_t)((ts >> 24) & 0xFF);
+	pkt[offset++] = HISTO_SOH;
+	pkt[offset++] = cam_id;
+	/* pkt[12..2419] = the 2408-B line, already DMA'd in place. */
+	offset += IMAGE_LINE_SIZE;
+	pkt[offset++] = HISTO_EOH;
+	/* Same CRC span quirk as send_histogram_data(): SOF through the last
+	 * payload byte, EXCLUDING the EOH just written (offset-1 bytes). */
+	uint16_t crc = util_crc16(pkt, offset - 1);
+	pkt[offset++] = (uint8_t)(crc & 0xFF);
+	pkt[offset++] = (uint8_t)((crc >> 8) & 0xFF);
+	pkt[offset++] = HISTO_EOF;
+
+	if (USBD_HISTO_SendData(&hUsbDeviceHS, pkt, IMAGE_PKT_TOTAL_SIZE, 0) != USBD_OK) {
+		image_gap_count[cam_id]++; /* dropped line -- host sees the gap, retries the sweep */
+	}
+
+	image_rearm_pending |= (uint8_t)(1u << cam_id);
+	NVIC_SetPendingIRQ(LPTIM5_IRQn); /* re-arm fires after this ISR returns */
+	return true;
+}
+
+/* HAL error-callback recovery while in image mode (main.c routes here
+ * instead of the histogram abort+start pair): recover to a fresh 2408-B line
+ * reception and count the lost line. Runs in ISR context -- the same context
+ * the histogram path already runs abort+restart from. */
+void camera_image_link_error(uint8_t cam_id)
+{
+	image_gap_count[cam_id]++;
+	abort_data_reception(cam_id);
+	(void)camera_image_arm(cam_id);
+}
+
+/* Body of the LPTIM5 software IRQ (stm32h7xx_it.c). Drains the pending mask
+ * in a loop so a camera pended DURING this service is not lost. */
+void camera_image_rearm_service(void)
+{
+	for (;;) {
+		uint8_t pending;
+		__disable_irq();
+		pending = image_rearm_pending;
+		image_rearm_pending = 0;
+		__enable_irq();
+		if (pending == 0u || !image_mode_on) {
+			return;
+		}
+		for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+			if ((pending & (1u << i)) != 0u) {
+				if (!camera_image_arm(i)) {
+					image_gap_count[i]++; /* arm failed; timeout service retries */
+				}
+			}
+		}
+	}
+}
 /* -------- END DRIP-SCAN IMAGE MODE -------- */
 
 _Bool enable_camera_stream(uint8_t cam_id){
