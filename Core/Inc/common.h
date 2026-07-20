@@ -19,6 +19,22 @@
 #define SPI_PACKET_LENGTH 4100
 #define USART_PACKET_LENGTH 4100
 
+/* --- Drip-scan image mode (camera-fpga#8) ---------------------------------
+ * One packed RAW10 image line as pushed by the FPGA in sweep mode:
+ *   [0]=magic 0xB6, [1]=format version 0x01, [2]=line[7:0],
+ *   [3]={flags[3:0],line[11:8]} (flag bit0 = overrun since sweep start),
+ *   [4]=frame_cnt[7:0], [5]=reserved 0x00,
+ *   [6..2405]=2400 B packed RAW10 (4 px -> 5 B, 40-bit LE groups, low byte
+ *   first), [2406..2407]=CRC-16/CCITT-FALSE over bytes 0..2405 (same
+ *   algorithm as util_crc16: poly 0x1021, init 0xFFFF, MSB-first).
+ * The MCU forwards these 2408 bytes BLIND -- the host verifies the line CRC;
+ * only the DMA length here depends on the layout. */
+#define IMAGE_LINE_SIZE 2408
+/* Stream type byte for image-line packets on the HISTO USB endpoint
+ * (envelope byte[1]; TYPE_HISTO / TYPE_HISTO_CMP live in camera_manager.h).
+ * Must equal the SDK's OW_IMAGE_PACKET (omotion/config.py). */
+#define TYPE_IMAGE 0x03
+
 #define verbose_on false
 
 /* Camera temperature polling cadence (one camera sampled per interval). */
@@ -54,6 +70,13 @@
 #define DMA_IRQ_PRIORITY 0
 #define FSIN_IRQ_PRIORITY 2
 #define USB_IRQ_PRIORITY 0
+
+/* Drip-scan deferred DMA re-arm (software-pended LPTIM5 vector). MUST stay
+ * numerically ABOVE every camera link/DMA priority so the pend taken inside
+ * a RxCplt callback fires only after that ISR -- and the HAL driver's
+ * completion bookkeeping, which on USART sets State=READY only AFTER the
+ * callback -- has finished. */
+#define IMAGE_REARM_IRQ_PRIORITY 7
 
 // #define TIM8_BRK_TIM12_IRQ_PRIORITY 0
 // #define TIM8_TRG_COM_TIM14_IRQ_PRIORITY 0
@@ -164,6 +187,10 @@ typedef enum {
 	OW_CAMERA_POWER_STATUS = 0x52,
 	OW_CAMERA_READ_SECURITY_UID = 0x53,
 	OW_CAMERA_GET_TELEMETRY = 0x54,  /* #94: cached cam_telemetry_response_t snapshot (camera_telemetry.h) */
+	OW_CAMERA_IMAGE_MODE = 0x30,  /* drip-scan (camera-fpga#8): reserved = enable 0/1,
+	                               * data[0] = camera bitmask. Response = image_mode_resp_t.
+	                               * (0x30 also appears as OW_IMU_INIT, but that lives in the
+	                               * OW_IMU packet-type namespace -- dispatch is per type.) */
 
 } MotionCameraCommands;
 

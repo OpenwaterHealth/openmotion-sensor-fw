@@ -74,6 +74,19 @@ typedef struct {
  * transport-level CRC that only covers the compressed bytes. */
 #define HISTO_CMP_UNCMP_CRC_SIZE 2
 
+/* --- Drip-scan image mode (camera-fpga#8) ---------------------------------
+ * USB envelope for one image line, built IN PLACE around the DMA'd line in
+ * the camera's existing receive buffer:
+ *   [0]=HISTO_SOF [1]=TYPE_IMAGE [2..5]=total_size LE [6..9]=timestamp LE
+ *   [10]=HISTO_SOH [11]=cam_id [12..2419]=IMAGE_LINE_SIZE line bytes
+ *   [2420]=HISTO_EOH [2421..2422]=CRC-16 LE [2423]=HISTO_EOF
+ * Envelope CRC = util_crc16 over bytes [0..2419] -- mirrors
+ * send_histogram_data(), which computes util_crc16(packet_buffer, offset-1),
+ * i.e. SOF through the last payload byte EXCLUDING the final EOH. Quirk kept
+ * deliberately so the SDK's existing envelope-CRC convention applies. */
+#define IMAGE_PKT_LINE_OFFSET (HISTO_HEADER_SIZE + 4 + 2)                                  /* 12 */
+#define IMAGE_PKT_TOTAL_SIZE  (IMAGE_PKT_LINE_OFFSET + IMAGE_LINE_SIZE + 1 + HISTO_TRAILER_SIZE) /* 2424 */
+
 
 void init_camera_sensors(void);
 CameraDevice* get_active_cam(void);
