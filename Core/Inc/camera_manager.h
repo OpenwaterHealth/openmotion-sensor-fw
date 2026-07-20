@@ -149,6 +149,29 @@ _Bool disable_camera_power(uint8_t cam_id);
 _Bool get_camera_power_status(uint8_t cam_id);
 void power_off_all_cameras(void);
 
+/* --- Drip-scan image mode (camera-fpga#8) --------------------------------- */
+/* Wire response for OW_CAMERA_IMAGE_MODE. Fixed packed layout returned
+ * verbatim (same convention as cam_diag_stats_t above) -- do not reorder
+ * fields without an SDK-side parser change. */
+typedef struct __attribute__((packed)) {
+	uint8_t  active;                  /* 1 = image mode currently active */
+	uint8_t  mask;                    /* camera bitmask in image mode (0 when inactive) */
+	uint8_t  reserved[2];
+	uint32_t gap_count[CAMERA_COUNT]; /* per-camera lost-line events since the last enter:
+	                                   * line timeouts + USB send drops + link-error
+	                                   * recoveries. The host retries missing lines via the
+	                                   * FPGA sweep-start-line register. */
+} image_mode_resp_t;                  /* 36 B */
+
+_Bool camera_image_mode_enter(uint8_t mask);
+_Bool camera_image_mode_exit(void);
+bool  camera_image_mode_active(uint8_t cam_id); /* cam is in the active image mask */
+bool  camera_image_mode_rx(uint8_t cam_id);     /* HAL RxCplt hook; true = consumed by image path */
+void  camera_image_link_error(uint8_t cam_id);  /* HAL error-callback recovery while in image mode */
+void  camera_image_rearm_service(void);         /* LPTIM5 software-IRQ body: deferred DMA re-arm */
+void  camera_image_service(void);               /* main-loop line-timeout tick (~2 ms) */
+void  camera_image_get_status(image_mode_resp_t *out);
+
 void Camera_USART_RxCpltCallback_Handler(USART_HandleTypeDef *husart);
 void Camera_SPI_RxCpltCallback_Handler(SPI_HandleTypeDef *hspi);
 uint32_t read_status_fpga(uint8_t cam_id);

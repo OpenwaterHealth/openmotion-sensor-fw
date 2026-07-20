@@ -46,6 +46,15 @@ static int _active_cam_idx = 0;
 
 static volatile bool usb_failed = false;
 
+/* Drip-scan (camera-fpga#8): set true on image-mode exit; send_data() consumes
+ * + discards the next histogram frame. The FPGA's first post-sweep histogram
+ * integrates counts across the whole image session (the existing feature/5
+ * first-frame-garbage caveat), so it must never reach the host as data. Hosts
+ * may keep their own discard as belt-and-braces. Declared here (ahead of
+ * send_data()) so the read there precedes the definition site in the
+ * image-mode block; only ever set true by camera_image_mode_exit(). */
+static volatile bool histo_discard_next = false;
+
 __ALIGN_BEGIN volatile uint8_t frame_buffer[1][CAMERA_COUNT * HISTOGRAM_DATA_SIZE] __ALIGN_END; // Double buffer
 __ALIGN_BEGIN uint8_t packet_buffer[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;
 __ALIGN_BEGIN uint8_t uncmp_payload[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;  // Staging buffer for compression
@@ -1565,7 +1574,16 @@ _Bool send_data(void) {
 	
 	// Check for camera failures before clearing event_bits
 	check_camera_failures();
-	
+
+	/* Drip-scan: the first histogram frame after image-mode exit integrates
+	 * the whole image session (feature/5 first-frame-garbage caveat) --
+	 * consume the event bits + re-arm WITHOUT sending, exactly like the #75
+	 * stall repro's suppress path. One frame only. */
+	if (histo_discard_next) {
+		histo_discard_next = false;
+		return histo_stall_suppress_frame();
+	}
+
 	bool success = false;
 	uint32_t dflags = logging_get_debug_flags();
 	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
@@ -2236,6 +2254,220 @@ _Bool abort_data_reception(uint8_t cam_id){
 	if(verbose_on) { printf("done\r\n"); }
 	return true;
 }
+
+/* -------- BEGIN DRIP-SCAN IMAGE MODE (camera-fpga#8) -------- */
+/* Data-paced full-frame line receive (design spec 4.4). While active:
+ *  - Histogram streaming is SUSPENDED: event_bits_enabled is saved + zeroed,
+ *    so the FSIN ISR's send path goes quiet (send_histogram_data() returns
+ *    immediately when event_bits_enabled == 0). check_streaming() will close
+ *    the host-visible scan out after its 150 ms timeout -- its "Scan
+ *    finished" print shortly after image-mode entry is expected.
+ *  - Each masked camera runs a repeating 2408-B one-shot DMA into its
+ *    EXISTING receive buffer at offset IMAGE_PKT_LINE_OFFSET, so the USB
+ *    envelope is built in place around the line (zero copy). The buffers
+ *    already satisfy every DMA constraint -- cam 1 = spi6_buffer in SRAM4
+ *    for BDMA; D-cache is never enabled in this firmware -- because they are
+ *    the very buffers the histogram path DMAs into today.
+ *  - Pacing is the DATA, not FSIN: the FPGA pushes a line whenever its sweep
+ *    buffer fills. camera_image_mode_rx() (RxCplt context) forwards the line
+ *    and pends the LPTIM5 software IRQ (IMAGE_REARM_IRQ_PRIORITY, below all
+ *    camera link/DMA IRQs) which re-arms the DMA the instant the completing
+ *    ISR returns. The deferral is REQUIRED for the four USART cameras: the
+ *    H7 HAL calls HAL_USART_RxCpltCallback BEFORE setting State=READY
+ *    (USART_DMAReceiveCplt, stm32h7xx_hal_usart.c), so an in-callback
+ *    HAL_USART_Receive_DMA is rejected with HAL_BUSY and the driver would
+ *    then stomp the state under a live DMA. SPI sets READY before its
+ *    callback and would tolerate an inline re-arm, but both link types share
+ *    the one deferred path.
+ *  - camera_image_service() (main loop, HAL_GetTick) aborts + re-arms a
+ *    camera whose PARTIAL line made no byte progress for >2 ms (USART
+ *    byte-slip resync, spec risk table) and counts a gap.
+ */
+static volatile bool     image_mode_on = false;
+static volatile uint8_t  image_mode_mask = 0x00;
+static uint8_t           image_saved_event_enabled = 0x00;
+static volatile uint8_t  image_rearm_pending = 0x00;
+static volatile uint32_t image_gap_count[CAMERA_COUNT] = {0};
+/* Line-timeout progress tracking (camera_image_service, main loop only). */
+static uint32_t image_last_ndtr[CAMERA_COUNT];
+static uint32_t image_last_progress_tick[CAMERA_COUNT];
+/* histo_discard_next is defined near the top of this file (before send_data(),
+ * which reads it) so its declaration precedes that use; it is set true only on
+ * image-mode exit below. */
+
+#define IMAGE_LINE_TIMEOUT_MS 3u /* spec target ~2 ms; HAL_GetTick has 1 ms
+                                  * granularity, so >=3 ticks guarantees more
+                                  * than 2 ms of real mid-line silence */
+
+bool camera_image_mode_active(uint8_t cam_id)
+{
+	return image_mode_on && ((image_mode_mask & (1u << cam_id)) != 0u);
+}
+
+/* Arm (or re-arm) one camera's 2408-B line DMA at the in-place envelope
+ * offset. Returns true when a reception is armed after this call --
+ * including the already-armed case, which happens when an error-callback
+ * recovery re-armed the camera before the deferred LPTIM5 re-arm ran. */
+static _Bool camera_image_arm(uint8_t cam_id)
+{
+	CameraDevice *cam = &cam_array[cam_id];
+	uint8_t *dst = cam->pRecieveHistoBuffer + IMAGE_PKT_LINE_OFFSET;
+	HAL_StatusTypeDef status;
+
+	if (!image_mode_on) {
+		return false;
+	}
+	if (!cam->useDma) {
+		/* All 8 cameras are DMA (init_camera_sensors). IT-mode per-byte
+		 * interrupts at ~3.5 MB/s would be ~1.4M IRQ/s -- unsupported. */
+		return false;
+	}
+	if (cam->useUsart) {
+		if (cam->pUart->State == HAL_USART_STATE_BUSY_RX ||
+		    cam->pUart->State == HAL_USART_STATE_BUSY_TX_RX) {
+			return true; /* already armed */
+		}
+		status = HAL_USART_Receive_DMA(cam->pUart, dst, IMAGE_LINE_SIZE);
+	} else {
+		if (cam->pSpi->State == HAL_SPI_STATE_BUSY_RX ||
+		    cam->pSpi->State == HAL_SPI_STATE_BUSY_TX_RX) {
+			return true; /* already armed */
+		}
+		status = HAL_SPI_Receive_DMA(cam->pSpi, dst, IMAGE_LINE_SIZE);
+	}
+	return status == HAL_OK;
+}
+
+_Bool camera_image_mode_enter(uint8_t mask)
+{
+	if (image_mode_on) {
+		printf("Image mode already active\r\n");
+		return false;
+	}
+	if (mask == 0u) {
+		return false;
+	}
+	if ((logging_get_debug_flags() & DEBUG_FLAG_FAKE_DATA) != 0u) {
+		printf("Image mode refused: DEBUG_FLAG_FAKE_DATA active\r\n");
+		return false;
+	}
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		if ((mask & (1u << i)) != 0u && !camera_request_is_valid(i)) {
+			printf("Image mode refused: camera %d invalid\r\n", i + 1);
+			return false;
+		}
+	}
+
+	/* Suspend histogram streaming (see block comment). Non-masked cameras
+	 * that were streaming keep their armed 4100-B DMA; it completes at most
+	 * once more (nothing re-arms it while enables are zeroed) and is
+	 * re-armed on exit. */
+	__disable_irq();
+	image_saved_event_enabled = event_bits_enabled;
+	event_bits_enabled = 0x00;
+	event_bits = 0x00;
+	__enable_irq();
+
+	/* Drop queued histogram frames so the host's image reader starts clean
+	 * (same hygiene as the OW_CAMERA_STREAM enable path). */
+	USBD_HISTO_FlushQueue("image-enter");
+
+	/* Software re-arm IRQ: LPTIM5's vector is borrowed as a pure software
+	 * interrupt (the LPTIM5 peripheral is never clocked); the handler in
+	 * stm32h7xx_it.c calls camera_image_rearm_service(). */
+	HAL_NVIC_SetPriority(LPTIM5_IRQn, IMAGE_REARM_IRQ_PRIORITY, 0);
+	HAL_NVIC_EnableIRQ(LPTIM5_IRQn);
+
+	uint32_t now = HAL_GetTick();
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		image_gap_count[i] = 0;
+		image_last_ndtr[i] = IMAGE_LINE_SIZE;
+		image_last_progress_tick[i] = now;
+	}
+	image_rearm_pending = 0x00;
+	image_mode_mask = mask;
+	image_mode_on = true; /* BEFORE arming, so RxCplt/error callbacks route image-side */
+
+	_Bool ok = true;
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		if ((mask & (1u << i)) == 0u) {
+			continue;
+		}
+		abort_data_reception(i); /* kill any in-flight 4100-B histogram DMA */
+		memset((uint8_t *)cam_array[i].pRecieveHistoBuffer, 0, IMAGE_PKT_TOTAL_SIZE);
+		if (!camera_image_arm(i)) {
+			printf("Image mode: failed to arm camera %d\r\n", i + 1);
+			ok = false;
+		}
+	}
+	if (!ok) {
+		camera_image_mode_exit();
+		return false;
+	}
+	printf("Image mode ON mask=0x%02X\r\n", mask);
+	return true;
+}
+
+_Bool camera_image_mode_exit(void)
+{
+	if (!image_mode_on) {
+		return true; /* idempotent, like disable_camera_stream on a stopped camera --
+		              * also lets the host re-read final gap counters via a second
+		              * disable command */
+	}
+	uint8_t mask = image_mode_mask;
+	uint8_t restore = image_saved_event_enabled;
+
+	image_mode_on = false; /* stop RxCplt routing + deferred re-arms first */
+	image_mode_mask = 0x00;
+	image_rearm_pending = 0x00;
+
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		uint8_t bit = (uint8_t)(1u << i);
+		if (((mask | restore) & bit) == 0u) {
+			continue;
+		}
+		/* Masked cams: abort the image DMA. Previously-streaming cams: abort
+		 * the stale histogram DMA left from suspension. */
+		abort_data_reception(i);
+		/* #172 hygiene, same as enable_camera_stream(): never leave stale
+		 * bytes where the next scan's first frame could ship them. */
+		if (cam_array[i].pRecieveHistoBuffer != NULL) {
+			memset((uint8_t *)cam_array[i].pRecieveHistoBuffer, 0,
+			       cam_array[i].useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+		}
+		if ((restore & bit) != 0u) {
+			start_data_reception(i); /* restore the 4100-B histogram arming */
+		}
+	}
+
+	__disable_irq();
+	event_bits = 0x00;
+	event_bits_enabled = restore;
+	__enable_irq();
+	image_saved_event_enabled = 0x00;
+	if (restore != 0u) {
+		histo_discard_next = true; /* consumed by send_data() */
+	}
+	/* Drop any image lines still queued so they can't bleed into the
+	 * histogram stream (same convention as the scan-stop flush). The host
+	 * exits image mode only after it has collected or given up on lines. */
+	USBD_HISTO_FlushQueue("image-exit");
+	printf("Image mode OFF\r\n");
+	return true;
+}
+
+void camera_image_get_status(image_mode_resp_t *out)
+{
+	out->active = image_mode_on ? 1u : 0u;
+	out->mask = image_mode_mask;
+	out->reserved[0] = 0;
+	out->reserved[1] = 0;
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		out->gap_count[i] = image_gap_count[i];
+	}
+}
+/* -------- END DRIP-SCAN IMAGE MODE -------- */
 
 _Bool enable_camera_stream(uint8_t cam_id){
 	// printf("C%d: enable...", cam_id+1);
