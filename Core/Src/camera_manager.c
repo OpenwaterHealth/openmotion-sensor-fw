@@ -1174,7 +1174,7 @@ static void poll_camera_temperatures(void)
                     {
                         /* Keep last-known-good on failed reads: read_temp
                          * returns a negative error code on I2C failure, and
-                         * a live OV2312 die never legitimately reads <= 0 °C
+                         * a live OX02C1B die never legitimately reads <= 0 °C
                          * (self-heating), so treat non-positive as failure. */
                         float t = X02C1B_read_temp(pCam);
                         if (t > 0.0f) {
@@ -1251,7 +1251,7 @@ static void camera_death_isolate(uint8_t cam_id)
 }
 
 /* Re-power a dead camera's rail once its cool-off has elapsed, keeping
- * CRESETB low: the FPGA stays unbooted and quiet, while the OV2312 (direct
+ * CRESETB low: the FPGA stays unbooted and quiet, while the OX02C1B (direct
  * I2C behind the mux) comes back up so temperature telemetry resumes.
  * needs_recovery stays set until program_fpga() completes the real
  * bring-up at the next scan. Main-loop only. */
@@ -1471,7 +1471,7 @@ static void check_camera_failures(void) {
 						/* Mark dead via needs_recovery — NOT isPresent, which keeps
 						 * the presence determination from scan start. The likely
 						 * cause is the camera PCB's power regulator hitting thermal
-						 * shutdown (kills both FPGA and OV2312), so the camera
+						 * shutdown (kills both FPGA and OX02C1B), so the camera
 						 * needs a timed rail cycle, done from the main loop. */
 						cam_array[cam_id].needs_recovery = true;
 						printf("Camera %d has stopped posting data\r\n", cam_id + 1);

@@ -1,7 +1,7 @@
 """HIL: configure all cameras, then read back each camera's analog-gain
 register and verify it matches the per-position gain the firmware writes.
 
-The OV2312 image sensor lives at I2C 0x36; its analog-gain register is 0x3508
+The OX02C1B image sensor lives at I2C 0x36; its analog-gain register is 0x3508
 (16-bit register address). During camera_configure_registers(), the firmware
 (X02C1B_configure_sensor in Core/Src/0X02C1B.c) writes the default config table
 and then overrides 0x3508 with a per-position gain by camera id:
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 CONNECT_TIMEOUT_S = 15.0
 
 OV2312_ADDR = 0x36
-GAIN_REG = 0x3508            # OV2312 analog gain, 16-bit register address
+GAIN_REG = 0x3508            # OX02C1B analog gain, 16-bit register address
 IMU_ADDR = 0x68             # ICM20948, on the main bus (not behind the mux)
 IMU_WHOAMI_REG = 0x00
 IMU_WHOAMI_EXPECTED = 0xEA
@@ -71,7 +71,7 @@ def interface():
 
 
 def _present_cameras(sensor):
-    """0-based positions whose OV2312 responded; fall back to all 8."""
+    """0-based positions whose OX02C1B responded; fall back to all 8."""
     try:
         health = sensor.get_i2c_health(rescan=True)
         cams = health.get("cameras") if isinstance(health, dict) else None
