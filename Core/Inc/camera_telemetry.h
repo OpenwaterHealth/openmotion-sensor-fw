@@ -8,7 +8,8 @@
  * OW_CAMERA_GET_TELEMETRY.
  *
  * Register basis: OX02C1S/OX02C1B DS 1.0 — voltage monitor §10.5.24/table
- * A-39, temperature §10.5.23, watchdog table A-40, frame counter §10.5.25.
+ * A-39, temperature §10.5.23, watchdog table A-40, frame counter §10.5.25,
+ * BLC / optical-black table A-25 (§3.5).
  * All values are returned as RAW register bytes assembled MSB-first; the SDK
  * owns conversion to engineering units (V = code*6/4096, °C = 8.8 format
  * with the >0xC000 negative rule, gains /16 and /1024).
@@ -26,7 +27,7 @@
 
 /* Wire-format version. Bump on ANY field change and update the SDK parser
  * (omotion/MotionSensor.py get_camera_telemetry()) in the same change. */
-#define CAM_TELEMETRY_VERSION 1u
+#define CAM_TELEMETRY_VERSION 2u
 
 /* Per-camera snapshot. Packed, little-endian (returned verbatim over COMMS).
  * "raw" fields hold the sensor's register bytes assembled MSB-first without
@@ -67,6 +68,41 @@ typedef struct __attribute__((packed)) {
 	uint8_t  isp_ctrl;       /* 0x5000 — 0x34 production / 0x30 raw mode (#89) */
 	uint8_t  i2c_err_count;  /* failed sweep transactions for this camera (saturating) */
 	uint8_t  sweep_count;    /* completed sweeps (wraps) — liveness/staleness check */
+
+	/* --- #103: optical-black / black-level block (DS table A-25) -------
+	 * The dark-row measurements plus the window/target/trigger context
+	 * that produced them — an average is not interpretable without
+	 * knowing which rows it averaged and what the servo was aiming at.
+	 * NOTE: the BLC servo only runs when 0x4001[0] blc_en is set. In raw
+	 * mode (#89 writes 0x4001 = 0x00) the offsets below are frozen at
+	 * whatever the servo last computed. */
+	uint16_t z_avg[4];        /* 0x40E0-0x40E7 — zero-line (dark row) averages for
+	                           * Bayer positions 00/01/10/11, 15-bit ({[6:0],[7:0]}).
+	                           * Mono sensor: all four sample the same physical dark
+	                           * rows, so they should agree; spread is a health metric. */
+	uint16_t blc_offset_z[4]; /* 0x40CD-0x40D4 — BLCoffset10000..10011, the second
+	                           * applied-offset bank (blc_offset[8] above is the first) */
+	uint16_t blc_thres;       /* 0x4061/62 — thres_l, the computed sample-discard
+	                           * threshold row averaging applies (0x4028[5] thres_en) */
+	uint16_t blk_lvl_target;  /* 0x4004/05 — blk_lvl_target_l, servo target pedestal
+	                           * (11-bit; base config programs 0x080 = 128) */
+	uint16_t zero_ln_num;     /* 0x4065/66 — zero_ln_num, zero-line count (10-bit) */
+	uint8_t  blc_trig_ctrl;   /* 0x4000 — [7] off_trig [6] exp_chg [5] gain_chg
+	                           * [4] fmt_chg [3] rst [2] man_trig [1] freeze [0] always */
+	uint8_t  bl_start;        /* 0x4008[5:0] — black-row window first row */
+	uint8_t  bl_end;          /* 0x4009[5:0] — black-row window last row */
+	uint8_t  blk_ln_num;      /* 0x4019 — black-row count */
+	uint8_t  blc_ln_mode;     /* 0x401A — [7] h_size_man_en [2] ln_num_man [1:0] byp_mode */
+	uint8_t  zl_start;        /* 0x4050 — zero-line window first row */
+	uint8_t  zl_end;          /* 0x4051 — zero-line window last row */
+	uint8_t  zavg_ctrl;       /* 0x40E8 — [5] dither_zbline_en [4] zl_win2_en
+	                           * [3] zl_off_en [2] zl_cal_dis [1:0] z_avg_sel */
+	uint8_t  zl_start2;       /* 0x40EA — second zero-line window first row */
+	uint8_t  zl_end2;         /* 0x40EB — second zero-line window last row */
+	uint8_t  blc_fault_latch; /* 0x40F1 — BLC fault_latch (mask at 0x40F0, default 0xFC) */
+	uint8_t  blc_fault_state; /* 0x40F2[0] — BLC fault_state */
+	uint8_t  dig_test_fail;   /* 0x40B3 — dig_test_fail_cnt_l, digital-test-row mismatches */
+	uint8_t  dtr_fault;       /* 0x40F8 — [1] dtr_fault_latched [0] dtr_fault_stat */
 } cam_telemetry_t;
 
 /* NOTE on frame counting: the OX02C1B's documented "32-bit frame counter"
@@ -88,8 +124,8 @@ typedef struct __attribute__((packed)) {
 	cam_telemetry_t cam[CAMERA_COUNT];
 } cam_telemetry_response_t;
 
-_Static_assert(sizeof(cam_telemetry_t) == 74u, "cam_telemetry_t wire size changed - bump CAM_TELEMETRY_VERSION and fix the SDK parser");
-_Static_assert(sizeof(cam_telemetry_response_t) == 12u + 8u * 74u, "cam_telemetry_response_t wire size changed");
+_Static_assert(sizeof(cam_telemetry_t) == 110u, "cam_telemetry_t wire size changed - bump CAM_TELEMETRY_VERSION and fix the SDK parser");
+_Static_assert(sizeof(cam_telemetry_response_t) == 12u + 8u * 110u, "cam_telemetry_response_t wire size changed");
 
 /* Advance the background sweep by one bounded chunk (<= ~1.3 ms of I2C).
  * Call from camera_i2c_service() only: hi2c1 work must stay in the main
