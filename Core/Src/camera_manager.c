@@ -2558,6 +2558,56 @@ void camera_image_rearm_service(void)
 		}
 	}
 }
+/* Main-loop line-timeout tick (wired next to camera_i2c_service() in
+ * main.c). Deadline clock is HAL_GetTick(), NOT get_timestamp_ms() -- the
+ * TIM5 timestamp wraps at ~11.93 h and is documented (utils.c, #73) as
+ * unsafe for deadlines.
+ *
+ * Progress probe: the DMA remaining-transfer count, via
+ * __HAL_DMA_GET_COUNTER -- which reads NDTR for DMA streams and CNDTR for
+ * BDMA channels (stm32h7xx_hal_dma.h), so cam 1's SPI6/BDMA path needs no
+ * special case. Semantics:
+ *   remaining == IMAGE_LINE_SIZE  -> no line in flight (idle between sweeps
+ *                                    / FPGA not pushing) -- NOT a fault.
+ *   remaining == 0                -> transfer complete, callback/re-arm
+ *                                    pending -- NOT a fault.
+ *   0 < remaining < IMAGE_LINE_SIZE, unchanged >2 ms -> a stalled PARTIAL
+ *     line (mid-line byte slip on a USART link, spec risk table): abort,
+ *     re-arm, count a gap. The host retries via the sweep start line. */
+void camera_image_service(void)
+{
+	if (!image_mode_on) {
+		return;
+	}
+	uint32_t now = HAL_GetTick();
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		if ((image_mode_mask & (1u << i)) == 0u) {
+			continue;
+		}
+		CameraDevice *cam = &cam_array[i];
+		DMA_HandleTypeDef *hdma = cam->useUsart ? cam->pUart->hdmarx : cam->pSpi->hdmarx;
+		if (hdma == NULL) {
+			continue;
+		}
+		uint32_t remaining = __HAL_DMA_GET_COUNTER(hdma);
+		if (remaining != image_last_ndtr[i]) {
+			image_last_ndtr[i] = remaining;
+			image_last_progress_tick[i] = now;
+			continue;
+		}
+		if (remaining == IMAGE_LINE_SIZE || remaining == 0u) {
+			image_last_progress_tick[i] = now;
+			continue;
+		}
+		if ((now - image_last_progress_tick[i]) >= IMAGE_LINE_TIMEOUT_MS) {
+			image_gap_count[i]++;
+			abort_data_reception(i);
+			(void)camera_image_arm(i); /* on failure the next pass retries */
+			image_last_ndtr[i] = IMAGE_LINE_SIZE;
+			image_last_progress_tick[i] = now;
+		}
+	}
+}
 /* -------- END DRIP-SCAN IMAGE MODE -------- */
 
 _Bool enable_camera_stream(uint8_t cam_id){

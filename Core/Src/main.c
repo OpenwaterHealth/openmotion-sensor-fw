@@ -472,6 +472,7 @@ int main(void)
   	comms_host_check_received(); // check comms
     imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
     camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
+    camera_image_service();  /* Drip-scan: per-camera image line timeout (no-op unless image mode is on) */
     logging_pump();          /* Flush USB log data buffered from ISR context */
     check_streaming();
     poll_mcu_temperature();  /* Print warning if MCU junction temp above threshold */
