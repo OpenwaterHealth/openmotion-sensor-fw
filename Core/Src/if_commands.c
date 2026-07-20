@@ -36,6 +36,7 @@ extern volatile uint8_t event_bits_enabled;
 
 static uint32_t id_words[4] = {0};  /* 3 UID words + 1 zero-pad: HWID reply is 16B, so [3] would over-read 4B past the array */
 static uint8_t camera_status[8] = {0};
+static image_mode_resp_t image_mode_resp; /* OW_CAMERA_IMAGE_MODE reply buffer */
 static uint8_t i2c_reg_read_buf[I2C_REG_READ_MAX_LEN] = {0};
 static uint8_t camera_power_status = 0;
 static float cam_temp;
@@ -836,6 +837,36 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 	        	}
 	        }
 	    }
+		break;
+	case OW_CAMERA_IMAGE_MODE:
+		/* Drip-scan (camera-fpga#8): reserved = enable 0/1, data[0] = camera
+		 * bitmask (enable only). Host sequencing: enable cameras/streaming
+		 * first if a live sweep is wanted, enable image mode, THEN put the
+		 * FPGA into sweep mode via I2C (0x5A CTRL); reverse order on the way
+		 * out. Response is image_mode_resp_t either way -- the disable reply
+		 * carries the final per-camera gap tally, and a repeated disable is
+		 * an idempotent success that re-reads it. */
+		VERBOSE_CMD("[CMD] OW_CAMERA_IMAGE_MODE reserved=%u len=%u\r\n",
+		            cmd.reserved, (unsigned)cmd.data_len);
+		uartResp->command = OW_CAMERA_IMAGE_MODE;
+		uartResp->packet_type = OW_RESP;
+		if (cmd.reserved == 1) {
+			if (cmd.data_len != 1 || cmd.data[0] == 0) {
+				VERBOSE_CMD("Invalid image mode payload\r\n");
+				uartResp->packet_type = OW_ERROR;
+				break;
+			}
+			if (!camera_image_mode_enter(cmd.data[0])) {
+				uartResp->packet_type = OW_ERROR;
+			}
+		} else {
+			if (!camera_image_mode_exit()) {
+				uartResp->packet_type = OW_ERROR;
+			}
+		}
+		camera_image_get_status(&image_mode_resp);
+		uartResp->data_len = sizeof(image_mode_resp);
+		uartResp->data = (uint8_t *)&image_mode_resp;
 		break;
 	case OW_CAMERA_OFF:
 		VERBOSE_CMD("[CMD] OW_CAMERA_OFF\r\n");
