@@ -150,10 +150,27 @@ def sensor():
 
 
 def _bring_up(sensor):
-    """Power -> FPGA -> configure, the production bring-up sequence."""
+    """Power -> FPGA (FORCED) -> configure.
+
+    Bench finding: the fleet cameras are NVCM-programmed, so the stock
+    (non-forced) program path detects NVCM and silently skips the SRAM load,
+    leaving the burned production image running. OW_FPGA_PROG_SRAM with
+    reserved=2 (#68 hunk, firmware fe3f64e+) forces the flash-resident
+    bitstream into SRAM (~10 s per camera)."""
+    from omotion.config import OW_FPGA, OW_FPGA_PROG_SRAM
+    from omotion.MotionSensor import _ERROR_TYPES
+
     assert sensor.enable_camera_power(CAM_MASK) is True
     time.sleep(0.5)
-    assert sensor.program_fpga(camera_position=CAM_MASK, manual_process=False) is True
+    # ONE CAMERA PER COMMAND: each force blocks the MCU main loop ~10.5 s;
+    # a multi-camera mask in a single command blocks >20 s and stalls the
+    # COMMS USB endpoint (bench-reproduced twice). Per-camera is also the
+    # fleet-validated pattern (smoke_test.py / feature/5 RUNBOOK).
+    for cam in CAMS:
+        r = sensor._send(packetType=OW_FPGA, command=OW_FPGA_PROG_SRAM,
+                         addr=(1 << cam), reserved=2, timeout=120)
+        assert r is not None and r.packetType not in _ERROR_TYPES, (
+            f"forced SRAM load failed on cam {cam}")
     time.sleep(0.1)
     assert sensor.camera_configure_registers(CAM_MASK) is True
 
