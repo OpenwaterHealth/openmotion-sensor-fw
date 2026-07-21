@@ -1,15 +1,22 @@
-"""HIL: continuous camera-sensor telemetry (#94, OW_CAMERA_GET_TELEMETRY).
+"""HIL: continuous camera-sensor telemetry (#94 + OB block #103).
 
 Brings up every present camera, lets the firmware's background sweep refresh
 the fleet (~1 s round-robin), then validates the cached snapshot end to end:
 
-- response framing: version 1, struct_size 78, valid bit per powered camera
+- response framing: version 2, struct_size 110, valid bit per powered camera
 - supply rails from the on-die voltage monitor sit inside the alarm windows
   the config table programs (AVDD [2.52, 3.08] V etc., V = code * 6 / 4096)
 - die temperatures are plausible (10-95 degC) and TPM cross-check alarm clear
 - no camera sits in safe mode (sc_state 5); no VM/watchdog fault latched
 - correction-state bytes match the production table (0x4001=0x23, 0x5000=0x34,
   AEC/AGC manual 0xA8) and commanded analog gain matches the per-slot ladder
+- the optical-black block's window/target/trigger context matches what the
+  config table programs (#103), and the dark-row averages track while the
+  sensor scans rows. Baselined on the left sensor 2026-07-20: z_avg reads 0
+  at idle, ~7790 LSB (/64 = 121.7 DN) while streaming, with Bayer positions
+  10/11 ~60 LSB above 00/01. blc_thres (2047), blc_fault_latch (0xFF with
+  fault_state 0) and dtr_fault (1) are configuration signatures, not faults —
+  same lesson as the watchdog bytes — so they are printed, never asserted.
 - sweeps stay live (sweep_count advances between polls)
 - during a ~3 s stream_on + internal-FSIN burst, sweeps observe the probe
   camera actually producing frames: sc_state reads 0x9 (streaming) and the
@@ -62,6 +69,18 @@ PRODUCTION_ISP_CTRL = 0x34   # 0x5000 (raw mode #89 would read 0x30)
 AEC_AGC_MANUAL = 0xA8        # 0x3503
 EXPECTED_EXPO_ROWS = 0x0048  # 72 rows = 648 us (config table)
 SC_STATE_SAFE_MODE = 0x5
+
+# OB / black-level context the config table programs (#103). These are what
+# X02C1B_SENSOR_CONFIG writes, so a mismatch means the applied config drifted
+# — unlike the dark-row averages, they are safe to assert on the first run.
+EXPECTED_OB_CONTEXT = {
+    "blc_trig_ctrl": 0xF9,     # 0x4000
+    "blk_lvl_target": 0x080,   # 0x4004/05 — servo target pedestal 128
+    "bl_start": 0x04,          # 0x4008 — black-row window
+    "bl_end": 0x1B,            # 0x4009
+    "zl_start": 0x02,          # 0x4050 — zero-line window feeding z_avg
+    "zl_end": 0x0D,            # 0x4051
+}
 
 
 @pytest.fixture
@@ -132,7 +151,7 @@ def test_camera_telemetry_snapshot(interface):
 
         telem = sensor.get_camera_telemetry()
         assert telem is not None, f"[{side}] get_camera_telemetry returned None"
-        assert telem["version"] == 1, f"[{side}] unexpected telemetry version"
+        assert telem["version"] == 2, f"[{side}] unexpected telemetry version"
 
         print(f"\n=== Sensor [{side}] camera telemetry ===")
         print(f"{'cam':>3} | {'AVDD':>6} {'DOVDD':>6} {'DVDD':>6} | "
@@ -193,6 +212,43 @@ def test_camera_telemetry_snapshot(interface):
                 failures.append(
                     f"[{side}] cam {cam_id}: {c['i2c_err_count']} sweep I2C errors")
 
+            # OB block (#103): the window/target/trigger context is programmed
+            # by the config table, so assert it. The dark-row averages and the
+            # BLC fault byte have no bench baseline yet — report only.
+            for key, expected in EXPECTED_OB_CONTEXT.items():
+                if c[key] != expected:
+                    failures.append(
+                        f"[{side}] cam {cam_id}: {key} 0x{c[key]:02X} != "
+                        f"config-table 0x{expected:02X}")
+
+        # --- OB / black-level report (#103) -------------------------------
+        # z_avg_00/01/10/11 are the zero-line (dark row) averages per Bayer
+        # position. Mono sensor: all four sample the same physical dark rows,
+        # so spread should be ~0 and the mean is the dark pedestal. Printed
+        # for baselining; only structural context above is asserted.
+        print(f"\n--- Sensor [{side}] optical-black block ---")
+        print(f"{'cam':>3} | {'z_avg 00/01/10/11':>27} | {'mean':>7} {'spr':>4} | "
+              f"{'target':>6} | {'thres':>5} | {'blcflt':>6} | {'BLCoff_z':>19}")
+        print("-" * 96)
+        for cam_id in present:
+            c = telem["cameras"][cam_id]
+            if not c["valid"]:
+                continue
+            z = "/".join(f"{v:6d}" for v in c["z_avg"])
+            offz = "/".join(f"{v:4d}" for v in c["blc_offsets_z"])
+            print(f"{cam_id:>3} | {z:>27} | {c['z_avg_mean']:7.1f} "
+                  f"{c['z_avg_spread']:4d} | {c['blk_lvl_target']:6d} | "
+                  f"{c['blc_thres']:5d} | {c['blc_fault_latch']:02X}/"
+                  f"{c['blc_fault_state']:01X}  | {offz:>19}")
+        print(f"    zero-line window rows {telem['cameras'][present[0]]['zl_start']}"
+              f"-{telem['cameras'][present[0]]['zl_end']}, "
+              f"black-row window {telem['cameras'][present[0]]['bl_start']}"
+              f"-{telem['cameras'][present[0]]['bl_end']}, "
+              f"z_avg_sel={telem['cameras'][present[0]]['z_avg_sel']}, "
+              f"dtr_fault/dig_test_fail="
+              f"{telem['cameras'][present[0]]['dtr_fault']}/"
+              f"{telem['cameras'][present[0]]['dig_test_fail']}")
+
         # Liveness: sweeps keep advancing.
         probe_cam = present[0]
         first = telem["cameras"][probe_cam]["sweep_count"]
@@ -218,23 +274,53 @@ def test_camera_telemetry_snapshot(interface):
         while time.monotonic() < t_end:
             time.sleep(0.4)
             c = sensor.get_camera_telemetry()["cameras"][probe_cam]
-            samples.append((c["updated_ms"], c["tc_row"], c["sc_state"]))
+            samples.append((c["updated_ms"], c["tc_row"], c["sc_state"],
+                            tuple(c["z_avg"])))
         sensor.disable_aggregator_fsin()
         sensor._send(packetType=OW_CAMERA, command=OW_CAMERA_OFF)
         pc_after = sensor.get_camera_telemetry()["fsin_pulse_count"]
 
         fresh = {}
-        for upd, tc, sc in samples:
-            fresh[upd] = (tc, sc)
+        for upd, tc, sc, z in samples:
+            fresh[upd] = (tc, sc, z)
         print(f"burst sweeps for cam {probe_cam}: "
-              f"{[(u, t, hex(s)) for u, (t, s) in sorted(fresh.items())]} "
+              f"{[(u, t, hex(s)) for u, (t, s, _) in sorted(fresh.items())]} "
               f"(ext-FSIN pulse count {pc_before} -> {pc_after})")
+        # OB dark rows (#103). Bench-established 2026-07-20: z_avg reads 0 at
+        # idle and populates while the sensor scans rows, so a streaming sweep
+        # with an all-zero z_avg means the statistic stopped tracking.
+        z_seq = [z for _, (_, _, z) in sorted(fresh.items())]
+        streaming_z = [z for _, (_, sc, z) in sorted(fresh.items()) if sc == 0x9]
+        print(f"  z_avg across burst sweeps: {z_seq}")
+        print(f"  z_avg while streaming: {streaming_z}")
+        if streaming_z:
+            for z in streaming_z:
+                if not any(z):
+                    failures.append(
+                        f"[{side}] cam {probe_cam}: z_avg all-zero on a "
+                        f"streaming sweep (dark-row statistic not tracking)")
+                    break
+            else:
+                # Row-parity split: positions 10/11 run ~60 LSB above 00/01 on
+                # every camera measured. Assert only the loose envelope — this
+                # is one bench, one sensor.
+                splits = [((z[2] + z[3]) - (z[0] + z[1])) / 2.0 for z in streaming_z]
+                dn = [sum(z) / 4.0 / 64.0 for z in streaming_z]   # 6 fractional bits
+                print(f"  row-parity split (10/11 - 00/01): "
+                      f"{[round(s, 1) for s in splits]} LSB; "
+                      f"dark level {[round(d, 1) for d in dn]} DN")
+                if max(abs(s) for s in splits) > 200:
+                    failures.append(
+                        f"[{side}] cam {probe_cam}: z_avg row-parity split "
+                        f"{max(splits):.0f} LSB far above the ~60 LSB baseline")
+        else:
+            print("  (no streaming sweep captured; z_avg checks skipped)")
         if len(fresh) < 2:
             failures.append(
                 f"[{side}] only {len(fresh)} fresh sweep(s) during 3 s burst")
         else:
-            tc_vals = [t for t, _ in fresh.values()]
-            sc_vals = [s for _, s in fresh.values()]
+            tc_vals = [t for t, _, _ in fresh.values()]
+            sc_vals = [s for _, s, _ in fresh.values()]
             if 0x9 not in sc_vals:
                 failures.append(
                     f"[{side}] cam {probe_cam} never seen in streaming state "
