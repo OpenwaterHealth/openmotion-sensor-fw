@@ -474,6 +474,7 @@ int main(void)
     camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
     logging_pump();          /* Flush USB log data buffered from ISR context */
     check_streaming();
+    USBD_HISTO_CheckTxStuck(); /* Recover the HISTO EP if an armed transfer stalls (dead host reader) */
     poll_mcu_temperature();  /* Print warning if MCU junction temp above threshold */
     USB_RecoveryCheck();     /* EFT/lock-up watchdog: rebuild USB stack if bus goes dead */
     system_monitor_poll();   /* ECC report drain + DMA error-flag scan */
