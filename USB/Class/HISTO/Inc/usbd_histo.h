@@ -29,6 +29,12 @@ uint8_t  USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t l
 void USBD_HISTO_TxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum);
 void USBD_HISTO_FlushQueue(const char *who);
 
+/* Stuck-TX watchdog -- call from the main loop. Recovers the HISTO IN
+ * endpoint when an armed multi-packet transfer stops making progress
+ * (host reader died mid-transfer), which otherwise wedges the endpoint
+ * until a power cycle. No-op unless a transfer is armed and stalled. */
+void USBD_HISTO_CheckTxStuck(void);
+
 #ifdef __cplusplus
 }
 #endif
