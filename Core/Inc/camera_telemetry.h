@@ -73,13 +73,24 @@ typedef struct __attribute__((packed)) {
 	 * The dark-row measurements plus the window/target/trigger context
 	 * that produced them — an average is not interpretable without
 	 * knowing which rows it averaged and what the servo was aiming at.
-	 * NOTE: the BLC servo only runs when 0x4001[0] blc_en is set. In raw
-	 * mode (#89 writes 0x4001 = 0x00) the offsets below are frozen at
-	 * whatever the servo last computed. */
+	 *
+	 * Bench-established 2026-07-20 (left sensor, all 8 cameras):
+	 *  - z_avg and blc_offset* update ONLY while the sensor is scanning
+	 *    rows. Idle (sc_state 6) they read 0; they populate within one
+	 *    sweep of stream-on. Judge them against sc_state, not updated_ms.
+	 *  - They are NOT gated by 0x4001[0] blc_en: in raw mode (#89 writes
+	 *    0x4001 = 0x00) both keep updating with unchanged values. The
+	 *    statistics engine runs independently of whether the correction
+	 *    is applied.
+	 *  - Scale: z_avg is fixed-point with 6 fractional bits, z_avg/64 =
+	 *    DN. Measured 7791/64 = 121.7 DN against the sensor's own
+	 *    raw-mode Yavg (0x4C13, no BLC subtraction) of 121. */
 	uint16_t z_avg[4];        /* 0x40E0-0x40E7 — zero-line (dark row) averages for
 	                           * Bayer positions 00/01/10/11, 15-bit ({[6:0],[7:0]}).
-	                           * Mono sensor: all four sample the same physical dark
-	                           * rows, so they should agree; spread is a health metric. */
+	                           * Mono sensor, so all four sample the same physical
+	                           * dark rows — but they do NOT agree: positions 10/11
+	                           * read ~60 LSB (~0.8 %) above 00/01, reproducibly, on
+	                           * every camera. The split is by row parity. */
 	uint16_t blc_offset_z[4]; /* 0x40CD-0x40D4 — BLCoffset10000..10011, the second
 	                           * applied-offset bank (blc_offset[8] above is the first) */
 	uint16_t blc_thres;       /* 0x4061/62 — thres_l, the computed sample-discard

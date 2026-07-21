@@ -11,9 +11,12 @@ the fleet (~1 s round-robin), then validates the cached snapshot end to end:
 - correction-state bytes match the production table (0x4001=0x23, 0x5000=0x34,
   AEC/AGC manual 0xA8) and commanded analog gain matches the per-slot ladder
 - the optical-black block's window/target/trigger context matches what the
-  config table programs (#103) — the dark-row averages themselves are printed,
-  not asserted, until a bench baseline exists (the watchdog bytes taught us
-  that an un-baselined "fault" byte is usually a configuration signature)
+  config table programs (#103), and the dark-row averages track while the
+  sensor scans rows. Baselined on the left sensor 2026-07-20: z_avg reads 0
+  at idle, ~7790 LSB (/64 = 121.7 DN) while streaming, with Bayer positions
+  10/11 ~60 LSB above 00/01. blc_thres (2047), blc_fault_latch (0xFF with
+  fault_state 0) and dtr_fault (1) are configuration signatures, not faults —
+  same lesson as the watchdog bytes — so they are printed, never asserted.
 - sweeps stay live (sweep_count advances between polls)
 - during a ~3 s stream_on + internal-FSIN burst, sweeps observe the probe
   camera actually producing frames: sc_state reads 0x9 (streaming) and the
@@ -283,11 +286,35 @@ def test_camera_telemetry_snapshot(interface):
         print(f"burst sweeps for cam {probe_cam}: "
               f"{[(u, t, hex(s)) for u, (t, s, _) in sorted(fresh.items())]} "
               f"(ext-FSIN pulse count {pc_before} -> {pc_after})")
-        # Open question this run answers: does z_avg track the dark rows while
-        # streaming, and does it move at all? Reported, not asserted.
+        # OB dark rows (#103). Bench-established 2026-07-20: z_avg reads 0 at
+        # idle and populates while the sensor scans rows, so a streaming sweep
+        # with an all-zero z_avg means the statistic stopped tracking.
         z_seq = [z for _, (_, _, z) in sorted(fresh.items())]
+        streaming_z = [z for _, (_, sc, z) in sorted(fresh.items()) if sc == 0x9]
         print(f"  z_avg across burst sweeps: {z_seq}")
-        print(f"  z_avg changed during burst: {len(set(z_seq)) > 1}")
+        print(f"  z_avg while streaming: {streaming_z}")
+        if streaming_z:
+            for z in streaming_z:
+                if not any(z):
+                    failures.append(
+                        f"[{side}] cam {probe_cam}: z_avg all-zero on a "
+                        f"streaming sweep (dark-row statistic not tracking)")
+                    break
+            else:
+                # Row-parity split: positions 10/11 run ~60 LSB above 00/01 on
+                # every camera measured. Assert only the loose envelope — this
+                # is one bench, one sensor.
+                splits = [((z[2] + z[3]) - (z[0] + z[1])) / 2.0 for z in streaming_z]
+                dn = [sum(z) / 4.0 / 64.0 for z in streaming_z]   # 6 fractional bits
+                print(f"  row-parity split (10/11 - 00/01): "
+                      f"{[round(s, 1) for s in splits]} LSB; "
+                      f"dark level {[round(d, 1) for d in dn]} DN")
+                if max(abs(s) for s in splits) > 200:
+                    failures.append(
+                        f"[{side}] cam {probe_cam}: z_avg row-parity split "
+                        f"{max(splits):.0f} LSB far above the ~60 LSB baseline")
+        else:
+            print("  (no streaming sweep captured; z_avg checks skipped)")
         if len(fresh) < 2:
             failures.append(
                 f"[{side}] only {len(fresh)} fresh sweep(s) during 3 s burst")
