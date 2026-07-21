@@ -109,6 +109,12 @@ static volatile uint32_t histo_deq_count = 0;
 static volatile uint32_t histo_datain_count = 0;
 static volatile uint32_t histo_tx_fail_count = 0;
 
+/* Stuck-TX watchdog state (see USBD_HISTO_CheckTxStuck). Written from the
+ * main loop and from SetTxBuffer; read alongside histo_ep_data. */
+static volatile uint32_t histo_tx_armed_ms = 0;    /* tick when the in-flight transfer last progressed */
+static volatile uint32_t histo_tx_progress = 0;    /* histo_datain_count at that moment */
+static volatile uint32_t histo_tx_stuck_count = 0; /* watchdog recoveries (diagnostic) */
+
 #ifndef USB_RAM_D2
 #define USB_RAM_D2 __attribute__((section(".ram_d2")))
 #endif
@@ -140,6 +146,18 @@ static uint8_t USBD_Histo_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
     histo_queue_tail = 0;
     histo_queue_count = 0;
     histo_pdev = pdev;
+
+    /* Abandon any transfer the previous session left armed. A host reader
+     * that dies mid-transfer leaves histo_ep_data set with no DataIn ever
+     * coming; the flag used to survive this reconfigure, so every later
+     * SetTxBuffer returned BUSY, the 4-entry queue filled, and the
+     * endpoint stayed dead until a power cycle. A USB reset did not help
+     * either -- it runs this same DeInit/Init path. */
+    histo_ep_data = 0;
+    tx_histo_ptr = 0;
+    tx_histo_total_len = 0;
+    histo_tx_armed_ms = 0;
+    histo_tx_progress = 0;
 
     if (pdev->dev_speed == USBD_SPEED_HIGH)
     {
@@ -192,6 +210,14 @@ static uint8_t USBD_Histo_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   histo_queue_tail = 0;
   histo_queue_count = 0;
   histo_pdev = NULL;
+
+  /* Same reason as Init: the in-flight marker must not outlive the
+   * session that armed it. */
+  histo_ep_data = 0;
+  tx_histo_ptr = 0;
+  tx_histo_total_len = 0;
+  histo_tx_armed_ms = 0;
+  histo_tx_progress = 0;
 #ifdef USE_USBD_COMPOSITE
   if (pdev->pClassDataCmsit[pdev->classId] != NULL)
   {
@@ -405,6 +431,15 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
     histo_pdev = pdev;
   }
 
+  /* Do not push into a core that cannot move data. When the host
+   * selectively suspends the device the PHY clock is gated, and
+   * transmitting into it neither completes nor errors -- it just strands
+   * a transfer that DataIn will never finish. Drop the frame instead;
+   * histogram sends are already fire-and-forget. */
+  if (pdev->dev_state != USBD_STATE_CONFIGURED) {
+    return USBD_FAIL;
+  }
+
   /* If queue is empty and not currently sending, send directly */
   if (histo_queue_is_empty() && histo_ep_data == 0) {
     uint8_t ret = USBD_HISTO_SetTxBuffer(pdev, data, len);
@@ -451,6 +486,8 @@ void USBD_HISTO_FlushQueue(const char *who)
   histo_ep_data = 0;
   tx_histo_ptr = 0;
   tx_histo_total_len = 0;
+  histo_tx_armed_ms = 0;
+  histo_tx_progress = 0;
   if (histo_pdev != NULL && histo_ep_enabled != 0) {
     USBD_LL_FlushEP(histo_pdev, HISTOInEpAdd);
   }
@@ -463,6 +500,48 @@ void USBD_HISTO_FlushQueue(const char *who)
    *   e-d= enq-deq; this should EQUAL q. If e-d != q the count was corrupted by
    *        a cross-ISR race; if e-d == q > 0 the scan honestly left frames unsent. */
   printf("HISTO flush(%s): q=%u ep=%u e-d=%ld\r\n", who, pending, inflight, gap);
+}
+
+/* Stuck-TX watchdog. A multi-packet histogram transfer is chained by the
+ * DataIn completion interrupt: each 512-byte packet arms the next. If the
+ * host stops issuing IN tokens mid-chain -- a reader process dying, a
+ * cancelled transfer halting the pipe -- DataIn never fires again, so
+ * histo_ep_data stays 1 and histo_process_queue() returns BUSY forever.
+ * Nothing else in the class can break that cycle from inside a session.
+ *
+ * Call from the main loop. When a transfer has been armed for longer than
+ * HISTO_TX_STUCK_MS with no DataIn progress, abandon it: FlushQueue drops
+ * the EP FIFO, clears the in-flight marker and empties the queue, so the
+ * next frame starts a clean transfer.
+ *
+ * Deliberately keyed on lack of *progress*, not on elapsed time alone --
+ * a slow-but-advancing host must never be interrupted (the healthy path
+ * is what test_stream_resumes_within_one_session guards). */
+#define HISTO_TX_STUCK_MS 500u
+
+void USBD_HISTO_CheckTxStuck(void)
+{
+  if (histo_ep_data == 0 || histo_pdev == NULL || histo_ep_enabled == 0) {
+    return;
+  }
+
+  uint32_t datain_now = histo_datain_count;
+  if (datain_now != histo_tx_progress) {
+    /* Transfer is advancing -- re-arm the window and leave it alone. */
+    histo_tx_progress = datain_now;
+    histo_tx_armed_ms = HAL_GetTick();
+    return;
+  }
+
+  if ((HAL_GetTick() - histo_tx_armed_ms) < HISTO_TX_STUCK_MS) {
+    return;
+  }
+
+  histo_tx_stuck_count++;
+  /* FlushQueue clears histo_ep_data/tx bookkeeping under a critical
+   * section and prints its own one-line diagnostic, so the endpoint is
+   * usable again as soon as this returns. */
+  USBD_HISTO_FlushQueue("txstuck");
 }
 
 uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)
@@ -490,6 +569,9 @@ uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint1
 		ret = USBD_LL_Transmit(pdev, HISTOInEpAdd, pTxHistoBuff, pkt_len);
 		if (ret == USBD_OK) {
 			histo_ep_data = 1;
+			/* Arm the stuck-TX watchdog against this transfer. */
+			histo_tx_armed_ms = HAL_GetTick();
+			histo_tx_progress = histo_datain_count;
 		} else {
 			histo_tx_fail_count++;
 			histo_ep_data = 0;
