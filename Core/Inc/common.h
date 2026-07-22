@@ -105,6 +105,7 @@ typedef enum {
 	OW_CMD_I2C_BROADCAST = 0x06,
 	OW_CMD_SERIAL = 0x07,
 	OW_CMD_I2C_REG_READ = 0x08,
+	OW_CMD_BOOT_INFO = 0x09,   /* report runtime SCB->VTOR so a host can tell bare-metal from bootloader-slot */
 	OW_CMD_USR_CFG = 0x0A,
 	OW_CMD_I2C_STATUS = 0x0B,
 	OW_CMD_DEBUG_FLAGS = 0x0C,
