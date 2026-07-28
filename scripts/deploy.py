@@ -5,9 +5,17 @@ Flashes via STM32_Programmer_CLI (STM32CubeProgrammer) when installed —
 ~10x faster than dfu-util against the ROM bootloader — and falls back to
 dfu-util otherwise.
 
+Bare-metal images only. The ROM DFU bootloader this drives writes 0x08000000,
+which is where a bare-metal image lives; a bootloader-slot build (the repo's
+default `Debug`/`Release` presets) is linked at 0x08020400 and must be signed
+by CI, so it is refused rather than flashed to the wrong address (#88). The
+default preset is therefore Debug-BareMetal, configured automatically if its
+build directory doesn't exist yet.
+
 Usage:
     python scripts/deploy.py --device left|right
-                             [--config Debug|Release] [--no-build]
+                             [--config Debug-BareMetal|Release-BareMetal]
+                             [--no-build]
                              [--fw-only] [--use-dfu-util]
                              [--programmer-cli PATH] [--dfu-util PATH]
                              [--power-cycle-cmd CMD]
@@ -26,6 +34,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from _deploy_helpers import (  # noqa: E402
     bin_path_for,
+    build_type_for,
+    read_boot_mode,
     read_project_name,
     resolve_dfu_util,
     resolve_programmer_cli,
@@ -37,7 +47,15 @@ from _deploy_helpers import (  # noqa: E402
 # Boot includes FPGA SRAM erase (~5 s), so give the comeback some headroom.
 COMEBACK_TIMEOUT_S = 15.0
 DFU_ENUM_TIMEOUT_S = 10.0
+
+# This script drives the STM32 ROM DFU bootloader, which is only reachable on
+# a bare-metal image — so 0x08000000 is the only address it ever writes. A
+# bootloader-slot image lives at 0x08020400 behind the custom bootloader and
+# must be SIGNED to boot, which needs CI-held keys; there is deliberately no
+# local path to flash one here (#88).
 FLASH_BASE = 0x08000000
+
+CONFIG_CHOICES = ("Debug-BareMetal", "Release-BareMetal", "Debug", "Release")
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,7 +64,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--device", choices=("left", "right"), required=True,
                    help="Which sensor side to flash (required to avoid wrong-side mistakes)")
-    p.add_argument("--config", choices=("Debug", "Release"), default="Debug")
+    p.add_argument("--config", choices=CONFIG_CHOICES, default="Debug-BareMetal",
+                   help="CMake preset to build and flash (default: "
+                        "Debug-BareMetal — the bare-metal layout is the only "
+                        "one this script can flash; see --help notes on #88)")
     p.add_argument("--no-build", action="store_true")
     p.add_argument("--fw-only", action="store_true",
                    help="Flash the firmware-only image (no FPGA bitstream) — "
@@ -98,12 +119,41 @@ def _confirm(device: str, bin_file: Path) -> bool:
 def _build(config: str) -> None:
     build_dir = REPO_ROOT / "build" / config
     if not build_dir.exists():
-        raise RuntimeError(
-            f"Build dir {build_dir} does not exist. Run cmake configure first."
-        )
-    rc = _run(["cmake", "--build", str(build_dir), "--config", config])
+        # Configure it rather than making the caller do it by hand — the
+        # preset carries the boot mode, so there is nothing to get wrong.
+        rc = _run(["cmake", "--preset", config], cwd=str(REPO_ROOT))
+        if rc != 0:
+            raise RuntimeError(f"cmake --preset {config} failed with exit code {rc}")
+    rc = _run(["cmake", "--build", str(build_dir),
+               "--config", build_type_for(config)])
     if rc != 0:
         raise RuntimeError(f"cmake --build failed with exit code {rc}")
+
+
+def _require_bare_metal(config: str) -> None:
+    """Refuse to flash a bootloader-slot image (#88).
+
+    A slot image is linked at 0x08020400 with VTOR relocated there. Writing it
+    to 0x08000000 puts the vector table at the wrong address — the unit does
+    not boot, and on a bootloader unit it also destroys the bootloader.
+    """
+    build_dir = REPO_ROOT / "build" / config
+    mode = read_boot_mode(build_dir)
+    if mode == "baremetal":
+        return
+
+    bare = config if config.endswith("-BareMetal") else f"{config}-BareMetal"
+    raise RuntimeError(
+        f"build/{config} is a BOOTLOADER-SLOT build (BARE_METAL=OFF): the app "
+        f"is linked at 0x08020400 and must be signed by CI to boot.\n"
+        f"   This script only flashes bare-metal images to 0x{FLASH_BASE:08x} "
+        f"via the ROM DFU bootloader, so it will not flash this one.\n"
+        f"   For a bench deploy, use the bare-metal preset:\n"
+        f"       python scripts/deploy.py --device <side> --config {bare}\n"
+        f"   To put a real bootloader unit into service, flash the signed "
+        f"`production` artifact from the build-firmware workflow with "
+        f"STM32CubeProgrammer instead."
+    )
 
 
 def _sensor_handle(interface, device: str):
@@ -198,6 +248,15 @@ def main() -> int:
         except RuntimeError as e:
             print(f"❌ {e}")
             return 1
+
+    # Boot-mode gate before any existence check: a slot build DOES produce a
+    # {project}.bin, so without this the script would happily flash it to the
+    # wrong address (#88).
+    try:
+        _require_bare_metal(args.config)
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return 1
 
     if not bin_file.exists():
         print(f"❌ Binary not found: {bin_file}")

@@ -29,6 +29,57 @@ def read_project_name(cmake_path: Path) -> str:
     return m.group(1)
 
 
+_BARE_METAL_CACHE_RE = re.compile(
+    r"^BARE_METAL:BOOL=(\w+)\s*$", re.MULTILINE
+)
+
+# CMake preset suffix marking the bare-metal variants (see CMakePresets.json).
+_BARE_METAL_SUFFIX = "-BareMetal"
+
+
+def build_type_for(config: str) -> str:
+    """Return the CMAKE_BUILD_TYPE for a preset name.
+
+    ``Debug-BareMetal`` is a *preset* name, not a build type — the build type
+    is still ``Debug``. Mirrors what .github/workflows/build-firmware.yml
+    passes to ``cmake --build --config``.
+    """
+    if config.endswith(_BARE_METAL_SUFFIX):
+        return config[: -len(_BARE_METAL_SUFFIX)]
+    return config
+
+
+def read_boot_mode(build_dir: Path) -> str:
+    """Return "baremetal" or "slot" for an already-configured build dir.
+
+    The CMakeCache is the only honest source: BARE_METAL can be set by the
+    preset *or* by a bare ``-DBARE_METAL=ON``, and the preset name alone
+    doesn't prove which linker script was used.
+
+    Raises RuntimeError if the directory was never configured, or if the
+    cache predates the BARE_METAL option — in that case the layout is
+    genuinely unknown, and guessing is how a slot image ends up flashed to
+    0x08000000.
+    """
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.is_file():
+        raise RuntimeError(
+            f"No CMakeCache.txt in {build_dir} — that build directory has "
+            f"never been configured. Run: cmake --preset {build_dir.name}"
+        )
+
+    m = _BARE_METAL_CACHE_RE.search(cache.read_text(encoding="utf-8",
+                                                    errors="replace"))
+    if not m:
+        raise RuntimeError(
+            f"{cache} has no BARE_METAL entry, so it predates the boot-mode "
+            "split and its flash layout cannot be determined. Reconfigure "
+            f"from scratch: cmake --preset {build_dir.name}"
+        )
+
+    return "baremetal" if m.group(1).upper() in ("ON", "TRUE", "1", "YES") else "slot"
+
+
 def bin_path_for(repo_root: Path, config: str, project: str,
                  fw_only: bool = False) -> Path:
     """Return the absolute path to the produced .bin for a given config.

@@ -9,6 +9,8 @@ import pytest
 from _deploy_helpers import (
     read_project_name,
     bin_path_for,
+    build_type_for,
+    read_boot_mode,
     resolve_dfu_util,
     wait_for_dfu_device,
 )
@@ -35,6 +37,57 @@ def test_bin_path_for_returns_repo_relative(tmp_path: Path):
     repo = tmp_path
     result = bin_path_for(repo, "Debug", "motion-console-fw")
     assert result == repo / "build" / "Debug" / "motion-console-fw.bin"
+
+
+def _write_cache(build_dir: Path, body: str) -> Path:
+    build_dir.mkdir(parents=True, exist_ok=True)
+    cache = build_dir / "CMakeCache.txt"
+    cache.write_text(textwrap.dedent(body), encoding="utf-8")
+    return cache
+
+
+def test_read_boot_mode_detects_baremetal(tmp_path: Path):
+    _write_cache(tmp_path / "Debug-BareMetal", """
+        CMAKE_BUILD_TYPE:STRING=Debug
+        BARE_METAL:BOOL=ON
+    """)
+    assert read_boot_mode(tmp_path / "Debug-BareMetal") == "baremetal"
+
+
+def test_read_boot_mode_detects_slot(tmp_path: Path):
+    _write_cache(tmp_path / "Debug", """
+        CMAKE_BUILD_TYPE:STRING=Debug
+        BARE_METAL:BOOL=OFF
+    """)
+    assert read_boot_mode(tmp_path / "Debug") == "slot"
+
+
+def test_read_boot_mode_raises_when_cache_missing(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="CMakeCache.txt"):
+        read_boot_mode(tmp_path / "never-configured")
+
+
+def test_read_boot_mode_raises_on_stale_cache_without_the_option(tmp_path: Path):
+    """A cache predating the BARE_METAL option says nothing about layout.
+
+    Guessing here is how you flash a slot image to 0x08000000, so refuse and
+    make the caller reconfigure.
+    """
+    _write_cache(tmp_path / "Debug", """
+        CMAKE_BUILD_TYPE:STRING=Debug
+    """)
+    with pytest.raises(RuntimeError, match="BARE_METAL"):
+        read_boot_mode(tmp_path / "Debug")
+
+
+@pytest.mark.parametrize("config,expected", [
+    ("Debug", "Debug"),
+    ("Release", "Release"),
+    ("Debug-BareMetal", "Debug"),
+    ("Release-BareMetal", "Release"),
+])
+def test_build_type_for_strips_the_preset_suffix(config: str, expected: str):
+    assert build_type_for(config) == expected
 
 
 def test_resolve_dfu_util_uses_override_when_given(tmp_path: Path):
