@@ -1605,6 +1605,10 @@ _Bool send_data(void) {
 	return success;
 }
 
+bool camera_is_streaming(void){
+	return streaming_active;
+}
+
 _Bool check_streaming(void){
 	if(streaming_active){
 		uint32_t current_time = get_timestamp_ms();

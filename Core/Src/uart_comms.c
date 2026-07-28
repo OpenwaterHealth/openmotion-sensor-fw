@@ -14,6 +14,7 @@
 #include "utils.h"
 #include "logging.h"
 #include "common.h"
+#include "camera_manager.h"   /* camera_is_streaming() -- bounds the TX spin */
 
 #include <string.h>
 
@@ -34,6 +35,14 @@ static uint8_t cmd_data_buf[COMMAND_MAX_SIZE];
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
+/* COMM TX drop/failure counters. These replace printfs on the streaming paths,
+ * where logging re-enters the very send that failed (see comms_interface_send).
+ * Diagnostics without amplification. */
+volatile uint32_t comm_tx_dropped_count = 0;
+volatile uint32_t comm_tx_failed_count = 0;
+
+/* Upper bound on the COMM transmit-complete spin, used OUTSIDE a scan only.
+ * While streaming the wait is skipped entirely -- see comms_interface_send. */
 #define TX_TIMEOUT 500
 #define RX_CMD_QUEUE_DEPTH 4U
 #define RX_CMD_BUFFER_SIZE 512U
@@ -113,7 +122,14 @@ _Bool comms_interface_send(UartPacket *pResp) {
 	send_in_progress = true;
 
 	if(!tx_flag){
-		printf("Comm tx not complete from last time");
+		/* Previous transfer still in flight. While streaming this is the
+		 * normal drop path (the wait below is skipped, so callers routinely
+		 * arrive before completion) and it MUST stay silent: a printf here
+		 * routes back into this same function and amplifies. */
+		comm_tx_dropped_count++;
+		if (!camera_is_streaming()) {
+			printf("Comm tx not complete from last time");
+		}
 		send_in_progress = false;
 		return false;
 	}
@@ -159,15 +175,15 @@ _Bool comms_interface_send(UartPacket *pResp) {
 	tx_flag = 0;  // Set the flag before starting transmission
 	uint8_t tx_status = USBD_COMMS_SendData(&hUsbDeviceHS, txBuffer, bufferIndex, 0);
 	if (tx_status != USBD_OK) {
-		// Transmission not started (e.g., endpoint busy); don't block on tx_flag
-		printf("COMM USB TX failed: id=0x%04X cmd=0x%02X type=0x%02X len=%d dev_state=0x%02X\r\n",
-			   pResp->id, pResp->command, pResp->packet_type, bufferIndex, hUsbDeviceHS.dev_state);
-		if (tx_status == USBD_BUSY) {
-			printf("COMM USB TX failed: endpoint busy\r\n");
-		} else if (tx_status == USBD_FAIL) {
-			printf("COMM USB TX failed: USBD_FAIL\r\n");
-		} else {
-			printf("COMM USB TX failed: status=0x%02X\r\n", tx_status);
+		// Transmission not started (e.g., endpoint busy); don't block on tx_flag.
+		// Silent while streaming: these printfs route back through this same
+		// send, so on a stalled COMM endpoint they amplify rather than inform.
+		// The count is available via OW_CMD_DIAG_STATS.
+		comm_tx_failed_count++;
+		if (!camera_is_streaming()) {
+			printf("COMM USB TX failed: id=0x%04X cmd=0x%02X type=0x%02X len=%d dev_state=0x%02X status=0x%02X\r\n",
+				   pResp->id, pResp->command, pResp->packet_type, bufferIndex,
+				   hUsbDeviceHS.dev_state, tx_status);
 		}
 		tx_flag = 1; // reset to idle on failure
 		USB_NotifyTxFailure();
@@ -180,7 +196,31 @@ _Bool comms_interface_send(UartPacket *pResp) {
 		printf("F:%d C: 0x%02X V: 0x%02X S:%d\r\n", pResp->id, pResp->addr, pResp->reserved, bufferIndex);
 	}
 
-	// Wait for the transmit complete flag with a timeout to avoid infinite loop.
+	/* While a scan is streaming, do NOT wait for completion.
+	 *
+	 * This function runs in the main loop, which also performs the per-camera
+	 * DMA re-arm every 25 ms frame (send_data -> start_data_reception). Any
+	 * block here costs a camera permanently: overrun -> "failed to setup
+	 * receive" -> 10 s rail-off -> dead until the next configure (#102).
+	 *
+	 * The transfer has been handed to the USB stack and its completion callback
+	 * sets tx_flag. A caller arriving before that is refused at the !tx_flag
+	 * check above and its message is dropped -- the correct trade, because a
+	 * diagnostic is best-effort and a camera is not.
+	 *
+	 * Note: merely SHORTENING the timeout is not sufficient and measured worse.
+	 * The timeout path printf()s, and that printf routes back through this same
+	 * send, so a tighter bound just runs the amplification loop faster. On the
+	 * bench a 10 ms bound lost all 8 cameras where the 500 ms bound lost 1 per
+	 * module. The fix has to remove the block and silence the drop paths, not
+	 * rescale them. See #115.
+	 */
+	if (camera_is_streaming()) {
+		send_in_progress = false;
+		return true;
+	}
+
+	// Outside a scan there is no frame deadline: wait for completion as before.
 	uint32_t start_time = get_timestamp_ms();
 
 	while (!tx_flag) {

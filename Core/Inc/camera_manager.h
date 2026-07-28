@@ -154,4 +154,10 @@ void scan_camera_sensor(uint8_t cam_id);  /* Scan single camera slot; sets isPre
 void scan_camera_sensors(void);
 uint8_t get_cameras_present(void);  // Get bitmask of present cameras (computed from cam_array[].isPresent)
 
+/* True while a scan is streaming frames. Callers that run in the main loop use
+ * this to bound how long they may block: while streaming, the main loop also
+ * performs the per-camera DMA re-arm (inside send_data), and the frame period
+ * is 25 ms, so a longer block loses a camera permanently. See #115/#116. */
+bool camera_is_streaming(void);
+
 #endif /* INC_CAMERA_MANAGER_H_ */
