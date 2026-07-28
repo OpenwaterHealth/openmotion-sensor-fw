@@ -636,7 +636,42 @@ USBD_StatusTypeDef USBD_LL_Transmit(USBD_HandleTypeDef *pdev, uint8_t ep_addr, u
   HAL_StatusTypeDef hal_status = HAL_OK;
   USBD_StatusTypeDef usb_status = USBD_OK;
 
+  /* #96: arming an IN transfer is not atomic, and the register it touches is
+   * shared by every IN endpoint.
+   *
+   * The core runs in slave mode (Init.dma_enable = DISABLE above), so packet
+   * data reaches an endpoint FIFO only because the TX-FIFO-empty interrupt is
+   * enabled for it. Those enables all live in ONE device register, and
+   * USB_EPStartXfer sets its bit with a plain read-modify-write:
+   *
+   *     stm32h7xx_ll_usb.c  USB_EPStartXfer()
+   *         USBx_DEVICE->DIEPEMPMSK |= 1UL << (ep->num & EP_ADDR_MSK);
+   *
+   * Transfers get armed from three contexts: the main loop (COMM command
+   * responses, via comms_host_check_received), the frame ISR (histogram
+   * sends) and the USB ISR (multi-packet chaining in *_DataIn). The USB ISR
+   * is NVIC priority 0 (USB_IRQ_PRIORITY), so it preempts the other two. When
+   * it lands between the load and the store, the preempted caller writes back
+   * a stale mask and silently clears the OTHER endpoint's enable bit. That
+   * endpoint's packet is never copied into the FIFO, DataIn never fires for
+   * it, and its class code waits forever on a transfer that cannot complete.
+   *
+   * Observed as: host polls camera telemetry over COMM at 1 Hz during a scan,
+   * and HISTO stops delivering within seconds-to-a-minute while COMM itself
+   * stays healthy (the clobbering writer keeps its own bit) and the cameras
+   * keep running. Same mechanism behind the older "concurrent I2C passthrough
+   * kills HISTO in ~2 s" reports.
+   *
+   * Masking interrupts across the arm makes the read-modify-write indivisible.
+   * The clear side (PCD_WriteEmptyTxFifo) needs no guard: it runs in the USB
+   * ISR at priority 0, which nothing touching this register can preempt. In
+   * slave mode this call only programs registers — the FIFO copy happens later
+   * in the ISR — so the masked window is a handful of writes, not a data copy.
+   */
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
   hal_status = HAL_PCD_EP_Transmit(pdev->pData, ep_addr, pbuf, size);
+  __set_PRIMASK(primask);
 
   usb_status =  USBD_Get_USB_Status(hal_status);
 
