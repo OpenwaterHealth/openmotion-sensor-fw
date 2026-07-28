@@ -190,6 +190,19 @@ void DebugMon_Handler(void)
   /* USER CODE END DebugMonitor_IRQn 1 */
 }
 
+/**
+  * @brief This function handles Pendable request for system service.
+  * #116: repurposed as the deferred camera RX re-arm (no RTOS on this
+  * firmware, so PendSV is otherwise unused). Pended from the camera RX
+  * completion / error callbacks; runs at CAMERA_REARM_PENDSV_PRIORITY —
+  * after the HAL RX ISR unwinds (peripheral READY) but still preempting
+  * the FSIN/send tier, so a stalled send path can never delay the re-arm.
+  */
+void PendSV_Handler(void)
+{
+  camera_rearm_isr();
+}
+
 /******************************************************************************/
 /* STM32H7xx Peripheral Interrupt Handlers                                    */
 /* Add here the Interrupt Handlers for the used peripherals.                  */

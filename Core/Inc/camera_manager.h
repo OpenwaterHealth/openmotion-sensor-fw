@@ -33,7 +33,18 @@ typedef struct {
 	bool            isPresent;
 	uint8_t 		gain;
 	uint8_t 		exposure;
+	/* #116: published frame pointer — always aliases pRxBuf[done] (the most
+	 * recent COMPLETE frame). Legacy readers (get_single_histogram, fake-data
+	 * fill) use this; the streaming send paths read pRxBuf[] through the
+	 * copy-announce protocol in camera_manager.c instead. */
 	uint8_t *pRecieveHistoBuffer;
+	/* #116: per-camera RX double buffer. DMA fills one half while the send
+	 * path copies the other, so the re-arm never waits on the send. Cam 1
+	 * (SPI6) points into SRAM4 (BDMA reaches only D3); the rest into
+	 * frame_buffer in RAM_D1. NOTE: D-cache is disabled in this firmware; if
+	 * anyone enables it, every one of these DMA buffers needs MPU/invalidate
+	 * treatment at once. */
+	uint8_t *pRxBuf[2];
     size_t   receiveBufferSize;      // Size of the buffer
 	GPIO_TypeDef *	detect_clk_port;
 	uint16_t		detect_clk_pin;
@@ -150,6 +161,19 @@ void CAM_UART_RxCpltCallback(USART_HandleTypeDef *husart);
 void CAM_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi);
 
 void camera_i2c_service(void);  /* Main-loop service for hi2c1 work deferred from the frame ISRs (temp poll, failed-camera mux disables) */
+
+/* #116: camera RX decoupling. camera_rx_complete() runs in the camera DMA/SPI
+ * RX ISRs (replaces the bare event-bit set): publishes the completed buffer,
+ * swaps the DMA target, and pends PendSV for the re-arm. camera_rearm_isr()
+ * is the PendSV body (called from PendSV_Handler in stm32h7xx_it.c).
+ * camera_rx_error_recover() is the error-callback path (main.c): flags the
+ * camera for re-arm instead of abort+start in ISR context.
+ * camera_rearm_service() is the main-loop backstop: retries any failed arm
+ * with abort + backoff until it sticks — no arm failure is terminal. */
+void camera_rx_complete(uint8_t cam_id);
+void camera_rearm_isr(void);
+void camera_rx_error_recover(uint8_t cam_id);
+void camera_rearm_service(void);
 void scan_camera_sensor(uint8_t cam_id);  /* Scan single camera slot; sets isPresent */
 void scan_camera_sensors(void);
 uint8_t get_cameras_present(void);  // Get bitmask of present cameras (computed from cam_array[].isPresent)

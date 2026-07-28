@@ -472,6 +472,7 @@ int main(void)
   	comms_host_check_received(); // check comms
     imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
     camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
+    camera_rearm_service();  /* #116: retry any camera RX arm that failed in PendSV (abort+backoff) */
     logging_pump();          /* Flush USB log data buffered from ISR context */
     check_streaming();
     USBD_HISTO_CheckTxStuck(); /* Recover the HISTO EP if an armed transfer stalls (dead host reader) */
@@ -1634,6 +1635,9 @@ static void MX_DMA_Init(void)
   }
 
   /* DMA interrupt init */
+  /* #116: DMA1_Stream2-7 + DMA2_Stream0 carry camera RX completions (SPI2/3/4
+   * RX, USART2/1/3/6 RX) — CAMERA_RX_IRQ_PRIORITY tier, see common.h.
+   * DMA1_Stream0/1 are UART4 logging RX/TX and stay at 0 (short ISRs). */
   /* DMA1_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
@@ -1641,25 +1645,25 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA1_Stream2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
   /* DMA1_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
   /* DMA1_Stream4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
   /* DMA1_Stream5_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
   /* DMA1_Stream6_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
   /* DMA1_Stream7_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -1872,11 +1876,14 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
   /* Attempt graceful recovery for any known camera USART peripheral.
    * Same fix as HAL_SPI_ErrorCallback: non-overrun errors (framing, noise,
    * DMA) previously fell through to Error_Handler() and halted the MCU.
-   * Any error on a known camera USART is recoverable via abort+restart. */
+   * #116: recovery is now flag + PendSV re-arm instead of an in-ISR
+   * abort_data_reception() (which busy-waited 10 ms in ISR context) +
+   * one-shot start (which was terminal on failure). If the PendSV arm
+   * fails, camera_rearm_service() retries from the main loop until it
+   * sticks — a failed re-arm is no longer permanent. */
   if (cam_id >= 0)
   {
-    abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    camera_rx_error_recover((uint8_t)cam_id);
     return;
   }
 
@@ -1980,11 +1987,11 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
    *   Error_Handler() entered from interrupt context →
    *   wait_for_usb_queues_to_finish() blocks (USB ISR can't run) →
    *   __disable_irq() → MCU completely dark.
-   * Now any error on a known camera SPI triggers abort+restart instead. */
+   * #116: recovery is now flag + PendSV re-arm with a main-loop retry
+   * backstop — see the USART error callback above for the rationale. */
   if (cam_id >= 0)
   {
-    abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    camera_rx_error_recover((uint8_t)cam_id);
     return;
   }
 
@@ -1993,50 +2000,49 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 }
 
 
-void set_event_bit_atomic(uint32_t bit) {
-  __disable_irq();
-  event_bits |= bit;
-  __enable_irq();
-}
+/* #116: RX completions run the buffer-exchange protocol in camera_manager.c
+ * (publish the filled half, swap the DMA target, pend the PendSV re-arm)
+ * instead of just setting an event bit and leaving the re-arm to the send
+ * path. Instance -> cam_id mapping matches the old BIT_n assignments. */
 
 // Interrupt handler for SPI reception
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
   if (hspi->Instance == SPI2)
   {
-    set_event_bit_atomic(BIT_6);
+    camera_rx_complete(6);
   }
   else if (hspi->Instance == SPI3)
   {
-    set_event_bit_atomic(BIT_5);
+    camera_rx_complete(5);
   }
   else if (hspi->Instance == SPI4)
   {
-    set_event_bit_atomic(BIT_7);
+    camera_rx_complete(7);
   }
   else if (hspi->Instance == SPI6)
   {
-    set_event_bit_atomic(BIT_1);
+    camera_rx_complete(1);
   }
 }
 
 void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)
 {
   if (husart->Instance == USART1)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_4);
+  {
+    camera_rx_complete(4);
   }
   else if (husart->Instance == USART2)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_0);
+  {
+    camera_rx_complete(0);
   }
   else if (husart->Instance == USART3)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_2);
+  {
+    camera_rx_complete(2);
   }
   else if (husart->Instance == USART6)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_3);
+  {
+    camera_rx_complete(3);
   }
 
 }

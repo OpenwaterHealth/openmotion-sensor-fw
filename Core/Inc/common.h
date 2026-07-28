@@ -41,18 +41,38 @@
                                           * (re)configured. See X02C1B_raw_sensor in 0X02C1B.c */
 
 
+/* #116 NVIC tiering — the camera RX -> re-arm chain must outrank the send
+ * path, or a stalled send (COMM TX spin, rle_compress, logging waits) blocks
+ * the DMA re-arm and one missed re-arm kills a camera for the scan:
+ *
+ *   0  USB / I2C / UART4-logging DMA        (unchanged; all short ISRs)
+ *   1  camera RX completions                 CAMERA_RX_IRQ_PRIORITY
+ *      (DMA1_Stream2-7, DMA2_Stream0, BDMA_Channel0, SPI2/3/4/6 EOT)
+ *   2  PendSV = deferred camera re-arm       CAMERA_REARM_PENDSV_PRIORITY
+ *      (pended from RX-complete; runs after the HAL ISR unwinds, so the
+ *       peripheral state is READY, yet still preempts the send path below)
+ *   3  FSIN frame ISRs -> send_data()        FSIN_IRQ_PRIORITY (TIM4 + EXTI13)
+ *   4  USART/UART globals                    (camera error callbacks, logging)
+ *   6  (was SPI3/4 — now 1, see above)
+ *
+ * Raising RX priority alone was bench-proven insufficient (15/15 deaths on a
+ * priority-corrected build) because the re-arm CODE lived in the send path;
+ * the tiering only works together with the PendSV re-arm in camera_manager.c. */
 #define I2C_IRQ_PRIORITY 0
-#define SPI2_IRQ_PRIORITY 0
-#define SPI3_IRQ_PRIORITY 6
-#define SPI4_IRQ_PRIORITY 6
-#define SPI6_IRQ_PRIORITY 4
+#define CAMERA_RX_IRQ_PRIORITY 1
+#define CAMERA_REARM_PENDSV_PRIORITY 2
+#define SPI2_IRQ_PRIORITY CAMERA_RX_IRQ_PRIORITY
+#define SPI3_IRQ_PRIORITY CAMERA_RX_IRQ_PRIORITY
+#define SPI4_IRQ_PRIORITY CAMERA_RX_IRQ_PRIORITY
+#define SPI6_IRQ_PRIORITY CAMERA_RX_IRQ_PRIORITY
 #define USART1_IRQ_PRIORITY 4
 #define USART2_IRQ_PRIORITY 4
 #define USART3_IRQ_PRIORITY 4
 #define USART6_IRQ_PRIORITY 4
 #define UART4_IRQ_PRIORITY 4
-#define DMA_IRQ_PRIORITY 0
-#define FSIN_IRQ_PRIORITY 2
+#define DMA_IRQ_PRIORITY CAMERA_RX_IRQ_PRIORITY  /* BDMA_Channel0 = SPI6 RX (cam 2) */
+#define FSIN_IRQ_PRIORITY 3
+#define TIM4_FSIN_IRQ_PRIORITY FSIN_IRQ_PRIORITY /* internal-FSIN frame ISR (was hardcoded 0) */
 #define USB_IRQ_PRIORITY 0
 
 // #define TIM8_BRK_TIM12_IRQ_PRIORITY 0

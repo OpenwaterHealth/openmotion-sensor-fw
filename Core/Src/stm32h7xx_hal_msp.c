@@ -768,7 +768,10 @@ void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* htim_pwm)
     /* Peripheral clock enable */
     __HAL_RCC_TIM4_CLK_ENABLE();
     /* TIM4 interrupt Init */
-    HAL_NVIC_SetPriority(TIM4_IRQn, 0, 0);
+    /* #116: TIM4 is the internal-FSIN frame ISR (runs send_data). It must sit
+     * BELOW the camera-RX and PendSV re-arm tiers so a stalled send can't
+     * block the DMA re-arm — see the tier table in common.h. */
+    HAL_NVIC_SetPriority(TIM4_IRQn, TIM4_FSIN_IRQ_PRIORITY, 0);
     HAL_NVIC_EnableIRQ(TIM4_IRQn);
     /* USER CODE BEGIN TIM4_MspInit 1 */
 
