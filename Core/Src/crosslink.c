@@ -85,6 +85,10 @@ int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *w
     return HAL_OK;
 }
 
+/* Staging area for the FIRST chunk only — the one that carries the command
+ * prefix. See xi2c_write_long. */
+static uint8_t xi2c_first_chunk[BITSTREAM_CHUNK_SIZE];
+
 static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *cmd, int cmd_len, uint8_t *data, size_t data_len) {
 	HAL_StatusTypeDef ret;
     size_t offset = 0;
@@ -94,9 +98,36 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
     uint8_t *pData;
 	uint16_t datalen;
 
-	memset(bitstream_buffer, 0, MAX_BITSTREAM_SIZE);
-    memcpy(bitstream_buffer, cmd, cmd_len);  // copy the long write command in
-    memcpy(bitstream_buffer + cmd_len, data, data_len);
+    /* #82: this used to stage cmd+data into bitstream_buffer and transmit from
+     * there. The host-upload path (fpga_program_sram, rom_bitstream=true)
+     * passes bitstream_buffer AS `data`, so the staging memset wiped the
+     * source before the copy read it and the CrossLink received the 0x7A
+     * command followed by 163 KB of zeros — the FPGA "programmed" silently
+     * with an empty design. The embedded-flash path was unaffected only
+     * because its source is flash, not the shared scratch buffer.
+     *
+     * Only the first chunk needs assembling, because only it carries the
+     * command prefix; every later chunk is a straight slice of the caller's
+     * data. So build chunk 0 in a private buffer and stream the rest directly
+     * from `data`, never writing to the caller's buffer at all. Chunk sizes
+     * and I2C frame flags below are untouched, so the byte stream and the
+     * framing on the wire stay exactly what the working flash path already
+     * produced. Streaming straight from `data` also drops a 163 KB copy out
+     * of the flash path — the I2C transfer is interrupt-driven and reads the
+     * source with the CPU, so a memory-mapped flash address is a fine source.
+     */
+    if (cmd_len < 0 || (size_t)cmd_len > BITSTREAM_CHUNK_SIZE) {
+        printf("i2c_write_long: cmd_len %d out of range\r\n", cmd_len);
+        return HAL_ERROR;
+    }
+
+    {
+        size_t first_chunk = (total_len > BITSTREAM_CHUNK_SIZE)
+                                 ? (size_t)BITSTREAM_CHUNK_SIZE
+                                 : total_len;
+        memcpy(xi2c_first_chunk, cmd, (size_t)cmd_len);
+        memcpy(xi2c_first_chunk + cmd_len, data, first_chunk - (size_t)cmd_len);
+    }
 
     for (int i = 0; i < num_chunks; i++) {
         size_t current_chunk_size = (total_len - offset > BITSTREAM_CHUNK_SIZE)
@@ -120,7 +151,10 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
             delay_ms(1);  // Add a small delay to avoid busy looping
         }
 
-        pData = (uint8_t*)&bitstream_buffer[offset];
+        /* Chunk 0 is the assembled command+data prefix; later chunks come
+         * straight from the caller's source, offset back by the command
+         * bytes that only exist in chunk 0. */
+        pData = (i == 0) ? xi2c_first_chunk : (data + (offset - (size_t)cmd_len));
         datalen = (uint16_t)current_chunk_size;
 
         // Reset completion flags
