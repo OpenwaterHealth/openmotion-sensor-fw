@@ -74,6 +74,19 @@ typedef struct {
  * transport-level CRC that only covers the compressed bytes. */
 #define HISTO_CMP_UNCMP_CRC_SIZE 2
 
+/* --- Drip-scan image mode (camera-fpga#8) ---------------------------------
+ * USB envelope for one image line, built IN PLACE around the DMA'd line in
+ * the camera's existing receive buffer:
+ *   [0]=HISTO_SOF [1]=TYPE_IMAGE [2..5]=total_size LE [6..9]=timestamp LE
+ *   [10]=HISTO_SOH [11]=cam_id [12..2419]=IMAGE_LINE_SIZE line bytes
+ *   [2420]=HISTO_EOH [2421..2422]=CRC-16 LE [2423]=HISTO_EOF
+ * Envelope CRC = util_crc16 over bytes [0..2419] -- mirrors
+ * send_histogram_data(), which computes util_crc16(packet_buffer, offset-1),
+ * i.e. SOF through the last payload byte EXCLUDING the final EOH. Quirk kept
+ * deliberately so the SDK's existing envelope-CRC convention applies. */
+#define IMAGE_PKT_LINE_OFFSET (HISTO_HEADER_SIZE + 4 + 2)                                  /* 12 */
+#define IMAGE_PKT_TOTAL_SIZE  (IMAGE_PKT_LINE_OFFSET + IMAGE_LINE_SIZE + 1 + HISTO_TRAILER_SIZE) /* 2424 */
+
 
 void init_camera_sensors(void);
 CameraDevice* get_active_cam(void);
@@ -135,6 +148,29 @@ _Bool enable_camera_power(uint8_t cam_id);
 _Bool disable_camera_power(uint8_t cam_id);
 _Bool get_camera_power_status(uint8_t cam_id);
 void power_off_all_cameras(void);
+
+/* --- Drip-scan image mode (camera-fpga#8) --------------------------------- */
+/* Wire response for OW_CAMERA_IMAGE_MODE. Fixed packed layout returned
+ * verbatim (same convention as cam_diag_stats_t above) -- do not reorder
+ * fields without an SDK-side parser change. */
+typedef struct __attribute__((packed)) {
+	uint8_t  active;                  /* 1 = image mode currently active */
+	uint8_t  mask;                    /* camera bitmask in image mode (0 when inactive) */
+	uint8_t  reserved[2];
+	uint32_t gap_count[CAMERA_COUNT]; /* per-camera lost-line events since the last enter:
+	                                   * line timeouts + USB send drops + link-error
+	                                   * recoveries. The host retries missing lines via the
+	                                   * FPGA sweep-start-line register. */
+} image_mode_resp_t;                  /* 36 B */
+
+_Bool camera_image_mode_enter(uint8_t mask);
+_Bool camera_image_mode_exit(void);
+bool  camera_image_mode_active(uint8_t cam_id); /* cam is in the active image mask */
+bool  camera_image_mode_rx(uint8_t cam_id);     /* HAL RxCplt hook; true = consumed by image path */
+void  camera_image_link_error(uint8_t cam_id);  /* HAL error-callback recovery while in image mode */
+void  camera_image_rearm_service(void);         /* LPTIM5 software-IRQ body: deferred DMA re-arm */
+void  camera_image_service(void);               /* main-loop line-timeout tick (~2 ms) */
+void  camera_image_get_status(image_mode_resp_t *out);
 
 void Camera_USART_RxCpltCallback_Handler(USART_HandleTypeDef *husart);
 void Camera_SPI_RxCpltCallback_Handler(SPI_HandleTypeDef *hspi);

@@ -49,6 +49,7 @@ typedef struct __attribute__((packed)) {
 static boot_info_t boot_info = {0};
 
 static uint8_t camera_status[8] = {0};
+static image_mode_resp_t image_mode_resp; /* OW_CAMERA_IMAGE_MODE reply buffer */
 static uint8_t i2c_reg_read_buf[I2C_REG_READ_MAX_LEN] = {0};
 static uint8_t camera_power_status = 0;
 static float cam_temp;
@@ -515,15 +516,24 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
 		VERBOSE_CMD("[CMD] OW_FPGA_PROG_SRAM addr=0x%02X reserved=%u\r\n", cmd.addr, cmd.reserved);
 		uartResp->command = OW_FPGA_PROG_SRAM;
 		uartResp->packet_type = OW_RESP;
-		// TODO: Add parameter to force update currently defaults to false
+		/* #68: reserved==2 forces the SRAM load — with force off, an
+		 * NVCM-programmed part skips the SRAM load and silently keeps
+		 * running the burned image, so a newer BUNDLED bitstream never
+		 * takes effect (~10 s/camera when forced). Ported verbatim from
+		 * the bench-validated fix/82-sram-upload-path hunk. */
 	    for (uint8_t i = 0; i < 8; i++) {
 	        if (((cmd.addr >> i) & 0x01) != 0) {
 	        	_Bool func_ret = false;
+	        	_Bool force_sram = (cmd.reserved == 2);
 
-	        	if(cmd.reserved == 1) {
-	        		func_ret = program_fpga(i, false);
+	        	if(cmd.reserved == 1 || force_sram) {
+	        		func_ret = program_fpga(i, force_sram);
 	        	} else {
-	        		func_ret = program_sram_fpga(i, true, 0, 0, false);
+	        		/* reserved==0: host-uploaded bitstream, NVCM-gated.
+	        		 * reserved==3: host-uploaded bitstream, FORCED — skips the
+	        		 * isProgrammed/NVCM gates (required on NVCM-burned parts,
+	        		 * same rationale as reserved==2). */
+	        		func_ret = program_sram_fpga(i, true, 0, 0, cmd.reserved == 3);
 	        	}
 	    		if(!func_ret)
 	    		{
@@ -865,6 +875,34 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 	        	}
 	        }
 	    }
+		break;
+	case OW_CAMERA_IMAGE_MODE:
+		/* Drip-scan (camera-fpga#8): reserved = enable 0/1, data[0] = camera
+		 * bitmask (enable only). Host sequencing: enable cameras/streaming
+		 * first if a live sweep is wanted, enable image mode, THEN put the
+		 * FPGA into sweep mode via I2C (0x5A CTRL); reverse order on the way
+		 * out. Response is image_mode_resp_t either way -- the disable reply
+		 * carries the final per-camera gap tally, and a repeated disable is
+		 * an idempotent success that re-reads it. */
+		VERBOSE_CMD("[CMD] OW_CAMERA_IMAGE_MODE reserved=%u len=%u\r\n",
+		            cmd.reserved, (unsigned)cmd.data_len);
+		uartResp->command = OW_CAMERA_IMAGE_MODE;
+		uartResp->packet_type = OW_RESP;
+		if (cmd.reserved == 1) {
+			if (cmd.data_len != 1 || cmd.data[0] == 0) {
+				VERBOSE_CMD("Invalid image mode payload\r\n");
+				uartResp->packet_type = OW_ERROR;
+			} else if (!camera_image_mode_enter(cmd.data[0])) {
+				uartResp->packet_type = OW_ERROR;
+			}
+		} else {
+			if (!camera_image_mode_exit()) {
+				uartResp->packet_type = OW_ERROR;
+			}
+		}
+		camera_image_get_status(&image_mode_resp);
+		uartResp->data_len = sizeof(image_mode_resp);
+		uartResp->data = (uint8_t *)&image_mode_resp;
 		break;
 	case OW_CAMERA_OFF:
 		VERBOSE_CMD("[CMD] OW_CAMERA_OFF\r\n");

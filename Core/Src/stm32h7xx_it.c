@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "camera_manager.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -643,5 +644,17 @@ void ECC_IRQHandler(void)
 void EXTI15_10_IRQHandler(void)
 {
     HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);  // Handle EXTI line 13
+}
+
+/* Drip-scan image mode (camera-fpga#8): software-pended re-arm IRQ. The
+ * LPTIM5 peripheral is never used or clocked -- its vector is borrowed as a
+ * low-priority (IMAGE_REARM_IRQ_PRIORITY) software interrupt, pended from
+ * the camera RxCplt callbacks so the DMA re-arm runs immediately AFTER the
+ * HAL driver finishes its completion bookkeeping (required on USART, whose
+ * driver sets State=READY only after the RxCplt callback). Nothing to clear:
+ * a software pend auto-clears on entry. */
+void LPTIM5_IRQHandler(void)
+{
+  camera_image_rearm_service();
 }
 /* USER CODE END 1 */
