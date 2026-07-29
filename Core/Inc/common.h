@@ -34,6 +34,11 @@
 #define DEBUG_FLAG_SEND_DEFER (1u << 7)  /* #68: FSIN ISR only flips send_data_flag; main loop runs send_data() */
 #define DEBUG_FLAG_HISTO_STALL (1u << 8) /* #75: stop sending histogram frames after HISTO_STALL_TRIGGER_FRAMES;
                                           * cameras/SPI/USB stay alive — deterministic host-visible stall repro */
+#define DEBUG_FLAG_CAMERA_CROP (1u << 9) /* #86: crop camera output to 1720x1280 (drop right 200 columns) when
+                                          * cameras are (re)configured — misaligned-optic A/B test. See 0X02C1B.c */
+#define DEBUG_FLAG_CAMERA_RAW (1u << 10) /* #89: raw "scientific sensor" mode — disable every on-sensor pixel
+                                          * correction (BLC/DC-BLC/dither/OTP-DPC) when cameras are
+                                          * (re)configured. See X02C1B_raw_sensor in 0X02C1B.c */
 
 
 #define I2C_IRQ_PRIORITY 0
@@ -100,6 +105,7 @@ typedef enum {
 	OW_CMD_I2C_BROADCAST = 0x06,
 	OW_CMD_SERIAL = 0x07,
 	OW_CMD_I2C_REG_READ = 0x08,
+	OW_CMD_BOOT_INFO = 0x09,   /* report runtime SCB->VTOR so a host can tell bare-metal from bootloader-slot */
 	OW_CMD_USR_CFG = 0x0A,
 	OW_CMD_I2C_STATUS = 0x0B,
 	OW_CMD_DEBUG_FLAGS = 0x0C,
@@ -158,6 +164,7 @@ typedef enum {
 	OW_CAMERA_POWER_OFF = 0x51,
 	OW_CAMERA_POWER_STATUS = 0x52,
 	OW_CAMERA_READ_SECURITY_UID = 0x53,
+	OW_CAMERA_GET_TELEMETRY = 0x54,  /* #94: cached cam_telemetry_response_t snapshot (camera_telemetry.h) */
 
 } MotionCameraCommands;
 

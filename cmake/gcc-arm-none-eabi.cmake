@@ -36,7 +36,9 @@ set(CMAKE_CXX_FLAGS_RELEASE "-Os -g0")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -fno-rtti -fno-exceptions -fno-threadsafe-statics")
 
 set(CMAKE_EXE_LINKER_FLAGS "${TARGET_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T \"${CMAKE_SOURCE_DIR}/STM32H743VIHX_FLASH.ld\"")
+# NOTE: the linker script is selected in CMakeLists.txt via the BARE_METAL option
+# (STM32H743XX_FLASH.ld = bootloader slot @0x08020400,
+#  STM32H743XX_FLASH_BARE.ld = bare-metal @0x08000000). Not hard-coded here.
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --specs=nano.specs")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-Map=${CMAKE_PROJECT_NAME}.map -Wl,--gc-sections")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--print-memory-usage")

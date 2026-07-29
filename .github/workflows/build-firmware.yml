@@ -1,18 +1,45 @@
 name: Build firmware using published build image
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      bl_release:
+        description: "open-motion-sensor-bl release tag to bundle into the production image (default: latest)"
+        required: false
+        default: "latest"
   push:
     branches: [ "main", "next" ]
     tags:
       - "*.*.*"
       - "*.*.*-rc.*"
       - "*.*.*-dev.*"
-  release:
-    types: [created]
 
 permissions:
-  contents: write 
+  contents: write
+
+# ---------------------------------------------------------------------------
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#
+#   FW_SIGNING_KEY     ECDSA P-256 *private* signing key, full PEM (multi-line).
+#                      MUST be the private half of the public key embedded in the
+#                      open-motion-sensor-bl bootloader (SECoreBin). Used to sign
+#                      the slot image so the bootloader will accept it. This is the
+#                      SENSOR key — it is NOT the console key. NEVER commit this.
+#
+#   SECOREBIN_AES_KEY  AES-128 key as base64 of the raw 16 bytes. Same value as the
+#                      open-motion-sensor-bl secret of the same name. The CBC crypto
+#                      scheme's sign step requires it (sign_firmware.py --aes-key).
+#
+#   BL_REPO_TOKEN      PAT / fine-grained token with *read* access to
+#                      OpenwaterHealth/open-motion-sensor-bl (contents + releases).
+#                      Needed only because that repo is private: used to check out
+#                      py-tools/sign_firmware.py and to download the bootloader
+#                      release binary. Falls back to GITHUB_TOKEN if the bl repo is
+#                      made public.
+#
+# The AES + ECDSA keypair MUST match what is embedded in open-motion-sensor-bl.
+# A mismatch silently produces a bootloader that rejects this firmware.
+# ---------------------------------------------------------------------------
 
 jobs:
   build:
@@ -22,8 +49,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # full history so git-describe works
-          fetch-tags: true       # ensure all tags are present
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Fail fast (before the minutes-long builds) with a clear message if any
+      # signing/bootloader secret is missing, instead of the cryptic
+      # "set the GH_TOKEN environment variable" error deep in the run.
+      - name: Check required secrets
+        env:
+          FW_SIGNING_KEY: ${{ secrets.FW_SIGNING_KEY }}
+          SECOREBIN_AES_KEY: ${{ secrets.SECOREBIN_AES_KEY }}
+          BL_REPO_TOKEN: ${{ secrets.BL_REPO_TOKEN }}
+        run: |
+          missing=0
+          for v in FW_SIGNING_KEY SECOREBIN_AES_KEY BL_REPO_TOKEN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Required secret '$v' is not set. Add it under" \
+                   "Settings -> Secrets and variables -> Actions. BL_REPO_TOKEN" \
+                   "must be a PAT with read access to OpenwaterHealth/open-motion-sensor-bl."
+              missing=1
+            fi
+          done
+          [ "$missing" = "0" ] || exit 1
+          echo "All required secrets present."
+
       # ---------------------------
       # Determine build config from the ref:
       #   *-dev.* tag            -> Debug   (development pre-release)
@@ -50,75 +99,288 @@ jobs:
           echo "ref='$GITHUB_REF' event='$GITHUB_EVENT_NAME' tag='$TAG_NAME' -> build config: $CONFIG"
 
       # ---------------------------
-      # Build Firmware
+      # FwVersion is a uint16 consumed by the bootloader's monotonic anti-rollback
+      # floor. Derive it from a release tag X.Y.Z as X*10000 + Y*100 + Z (supports
+      # up to 6.55.35); non-release builds sign as version 1.
+      # WARNING: anti-rollback means a unit that has booted version N will REFUSE
+      # any image < N until re-flashed. Keep release versions monotonic. Revisit
+      # this mapping if the versioning policy changes.
       # ---------------------------
+      - name: Compute signing FW version
+        id: fwver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$TAG" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            V=$(( ${BASH_REMATCH[1]}*10000 + ${BASH_REMATCH[2]}*100 + ${BASH_REMATCH[3]} ))
+            [ "$V" -lt 1 ] && V=1
+            [ "$V" -gt 65535 ] && V=65535
+          else
+            V=1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Signing FwVersion: $V"
+
       - name: Pull build image
         run: docker pull ghcr.io/openwaterhealth/stm32-build-env:latest
 
-      - name: Build inside container
+      # Slot image: runs under the custom bootloader from the active slot
+      # (linked at 0x08020400). App-only, no FPGA merge -> directly signable.
+      # This is the image that gets signed.
+      - name: Build slot image (@0x08020400)
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE":/workspace \
             -w /workspace \
-            --workdir /workspace \
             ghcr.io/openwaterhealth/stm32-build-env:latest \
-            bash -lc "git config --global --add safe.directory /workspace || true; cmake --preset ${{ steps.cfg.outputs.config }} && cmake --build build/${{ steps.cfg.outputs.config }} --config ${{ steps.cfg.outputs.config }} --target all -j 10"
+            bash -lc "git config --global --add safe.directory /workspace && cmake --preset ${{ steps.cfg.outputs.config }} && cmake --build build/${{ steps.cfg.outputs.config }} --config ${{ steps.cfg.outputs.config }} --target all -j 10"
+
+      # Bare-metal image: standalone at 0x08000000, no bootloader (BARE_METAL=ON).
+      # This build emits BOTH:
+      #   motion-sensor-fw-raw.{bin,hex}  = app only (no FPGA)
+      #   motion-sensor-fw.{bin,hex}      = app + FPGA bitstream merged @0x081A0000
+      - name: Build bare-metal image (@0x08000000)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/workspace \
+            -w /workspace \
+            ghcr.io/openwaterhealth/stm32-build-env:latest \
+            bash -lc "git config --global --add safe.directory /workspace && cmake --preset ${{ steps.cfg.outputs.config }}-BareMetal && cmake --build build/${{ steps.cfg.outputs.config }}-BareMetal --config ${{ steps.cfg.outputs.config }} --target all -j 10"
 
       # ---------------------------
-      # Upload Firmware
+      # Resolve which open-motion-sensor-bl release to bundle. Uses the
+      # workflow_dispatch input when given, otherwise the latest published
+      # bootloader release.
       # ---------------------------
-      - name: Upload firmware artifact
+      - name: Resolve open-motion-sensor-bl release tag
+        id: bl
+        env:
+          GH_TOKEN: ${{ secrets.BL_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          REQ="${{ github.event.inputs.bl_release }}"
+          if [ -z "$REQ" ] || [ "$REQ" = "latest" ]; then
+            TAG=$(gh release view --repo OpenwaterHealth/open-motion-sensor-bl --json tagName --jq .tagName)
+          else
+            TAG="$REQ"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Bundling open-motion-sensor-bl @ $TAG"
+
+      # Pull the signing tool + public key from the SAME pinned bootloader version
+      # so the signing format always matches the bootloader that will verify it.
+      - name: Fetch signing tool from open-motion-sensor-bl
+        uses: actions/checkout@v4
+        with:
+          repository: OpenwaterHealth/open-motion-sensor-bl
+          ref: ${{ steps.bl.outputs.tag }}
+          token: ${{ secrets.BL_REPO_TOKEN }}
+          path: _bl
+          sparse-checkout: py-tools
+
+      - name: Download bootloader binary from open-motion-sensor-bl release
+        env:
+          GH_TOKEN: ${{ secrets.BL_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p _artifacts
+          gh release download "${{ steps.bl.outputs.tag }}" \
+            --repo OpenwaterHealth/open-motion-sensor-bl \
+            --pattern 'openmotion-bl.bin' \
+            --dir _artifacts --clobber
+          test -s _artifacts/openmotion-bl.bin
+
+      # ---------------------------
+      # Sign the slot image with the ECDSA private key (+ AES key) from secrets.
+      # The slot build's motion-sensor-fw.bin is already app-only (FPGA is merged
+      # only in bare-metal builds), so it is signed directly. Keys are materialised
+      # only into a tmp dir and removed after use; never written into the repo tree.
+      # ---------------------------
+      - name: Sign the slot image
+        env:
+          FW_SIGNING_KEY: ${{ secrets.FW_SIGNING_KEY }}
+          SECOREBIN_AES_KEY: ${{ secrets.SECOREBIN_AES_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FW_SIGNING_KEY" ] || [ -z "$SECOREBIN_AES_KEY" ]; then
+            echo "::error::FW_SIGNING_KEY and SECOREBIN_AES_KEY secrets must be set to sign the slot image." >&2
+            exit 1
+          fi
+          python3 -m pip install --quiet 'cryptography>=41'
+          KD="$(mktemp -d)"
+          trap 'rm -rf "$KD"' EXIT
+          printf '%s\n' "$FW_SIGNING_KEY" > "$KD/ecdsa_private.pem"
+          printf '%s' "$SECOREBIN_AES_KEY" | base64 -d > "$KD/aes128.bin"
+          if [ "$(wc -c < "$KD/aes128.bin")" -ne 16 ]; then
+            echo "::error::Decoded AES key is not 16 bytes — check SECOREBIN_AES_KEY." >&2
+            exit 1
+          fi
+          APP="build/${{ steps.cfg.outputs.config }}/motion-sensor-fw.bin"
+          test -s "$APP"
+          python3 _bl/py-tools/sign_firmware.py \
+            --firmware "$APP" \
+            --private-key "$KD/ecdsa_private.pem" \
+            --aes-key "$KD/aes128.bin" \
+            --version "${{ steps.fwver.outputs.version }}" \
+            --output _artifacts/motion-sensor-fw-signed.bin
+          test -s _artifacts/motion-sensor-fw-signed.bin
+          echo "Signed slot image: motion-sensor-fw-signed.bin (FwVersion=${{ steps.fwver.outputs.version }})"
+
+      # ---------------------------
+      # Production image = bootloader (@0x08000000) + signed app (@0x08020000)
+      # + camera FPGA bitstream (@0x081A0000), merged into a single flashable
+      # image for factory programming.
+      #
+      # The bitstream has to be in here. crosslink.c is compiled unconditionally
+      # (it is not behind BARE_METAL), so the slot application still programs the
+      # CrossLink from ADDR_CAMERA_BITSTREAM on every boot -- but the bootloader
+      # clamps its DFU window to the app slot, so nothing else can ever put a
+      # bitstream at 0x081A0000. Without it, a factory-fresh unit streams erased
+      # flash into the FPGA and comes up with no cameras. See issue #109.
+      # ---------------------------
+      - name: Assemble production image (bootloader + signed app + FPGA bitstream)
+        run: |
+          set -euo pipefail
+          # Downloaded into the workspace by the bare-metal CMake configure above.
+          test -s fpga/openmotion-camera-fpga.bin
+          python3 - <<'PY'
+          import re
+
+          BL   = "_artifacts/openmotion-bl.bin"
+          APP  = "_artifacts/motion-sensor-fw-signed.bin"
+          FPGA = "fpga/openmotion-camera-fpga.bin"
+          OUT  = "_artifacts/motion-sensor-production.bin"
+
+          BASE        = 0x08000000
+          SLOT_OFFSET = 0x08020000 - BASE   # 0x20000  bootloader occupies sector 0
+          FPGA_OFFSET = 0x081A0000 - BASE   # 0x1A0000 bank 2 sectors 5-6
+          FPGA_LIMIT  = 0x081E0000 - BASE   # motion_config + serial sector starts here
+
+          bl   = open(BL, "rb").read()
+          app  = open(APP, "rb").read()
+          fpga = open(FPGA, "rb").read()
+
+          if len(bl) > SLOT_OFFSET:
+              raise SystemExit(f"bootloader ({len(bl)} B) overlaps app slot at 0x{SLOT_OFFSET:x}")
+          if SLOT_OFFSET + len(app) > FPGA_OFFSET:
+              raise SystemExit(f"signed app ({len(app)} B) overlaps FPGA bitstream at 0x{FPGA_OFFSET:x}")
+          if FPGA_OFFSET + len(fpga) > FPGA_LIMIT:
+              raise SystemExit(f"FPGA bitstream ({len(fpga)} B) overruns its region at 0x{FPGA_LIMIT:x}")
+
+          # crosslink.c streams a hardcoded byte count out of ADDR_CAMERA_BITSTREAM.
+          # A bitstream of any other size is sent truncated or over-read, and the
+          # failure only shows up as a dead FPGA on hardware -- catch it here.
+          src = open("Core/Src/crosslink.c").read()
+          m = re.search(r"ADDR_CAMERA_BITSTREAM\s*,\s*\(size_t\)\s*(\d+)\s*\)", src)
+          if not m:
+              raise SystemExit("could not find the bitstream length constant in Core/Src/crosslink.c")
+          if int(m.group(1)) != len(fpga):
+              raise SystemExit(
+                  f"bitstream is {len(fpga)} B but crosslink.c streams {m.group(1)} B "
+                  f"-- update the constant in Core/Src/crosslink.c")
+
+          img = bytearray(b"\xff" * FPGA_OFFSET)
+          img[:len(bl)] = bl
+          img[SLOT_OFFSET:SLOT_OFFSET + len(app)] = app
+          img += fpga
+          with open(OUT, "wb") as f:
+              f.write(img)
+          print(f"production image: {len(img)} bytes (bootloader={len(bl)} B, "
+                f"signed app={len(app)} B, fpga={len(fpga)} B)")
+          PY
+          # Intel-HEX view, built from the three pieces rather than converted from
+          # the padded .bin: a flat conversion would emit ~1.4 MB of 0xFF records
+          # for the gaps and make flashing take far longer than it needs to.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/workspace \
+            -w /workspace \
+            ghcr.io/openwaterhealth/stm32-build-env:latest \
+            bash -lc 'set -e
+              arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x08000000 _artifacts/openmotion-bl.bin             _artifacts/_prod_bl.hex
+              arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x08020000 _artifacts/motion-sensor-fw-signed.bin  _artifacts/_prod_app.hex
+              arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x081A0000 fpga/openmotion-camera-fpga.bin         _artifacts/_prod_fpga.hex'
+          python3 merge_hex.py _artifacts/motion-sensor-production.hex \
+            _artifacts/_prod_bl.hex _artifacts/_prod_app.hex _artifacts/_prod_fpga.hex
+          rm -f _artifacts/_prod_bl.hex _artifacts/_prod_app.hex _artifacts/_prod_fpga.hex
+          test -s _artifacts/motion-sensor-production.hex
+
+      # Collect the two bare-metal images with unambiguous names (the bare-metal
+      # build emits both an app-only -raw image and an FPGA-merged image sharing
+      # the motion-sensor-fw.* basename).
+      - name: Collect bare-metal artifacts
+        run: |
+          set -euo pipefail
+          BM="build/${{ steps.cfg.outputs.config }}-BareMetal"
+          # app only (no FPGA)
+          cp "$BM/motion-sensor-fw-raw.bin" _artifacts/motion-sensor-fw-baremetal.bin
+          cp "$BM/motion-sensor-fw-raw.hex" _artifacts/motion-sensor-fw-baremetal.hex
+          # app + FPGA bitstream merged
+          cp "$BM/motion-sensor-fw.bin" _artifacts/motion-sensor-fw-baremetal-fpga.bin
+          cp "$BM/motion-sensor-fw.hex" _artifacts/motion-sensor-fw-baremetal-fpga.hex
+
+      # Upload as four separate, clearly-named artifacts (each shows as its own
+      # row) rather than one opaque bundle:
+      #   - baremetal      : standalone app @0x08000000, no bootloader, no FPGA
+      #   - baremetal-fpga : standalone app + FPGA bitstream, single flash image
+      #   - signed         : app @0x08020400 signed for the bootloader slot
+      #   - production     : bootloader + signed app + FPGA bitstream, single
+      #                      factory image
+      - name: Upload bare-metal (app only) artifact
         uses: actions/upload-artifact@v4
         with:
-          name: motion-sensor-fw
+          name: motion-sensor-fw-baremetal
+          if-no-files-found: error
           path: |
-            build/${{ steps.cfg.outputs.config }}/*.hex
-            build/${{ steps.cfg.outputs.config }}/*.bin
+            _artifacts/motion-sensor-fw-baremetal.bin
+            _artifacts/motion-sensor-fw-baremetal.hex
 
+      - name: Upload bare-metal (app + FPGA) artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: motion-sensor-fw-baremetal-fpga
+          if-no-files-found: error
+          path: |
+            _artifacts/motion-sensor-fw-baremetal-fpga.bin
+            _artifacts/motion-sensor-fw-baremetal-fpga.hex
 
-      # ---------------------------
-      # Create GitHub Release (tags only)
-      # ---------------------------
+      - name: Upload signed slot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: motion-sensor-fw-signed
+          if-no-files-found: error
+          path: _artifacts/motion-sensor-fw-signed.bin
+
+      - name: Upload production artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: motion-sensor-production
+          if-no-files-found: error
+          path: |
+            _artifacts/motion-sensor-production.bin
+            _artifacts/motion-sensor-production.hex
+
       - name: Detect release type
         id: reltype
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
-            TAG_NAME=$(python3 -c "import json,sys;print(json.load(open('$GITHUB_EVENT_PATH'))['release']['tag_name'])")
+          TAG_NAME="${GITHUB_REF_NAME}"
+
+          if [[ "$TAG_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(rc|dev)\.[0-9]+$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           else
-            TAG_NAME="${GITHUB_REF_NAME}"
+            echo "Unrecognized tag format: $TAG_NAME" >&2
+            exit 1
           fi
 
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-
-          if [[ "$TAG_NAME" == *"-rc."* ]] || [[ "$TAG_NAME" == *"-dev."* ]]; then
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-          else
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-          fi
-          # Compute release display name:
-          if [[ "$TAG_NAME" == pre-* ]]; then
-            BASE=${TAG_NAME#pre-}
-            if [[ "$BASE" == v* ]]; then
-              RELEASE_NAME="pre-${BASE}"
-            else
-              RELEASE_NAME="pre-v${BASE}"
-            fi
-          elif [[ "$TAG_NAME" == v* ]]; then
-            RELEASE_NAME="$TAG_NAME"
-          else
-            RELEASE_NAME="v${TAG_NAME}"
-          fi
-
-          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
-          
       - name: Capture build metadata
         id: buildmeta
         run: |
-          echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "datetime=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "datetime=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           : > notes.md
 
@@ -127,31 +389,38 @@ jobs:
             echo "" >> notes.md
           fi
 
-          PREV_TAG=$(git tag --sort=-creatordate | sed -n '2p')
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${GITHUB_REF_NAME}$" | head -n 1)
 
           if [ -z "$PREV_TAG" ]; then
             git log --pretty=format:"- %s" >> notes.md
           else
-            git log ${PREV_TAG}..HEAD --pretty=format:"- %s" >> notes.md
+            git log "$PREV_TAG"..HEAD --pretty=format:"- %s" >> notes.md
           fi
 
+          echo "" >> notes.md
           echo "" >> notes.md
           echo "---" >> notes.md
           echo "**Build SHA:** \`${{ steps.buildmeta.outputs.sha }}\`" >> notes.md
           echo "**Build Time:** ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
           echo "**Build Config:** ${{ steps.cfg.outputs.config }}" >> notes.md
+          echo "**Bundled bootloader:** \`${{ steps.bl.outputs.tag }}\`" >> notes.md
+          echo "**Signed FwVersion:** \`${{ steps.fwver.outputs.version }}\`" >> notes.md
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          draft: false
-          prerelease: ${{ steps.reltype.outputs.prerelease }}
-          allow_updates: ${{ steps.reltype.outputs.prerelease }}
-          replace_existing_artifacts: ${{ steps.reltype.outputs.prerelease }}
+          tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          prerelease: ${{ steps.reltype.outputs.prerelease }}
           body_path: notes.md
+          overwrite_files: true
+          make_latest: ${{ steps.reltype.outputs.prerelease == 'false' }}
           files: |
-            build/${{ steps.cfg.outputs.config }}/*.hex
-            build/${{ steps.cfg.outputs.config }}/*.bin
-
+            _artifacts/motion-sensor-fw-baremetal.bin
+            _artifacts/motion-sensor-fw-baremetal.hex
+            _artifacts/motion-sensor-fw-baremetal-fpga.bin
+            _artifacts/motion-sensor-fw-baremetal-fpga.hex
+            _artifacts/motion-sensor-fw-signed.bin
+            _artifacts/motion-sensor-production.bin
+            _artifacts/motion-sensor-production.hex

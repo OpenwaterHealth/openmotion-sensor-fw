@@ -71,11 +71,43 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
+# ---------------------------------------------------------------------------
+# Boot mode: run under the custom secure bootloader (default) or bare-metal.
+#   OFF (default): image runs from the bootloader's active slot (linked at
+#                  0x08020400, VTOR relocated there). A DFU request hands control
+#                  back to the custom bootloader via the RTC->BKP7R magic.
+#   ON           : bare-metal image at 0x08000000 with NO bootloader. A DFU
+#                  request jumps to the STM32 system-memory ROM bootloader
+#                  (0x1FF09800). Matches openmotion-console-fw.
+# ---------------------------------------------------------------------------
+option(BARE_METAL "Build a bare-metal image (no custom bootloader; runs at 0x08000000)" OFF)
+
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+# Select the linker script based on the BARE_METAL option. The matching
+# BARE_METAL_BUILD compile definition is applied to the stm32cubemx interface
+# library below so the STM32 drivers — notably system_stm32h7xx.c, which owns the
+# VTOR base address and the ROM-bootloader jump — pick it up alongside the app.
+if(BARE_METAL)
+    set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/STM32H743XX_FLASH_BARE.ld")
+    message(STATUS "Boot mode    : BARE METAL (0x08000000, DFU -> ROM bootloader)")
+else()
+    set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/STM32H743XX_FLASH.ld")
+    message(STATUS "Boot mode    : custom bootloader slot (0x08020400)")
+endif()
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -T "${LINKER_SCRIPT}")
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES LINK_DEPENDS "${LINKER_SCRIPT}")
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+
+# Propagate the boot-mode define to every translation unit (application sources
+# and the STM32 drivers), so system_stm32h7xx.c relocates VTOR and gates the
+# ROM-bootloader jump correctly.
+if(BARE_METAL)
+    target_compile_definitions(stm32cubemx INTERFACE BARE_METAL_BUILD=1)
+endif()
 
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -91,6 +123,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     USB/Class/IMU/Src/usbd_imu.c
     Core/Src/0X02C1B.c
     Core/Src/camera_manager.c
+    Core/Src/camera_telemetry.c
     Core/Src/crosslink.c
     Core/Src/histo_fake.c
     Core/Src/i2c_protocol.c
@@ -144,6 +177,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
 )
 
+# FPGA bitstream: only needed for the BARE-METAL image, where it is merged into
+# the flashed .hex/.bin. In bootloader-slot mode the app is signed app-only and
+# the FPGA is flashed separately at 0x081A0000, so the download + merge are
+# skipped entirely (and the slot .hex/.bin are the plain, directly-signable app).
+if(BARE_METAL)
 # FPGA bitstream binary (always fetch latest from GitHub releases)
 set(FPGA_BITSTREAM_BIN ${CMAKE_SOURCE_DIR}/fpga/openmotion-camera-fpga.bin)
 set(FPGA_BITSTREAM_URL "https://github.com/OpenwaterHealth/openmotion-camera-fpga/releases/latest/download/openmotion-camera-fpga.bin")
@@ -163,6 +201,7 @@ if(NOT FPGA_DOWNLOAD_ERROR EQUAL 0)
     message(FATAL_ERROR "Failed to download FPGA bitstream: ${FPGA_DOWNLOAD_MSG}")
 endif()
 message(STATUS "FPGA bitstream downloaded to ${FPGA_BITSTREAM_BIN}")
+endif()
 
 # Locate a Python interpreter for build-time scripts (e.g. merge_hex.py).
 # Prefer python3, fall back to python (Windows installers often ship only "python").
@@ -173,32 +212,45 @@ if(NOT PYTHON_EXECUTABLE)
 endif()
 message(STATUS "Using Python interpreter: ${PYTHON_EXECUTABLE}")
 
-# Generate hex and bin files after build
-add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-    # Generate firmware hex and bin
-    COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}-raw.hex
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}-raw.bin
+# Generate hex and bin files after build.
+if(BARE_METAL)
+    # Bare-metal: merge the FPGA bitstream into the flashed image so a single
+    # .hex/.bin flashed at 0x08000000 brings up both the app and the FPGA.
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+        # Generate firmware hex and bin
+        COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}-raw.hex
+        COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}-raw.bin
 
-    # Convert FPGA bitstream to hex at the target flash address
-    COMMAND ${CMAKE_OBJCOPY} -I binary -O ihex
-        --change-addresses ${FPGA_BITSTREAM_ADDR}
-        ${FPGA_BITSTREAM_BIN}
-        openmotion-camera-fpga.hex
+        # Convert FPGA bitstream to hex at the target flash address
+        COMMAND ${CMAKE_OBJCOPY} -I binary -O ihex
+            --change-addresses ${FPGA_BITSTREAM_ADDR}
+            ${FPGA_BITSTREAM_BIN}
+            openmotion-camera-fpga.hex
 
-    # Merge firmware + FPGA bitstream into a single hex file
-    COMMAND ${CMAKE_COMMAND} -E echo "Merging firmware + FPGA bitstream hex files..."
-    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_SOURCE_DIR}/merge_hex.py
-        ${CMAKE_PROJECT_NAME}.hex
-        ${CMAKE_PROJECT_NAME}-raw.hex
-        openmotion-camera-fpga.hex
+        # Merge firmware + FPGA bitstream into a single hex file
+        COMMAND ${CMAKE_COMMAND} -E echo "Merging firmware + FPGA bitstream hex files..."
+        COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_SOURCE_DIR}/merge_hex.py
+            ${CMAKE_PROJECT_NAME}.hex
+            ${CMAKE_PROJECT_NAME}-raw.hex
+            openmotion-camera-fpga.hex
 
-    # Generate combined bin from merged hex (for DFU flashing)
-    COMMAND ${CMAKE_OBJCOPY} -I ihex -O binary
-        ${CMAKE_PROJECT_NAME}.hex
-        ${CMAKE_PROJECT_NAME}.bin
+        # Generate combined bin from merged hex (for direct flashing)
+        COMMAND ${CMAKE_OBJCOPY} -I ihex -O binary
+            ${CMAKE_PROJECT_NAME}.hex
+            ${CMAKE_PROJECT_NAME}.bin
 
-    COMMENT "Generating .hex/.bin and merging FPGA bitstream at ${FPGA_BITSTREAM_ADDR}"
-)
+        COMMENT "Generating .hex/.bin and merging FPGA bitstream at ${FPGA_BITSTREAM_ADDR}"
+    )
+else()
+    # Bootloader-slot: plain application image, NO FPGA merge. motion-sensor-fw.bin
+    # is the app-only image that gets signed for the bootloader; the FPGA bitstream
+    # is flashed separately at 0x081A0000.
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_OBJCOPY} -O ihex   $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.hex
+        COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.bin
+        COMMENT "Generating .hex/.bin (bootloader slot; app-only, FPGA flashed separately)"
+    )
+endif()
 
 # Build + DFU-flash targets, one per sensor side. Invokes scripts/deploy.py.
 # `--device` is required by the script, so we expose two separate targets.

@@ -21,7 +21,7 @@ typedef struct __attribute__((packed)) {
 	uint8_t version;          /* = I2C_HEALTH_VERSION */
 	uint8_t mux_present;      /* TCA9548A 0x70 ACK on the main bus */
 	uint8_t imu_present;      /* ICM-20948 0x68 ACK on the main bus */
-	uint8_t camera_present;   /* bit i = OV2312 (0x36) found on mux channel i */
+	uint8_t camera_present;   /* bit i = OX02C1B (0x36) found on mux channel i */
 	uint8_t fpga_present;     /* bit i = CrossLink (0x40) found on mux channel i */
 	uint8_t cameras_expected; /* = 0xFF (all 8 — both sensors fully connected) */
 	uint8_t all_present;      /* 1 iff mux & imu & camera==0xFF & fpga==0xFF */

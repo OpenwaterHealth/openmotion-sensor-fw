@@ -51,7 +51,7 @@ typedef struct {
 
 #define CAMERA_COUNT	8
 /* How long a dead camera's rail is held off so the camera-module PCB power
- * regulator (supplies both the CrossLink FPGA and the OV2312) can cool and
+ * regulator (supplies both the CrossLink FPGA and the OX02C1B) can cool and
  * clear its thermal-shutdown latch. */
 #define CAMERA_RECOVERY_OFF_MS	10000
 #define HISTOGRAM_DATA_SIZE	4100
@@ -90,6 +90,7 @@ _Bool enter_sram_prog_fpga(uint8_t cam_id);
 _Bool exit_sram_prog_fpga(uint8_t cam_id);
 _Bool erase_sram_fpga(uint8_t cam_id);
 _Bool program_fpga(uint8_t cam_id, _Bool force_update);
+_Bool camera_nvcm_boot_probe(uint8_t cam_id, _Bool *booted);
 _Bool configure_camera_sensor(uint8_t cam_id);
 _Bool configure_camera_testpattern(uint8_t cam_id, uint8_t test_pattern);
 _Bool capture_single_histogram(uint8_t cam_id);

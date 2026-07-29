@@ -85,7 +85,9 @@
 /*!< Uncomment the following line if you need to relocate the vector table
      anywhere in FLASH BANK1 or AXI SRAM, else the vector table is kept at the automatic
      remap of boot address selected */
-/* #define USER_VECT_TAB_ADDRESS */
+/* Relocate the vector table: the boot mode (bare-metal @0x08000000 vs custom
+ * bootloader slot @0x08020400) is resolved below via BARE_METAL_BUILD. */
+#define USER_VECT_TAB_ADDRESS
 
 #if defined(USER_VECT_TAB_ADDRESS)
 #if defined(DUAL_CORE) && defined(CORE_CM4)
@@ -112,11 +114,14 @@
                                                        This value must be a multiple of 0x400. */
 #define VECT_TAB_OFFSET         0x00000000U       /*!< Vector Table base offset field.
                                                        This value must be a multiple of 0x400. */
+#elif defined(BARE_METAL_BUILD)
+#define VECT_TAB_BASE_ADDRESS   0x08000000U       /*!< Bare-metal image at flash base
+                                                       (no bootloader). Multiple of 0x400. */
+#define VECT_TAB_OFFSET         0x00000000U       /*!< Multiple of 0x400. */
 #else
-#define VECT_TAB_BASE_ADDRESS   FLASH_BANK1_BASE  /*!< Vector Table base address field.
-                                                       This value must be a multiple of 0x400. */
-#define VECT_TAB_OFFSET         0x00000000U       /*!< Vector Table base offset field.
-                                                       This value must be a multiple of 0x400. */
+#define VECT_TAB_BASE_ADDRESS   0x08020400U       /*!< Custom bootloader active slot
+                                                       (0x08020000) + image offset (0x400). */
+#define VECT_TAB_OFFSET         0x00000000U       /*!< Multiple of 0x400. */
 #endif /* VECT_TAB_SRAM */
 #endif /* DUAL_CORE && CORE_CM4 */
 #endif /* USER_VECT_TAB_ADDRESS */
@@ -165,6 +170,13 @@
   * @{
   */
 
+/* Bare-metal build only: honour a DFU request by jumping to the STM32
+ * system-memory ROM DFU loader (0x1FF09800 on H743). The application writes
+ * 0xDEADBEEF to D3 SRAM (0x38000000) and resets; that RAM survives the reset and
+ * is checked first thing in SystemInit. In the custom-bootloader build the
+ * bootloader runs first and reads its own RTC backup-register magic, so this is
+ * compiled out and SystemInit boots straight into the slot image. */
+#if defined(BARE_METAL_BUILD)
 void CheckBootloaderFlag(void) {
     if (*((uint32_t *)0x38000000) == 0xDEADBEEF) {
         *((uint32_t *)0x38000000) = 0; // Clear flag
@@ -212,6 +224,7 @@ void CheckBootloaderFlag(void) {
         pJump();
     }
 }
+#endif /* BARE_METAL_BUILD */
 
 /**
   * @brief  Setup the microcontroller system
@@ -222,7 +235,9 @@ void CheckBootloaderFlag(void) {
   */
 void SystemInit (void)
 {
+#if defined(BARE_METAL_BUILD)
   CheckBootloaderFlag();
+#endif
 #if defined (DATA_IN_D2_SRAM)
  __IO uint32_t tmpreg;
 #endif /* DATA_IN_D2_SRAM */

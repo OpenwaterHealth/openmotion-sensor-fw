@@ -16,6 +16,7 @@
 #include "i2c_protocol.h"
 #include "ICM20948.h"
 #include "0X02C1B.h"
+#include "camera_telemetry.h"
 #include "histo_fake.h"
 #include "usbd_histo.h"
 #include "motion_config.h"
@@ -34,6 +35,19 @@ extern volatile uint8_t event_bits_enabled;
 } while(0)
 
 static uint32_t id_words[4] = {0};  /* 3 UID words + 1 zero-pad: HWID reply is 16B, so [3] would over-read 4B past the array */
+
+/* OW_CMD_BOOT_INFO reply. Reports the RUNTIME vector-table base (SCB->VTOR),
+ * not the compile-time BARE_METAL_BUILD flag, so the device evidences where it
+ * is actually executing: 0x08000000 => bare-metal, 0x08020400 => bootloader
+ * slot. The host derives the boot mode. Packed, little-endian on the wire. */
+typedef struct __attribute__((packed)) {
+	uint8_t  struct_version;   /* 1 */
+	uint8_t  reserved[3];
+	uint32_t vtor;             /* SCB->VTOR */
+	uint32_t flash_base;       /* image link base (same as vtor sans the 0x400 header offset in slot builds) */
+} boot_info_t;
+static boot_info_t boot_info = {0};
+
 static uint8_t camera_status[8] = {0};
 static uint8_t i2c_reg_read_buf[I2C_REG_READ_MAX_LEN] = {0};
 static uint8_t camera_power_status = 0;
@@ -86,6 +100,22 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		id_words[2] = HAL_GetUIDw2();
 		uartResp->data_len = 16;
 		uartResp->data = (uint8_t *)&id_words;
+		break;
+	case OW_CMD_BOOT_INFO:
+		VERBOSE_CMD("[CMD] OW_CMD_BOOT_INFO\r\n");
+		uartResp->command = OW_CMD_BOOT_INFO;
+		uartResp->packet_type = OW_RESP;
+		boot_info.struct_version = 1u;
+		boot_info.reserved[0] = 0u;
+		boot_info.reserved[1] = 0u;
+		boot_info.reserved[2] = 0u;
+		boot_info.vtor       = SCB->VTOR;
+		/* Link base = VTOR. In slot builds the vectors sit at slot+0x400; the
+		 * host only needs VTOR to classify (0x08000000 bare-metal vs 0x08020400
+		 * slot), so we report it directly rather than reconstructing a base. */
+		boot_info.flash_base = SCB->VTOR;
+		uartResp->data_len = sizeof(boot_info);
+		uartResp->data = (uint8_t *)&boot_info;
 		break;
 	case OW_CMD_I2C_REG_READ:
 	{
@@ -940,6 +970,16 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 				uartResp->data = (uint8_t *)&cam_temp; // Point to the static temp variable
 			}
 		}
+		break;
+	case OW_CAMERA_GET_TELEMETRY:
+		/* #94: background-collected per-camera condition snapshot (rails,
+		 * temps, faults, counters). No I2C here — returns the cache that
+		 * camera_telemetry_service() maintains from the main loop. */
+		VERBOSE_CMD("[CMD] OW_CAMERA_GET_TELEMETRY\r\n");
+		uartResp->command = OW_CAMERA_GET_TELEMETRY;
+		uartResp->packet_type = OW_RESP;
+		uartResp->data_len = sizeof(cam_telemetry_response_t);
+		uartResp->data = (uint8_t *)camera_telemetry_get();
 		break;
 	case OW_CAMERA_FSIN_EXTERNAL:
 		VERBOSE_CMD("[CMD] OW_CAMERA_FSIN_EXTERNAL reserved=%u (%s)\r\n", cmd.reserved, cmd.reserved == 0 ? "disable" : "enable");

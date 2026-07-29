@@ -102,14 +102,16 @@ void logging_set_debug_flags(uint32_t flags) {
 	uint32_t prev_flags = debug_flags;
 	debug_flags = flags;
 	if (prev_flags != debug_flags) {
-		printf("Debug flags changed: 0x%08lX -> 0x%08lX%s%s%s%s%s\r\n",
+		printf("Debug flags changed: 0x%08lX -> 0x%08lX%s%s%s%s%s%s%s\r\n",
 		       (unsigned long)prev_flags,
 		       (unsigned long)debug_flags,
 		       (debug_flags & DEBUG_FLAG_USB_PRINTF) ? " (USB printf ON)" : " (USB printf OFF)",
 		       (debug_flags & DEBUG_FLAG_HISTO_SPARSE) ? " (HISTO sparse ON)" : "",
 		       (debug_flags & DEBUG_FLAG_COMM_VERBOSE) ? " (comm verbose ON)" : "",
 		       (debug_flags & DEBUG_FLAG_CMD_VERBOSE) ? " (verbose cmd ON)" : "",
-		       (debug_flags & DEBUG_FLAG_HISTO_CMP) ? " (histo compress ON)" : "");
+		       (debug_flags & DEBUG_FLAG_HISTO_CMP) ? " (histo compress ON)" : "",
+		       (debug_flags & DEBUG_FLAG_CAMERA_CROP) ? " (camera crop 1720 ON)" : "",
+		       (debug_flags & DEBUG_FLAG_CAMERA_RAW) ? " (camera RAW ON)" : "");
 	}
 	if ((debug_flags & DEBUG_FLAG_USB_PRINTF) == 0u) {
 		// Drop any buffered log data so it doesn't flush later.

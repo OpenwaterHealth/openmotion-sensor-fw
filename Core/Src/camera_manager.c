@@ -9,6 +9,7 @@
 #include "logging.h"
 #include "crosslink.h"
 #include "0X02C1B.h"
+#include "camera_telemetry.h"
 #include "i2c_master.h"
 #include "uart_comms.h"
 #include "utils.h"
@@ -139,14 +140,18 @@ static bool camera_request_is_valid(uint8_t cam_id) {
 
 
 /**
- * Detect whether a CrossLink FPGA has been permanently programmed via NVCM.
+ * Detect whether a CrossLink FPGA boots a working design from NVCM.
  *
- * Method: enter forced slave config mode (activation key + CRESETB), read the
- * STATUS register Done bit.  Done=1 means NVCM was fully programmed (the Done
- * bit is the last step burned during NVCM programming and gates auto-boot).
+ * Method: release CRESETB without the activation key (auto-boot window),
+ * then check that the booted user design is driving this camera's bus
+ * clk/data pins low. This is behavioral — it detects a *bootable* image,
+ * not just a burned Done fuse: a part with the Done fuse programmed but a
+ * non-booting image correctly reads "no boot" here even though the 0x6C
+ * probe's STATUS bit 19 (the SDM Enable fuse mirror) reads "programmed"
+ * (openmotion-test-app#44, 2026-07-17).
  *
- * The slave I2C config port at 0x40 requires the activation key to become
- * active — without it, 0x40 never responds regardless of NVCM state.
+ * Leaves the design running (CRESETB high) when it booted, or the FPGA
+ * held in reset (CRESETB low, SRAM cleared) when it did not.
  */
 static bool fpga_detect_nvcm(CameraDevice *cam)
 {
@@ -202,6 +207,29 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
 	return false;
+}
+
+/* Host-facing wrapper for the pin-drive NVCM boot probe (#91 — verdict byte
+ * appended to the OW_FACTORY_NVCM_CHECK blob). Read-only with respect to
+ * flash and cached camera state: no SRAM write, no isProgrammed/isConfigured
+ * mutation — but
+ * it does reset the FPGA, so a previously SRAM-configured blank part is left
+ * unconfigured until the next program_fpga(). Returns false (probe refused)
+ * for an out-of-range index or an unpowered camera, whose floating pins
+ * would fake a "booted" reading. */
+_Bool camera_nvcm_boot_probe(uint8_t cam_id, _Bool *booted)
+{
+	if (cam_id >= CAMERA_COUNT || booted == NULL) {
+		return false;
+	}
+	CameraDevice *cam = &cam_array[cam_id];
+	if (!cam->isPowered) {
+		printf("C%d: NVCM boot probe refused - camera not powered\r\n",
+		       cam_id + 1);
+		return false;
+	}
+	*booted = fpga_detect_nvcm(cam);
+	return true;
 }
 
 static void init_camera(CameraDevice *cam){
@@ -1146,7 +1174,7 @@ static void poll_camera_temperatures(void)
                     {
                         /* Keep last-known-good on failed reads: read_temp
                          * returns a negative error code on I2C failure, and
-                         * a live OV2312 die never legitimately reads <= 0 °C
+                         * a live OX02C1B die never legitimately reads <= 0 °C
                          * (self-heating), so treat non-positive as failure. */
                         float t = X02C1B_read_temp(pCam);
                         if (t > 0.0f) {
@@ -1223,7 +1251,7 @@ static void camera_death_isolate(uint8_t cam_id)
 }
 
 /* Re-power a dead camera's rail once its cool-off has elapsed, keeping
- * CRESETB low: the FPGA stays unbooted and quiet, while the OV2312 (direct
+ * CRESETB low: the FPGA stays unbooted and quiet, while the OX02C1B (direct
  * I2C behind the mux) comes back up so temperature telemetry resumes.
  * needs_recovery stays set until program_fpga() completes the real
  * bring-up at the next scan. Main-loop only. */
@@ -1274,6 +1302,11 @@ void camera_i2c_service(void)
     }
 
     camera_recovery_tick();  /* Re-power dead cameras whose cool-off elapsed */
+
+    /* #94: advance the background telemetry sweep by one bounded chunk.
+     * Unlike the temp poll it self-schedules on HAL_GetTick(), so telemetry
+     * keeps refreshing while idle (no frames driving cam_temp_poll_due). */
+    camera_telemetry_service();
 }
 /* -------- END CAMERA I2C FUNCTIONS -------- */
 
@@ -1438,7 +1471,7 @@ static void check_camera_failures(void) {
 						/* Mark dead via needs_recovery — NOT isPresent, which keeps
 						 * the presence determination from scan start. The likely
 						 * cause is the camera PCB's power regulator hitting thermal
-						 * shutdown (kills both FPGA and OV2312), so the camera
+						 * shutdown (kills both FPGA and OX02C1B), so the camera
 						 * needs a timed rail cycle, done from the main loop. */
 						cam_array[cam_id].needs_recovery = true;
 						printf("Camera %d has stopped posting data\r\n", cam_id + 1);
