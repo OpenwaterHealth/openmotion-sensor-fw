@@ -1,6 +1,6 @@
 # openmotion-sensor-fw — Claude guide
 
-Firmware for the sensor-module MCU (STM32H743VIH6). Drives 8 OV2312 cameras through a Lattice CrossLink FPGA, exposes a composite USB device (three bulk interfaces: COMMS, HISTO, IMU) to the host, and ships a `.hex` that merges the firmware + the FPGA bitstream into one programmable image.
+Firmware for the sensor-module MCU (STM32H743VIH6). Drives 8 OX02C1B cameras through a Lattice CrossLink FPGA, exposes a composite USB device (three bulk interfaces: COMMS, HISTO, IMU) to the host, and ships a `.hex` that merges the firmware + the FPGA bitstream into one programmable image.
 
 Cross-repo context + shared protocol: [../CLAUDE.md](../CLAUDE.md). Authoritative protocol spec lives in [../openmotion-console-fw/CommandHandling.md](../openmotion-console-fw/CommandHandling.md).
 
@@ -108,7 +108,7 @@ Note: the parent CLAUDE.md historically claimed 384 KB for the FPGA region — t
 | `Core/Src/main.c` | Init, event loop, USB setup, GPIO / IRQ handlers. |
 | `Core/Src/if_commands.c` | Command dispatcher — handlers in `app_handle_uartframe()`. |
 | `Core/Src/camera_manager.c` | 8-camera orchestration, histogram streaming. SPI6 read from FPGA → `frame_buffer` → USB HISTO. |
-| `Core/Src/0X02C1B.c` | OV2312 image-sensor register config (the file is literally named after the part). |
+| `Core/Src/0X02C1B.c` | OX02C1B image-sensor register config (the file is named after the part). |
 | `Core/Src/crosslink.c` | Lattice CrossLink FPGA — I2C activation, IDCODE check, SRAM erase/program, status verify. Bitstream size hardcoded as `163489`. |
 | `Core/Src/ICM20948.c` | 6-DOF IMU + magnetometer driver. |
 | `Core/Src/uart_comms.c` | UART packet framing with CRC-16. |

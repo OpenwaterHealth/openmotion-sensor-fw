@@ -51,7 +51,7 @@ typedef struct {
 
 #define CAMERA_COUNT	8
 /* How long a dead camera's rail is held off so the camera-module PCB power
- * regulator (supplies both the CrossLink FPGA and the OV2312) can cool and
+ * regulator (supplies both the CrossLink FPGA and the OX02C1B) can cool and
  * clear its thermal-shutdown latch. */
 #define CAMERA_RECOVERY_OFF_MS	10000
 #define HISTOGRAM_DATA_SIZE	4100

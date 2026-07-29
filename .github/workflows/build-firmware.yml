@@ -226,34 +226,81 @@ jobs:
           echo "Signed slot image: motion-sensor-fw-signed.bin (FwVersion=${{ steps.fwver.outputs.version }})"
 
       # ---------------------------
-      # Production image = bootloader (@0x08000000) + signed app (@0x08020000),
-      # merged into a single flashable image for factory programming.
+      # Production image = bootloader (@0x08000000) + signed app (@0x08020000)
+      # + camera FPGA bitstream (@0x081A0000), merged into a single flashable
+      # image for factory programming.
+      #
+      # The bitstream has to be in here. crosslink.c is compiled unconditionally
+      # (it is not behind BARE_METAL), so the slot application still programs the
+      # CrossLink from ADDR_CAMERA_BITSTREAM on every boot -- but the bootloader
+      # clamps its DFU window to the app slot, so nothing else can ever put a
+      # bitstream at 0x081A0000. Without it, a factory-fresh unit streams erased
+      # flash into the FPGA and comes up with no cameras. See issue #109.
       # ---------------------------
-      - name: Assemble production image (bootloader + signed app)
+      - name: Assemble production image (bootloader + signed app + FPGA bitstream)
         run: |
           set -euo pipefail
+          # Downloaded into the workspace by the bare-metal CMake configure above.
+          test -s fpga/openmotion-camera-fpga.bin
           python3 - <<'PY'
-          BL  = "_artifacts/openmotion-bl.bin"
-          APP = "_artifacts/motion-sensor-fw-signed.bin"
-          OUT = "_artifacts/motion-sensor-production.bin"
-          SLOT_OFFSET = 0x08020000 - 0x08000000   # 0x20000 (bootloader occupies sector 0)
-          bl  = open(BL, "rb").read()
-          app = open(APP, "rb").read()
+          import re
+
+          BL   = "_artifacts/openmotion-bl.bin"
+          APP  = "_artifacts/motion-sensor-fw-signed.bin"
+          FPGA = "fpga/openmotion-camera-fpga.bin"
+          OUT  = "_artifacts/motion-sensor-production.bin"
+
+          BASE        = 0x08000000
+          SLOT_OFFSET = 0x08020000 - BASE   # 0x20000  bootloader occupies sector 0
+          FPGA_OFFSET = 0x081A0000 - BASE   # 0x1A0000 bank 2 sectors 5-6
+          FPGA_LIMIT  = 0x081E0000 - BASE   # motion_config + serial sector starts here
+
+          bl   = open(BL, "rb").read()
+          app  = open(APP, "rb").read()
+          fpga = open(FPGA, "rb").read()
+
           if len(bl) > SLOT_OFFSET:
               raise SystemExit(f"bootloader ({len(bl)} B) overlaps app slot at 0x{SLOT_OFFSET:x}")
-          img = bytearray(b"\xff" * SLOT_OFFSET)
+          if SLOT_OFFSET + len(app) > FPGA_OFFSET:
+              raise SystemExit(f"signed app ({len(app)} B) overlaps FPGA bitstream at 0x{FPGA_OFFSET:x}")
+          if FPGA_OFFSET + len(fpga) > FPGA_LIMIT:
+              raise SystemExit(f"FPGA bitstream ({len(fpga)} B) overruns its region at 0x{FPGA_LIMIT:x}")
+
+          # crosslink.c streams a hardcoded byte count out of ADDR_CAMERA_BITSTREAM.
+          # A bitstream of any other size is sent truncated or over-read, and the
+          # failure only shows up as a dead FPGA on hardware -- catch it here.
+          src = open("Core/Src/crosslink.c").read()
+          m = re.search(r"ADDR_CAMERA_BITSTREAM\s*,\s*\(size_t\)\s*(\d+)\s*\)", src)
+          if not m:
+              raise SystemExit("could not find the bitstream length constant in Core/Src/crosslink.c")
+          if int(m.group(1)) != len(fpga):
+              raise SystemExit(
+                  f"bitstream is {len(fpga)} B but crosslink.c streams {m.group(1)} B "
+                  f"-- update the constant in Core/Src/crosslink.c")
+
+          img = bytearray(b"\xff" * FPGA_OFFSET)
           img[:len(bl)] = bl
-          img += app
+          img[SLOT_OFFSET:SLOT_OFFSET + len(app)] = app
+          img += fpga
           with open(OUT, "wb") as f:
               f.write(img)
-          print(f"production image: {len(img)} bytes (bootloader={len(bl)} B, signed app={len(app)} B)")
+          print(f"production image: {len(img)} bytes (bootloader={len(bl)} B, "
+                f"signed app={len(app)} B, fpga={len(fpga)} B)")
           PY
-          # Intel-HEX view of the same image at load base 0x08000000
+          # Intel-HEX view, built from the three pieces rather than converted from
+          # the padded .bin: a flat conversion would emit ~1.4 MB of 0xFF records
+          # for the gaps and make flashing take far longer than it needs to.
           docker run --rm \
             -v "$GITHUB_WORKSPACE":/workspace \
             -w /workspace \
             ghcr.io/openwaterhealth/stm32-build-env:latest \
-            bash -lc "arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x08000000 _artifacts/motion-sensor-production.bin _artifacts/motion-sensor-production.hex"
+            bash -lc 'set -e
+              arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x08000000 _artifacts/openmotion-bl.bin             _artifacts/_prod_bl.hex
+              arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x08020000 _artifacts/motion-sensor-fw-signed.bin  _artifacts/_prod_app.hex
+              arm-none-eabi-objcopy -I binary -O ihex --change-addresses=0x081A0000 fpga/openmotion-camera-fpga.bin         _artifacts/_prod_fpga.hex'
+          python3 merge_hex.py _artifacts/motion-sensor-production.hex \
+            _artifacts/_prod_bl.hex _artifacts/_prod_app.hex _artifacts/_prod_fpga.hex
+          rm -f _artifacts/_prod_bl.hex _artifacts/_prod_app.hex _artifacts/_prod_fpga.hex
           test -s _artifacts/motion-sensor-production.hex
 
       # Collect the two bare-metal images with unambiguous names (the bare-metal
@@ -275,7 +322,8 @@ jobs:
       #   - baremetal      : standalone app @0x08000000, no bootloader, no FPGA
       #   - baremetal-fpga : standalone app + FPGA bitstream, single flash image
       #   - signed         : app @0x08020400 signed for the bootloader slot
-      #   - production     : bootloader + signed app, single factory image
+      #   - production     : bootloader + signed app + FPGA bitstream, single
+      #                      factory image
       - name: Upload bare-metal (app only) artifact
         uses: actions/upload-artifact@v4
         with:

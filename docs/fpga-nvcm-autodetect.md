@@ -115,7 +115,7 @@ the i2cem/isp path depends on index 5 first.)
 
 ### Background
 
-Each sensor module has 8 OV2312 cameras, each with its own Lattice CrossLink
+Each sensor module has 8 OX02C1B cameras, each with its own Lattice CrossLink
 FPGA behind a TCA9548A I2C mux at address 0x70.  The FPGAs compute histograms
 from MIPI CSI-2 camera data.
 

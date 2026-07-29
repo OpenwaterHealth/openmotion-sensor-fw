@@ -12,6 +12,10 @@
  * A failed transaction aborts the whole sweep: the published cache keeps the
  * camera's last completed snapshot (same last-known-good philosophy as
  * cam_temp[]) and i2c_err_count records the failure.
+ *
+ * #103 added the optical-black / black-level block (DS table A-25): the
+ * z_avg dark-row averages plus the window, target, trigger and fault context
+ * needed to interpret them. Read-only, like everything else here.
  */
 
 #include "camera_telemetry.h"
@@ -54,13 +58,27 @@ static const struct telem_op telem_ops[] = {
 	{ 0x350Au, 3u },  /* commanded digital gain (packed 14-bit) */
 	{ 0x3503u, 1u },  /* AEC/AGC mode */
 	{ 0x3A93u, 1u },  /* DCG (conversion gain) state */
-	{ 0x4001u, 1u },  /* BLC ctrl (#89 raw-mode contract) */
+	{ 0x4000u, 10u }, /* BLC trigger ctrl, BLC ctrl (#89 raw-mode contract),
+	                   * rsvd x2, black-level target, hwin_pad (skipped),
+	                   * black-row window start/end */
 	{ 0x5000u, 1u },  /* ISP ctrl (#89 raw-mode contract) */
 	{ 0x5052u, 8u },  /* ISP-latched real gain / dig gain / BLC / exposure */
 	{ 0x4072u, 30u }, /* applied BLC offsets ch0-7 ({MSB,LSB} at stride 4) */
+	/* #103 optical-black block. Read-only; ordered by address so the
+	 * bursts stay contiguous (DS table A-25). */
+	{ 0x4019u, 2u },  /* black-row count, line-number/bypass mode */
+	{ 0x4050u, 2u },  /* zero-line window start/end */
+	{ 0x4061u, 2u },  /* thres_l — computed sample-discard threshold */
+	{ 0x4065u, 2u },  /* zero_ln_num */
+	{ 0x40B3u, 1u },  /* digital-test-row fail count */
+	{ 0x40CDu, 8u },  /* BLCoffset10000..10011 (second offset bank, contiguous) */
+	{ 0x40E0u, 12u }, /* z_avg 00/01/10/11, zavg ctrl, 0x40E9 (skipped),
+	                   * second zero-line window start/end */
+	{ 0x40F1u, 2u },  /* BLC fault latch / fault state */
+	{ 0x40F8u, 1u },  /* digital-test-row fault status */
 };
 #define TELEM_N_OPS (sizeof(telem_ops) / sizeof(telem_ops[0]))
-#define TELEM_RAW_BYTES 81u
+#define TELEM_RAW_BYTES 122u
 
 /* Firmware-side FSIN pulse counter (main.c, incremented per frame trigger):
  * the frames-triggered ground truth for the response header — the sensor's
@@ -130,6 +148,7 @@ static void telem_publish(uint8_t cam_id, uint32_t now)
 	uint8_t prev_wd0 = t->wd[0], prev_wd1 = t->wd[1];
 	uint8_t prev_vml = t->vm_latched, prev_vmcpl = t->vm_cp_latched;
 	uint8_t prev_tpm = (uint8_t)(t->tpm_status & 0x0Fu);
+	uint8_t prev_blcf = t->blc_fault_latch;
 	_Bool was_valid = (telem_resp.valid_mask & (1u << cam_id)) != 0u;
 
 	t->avdd_raw = rd16(&p);
@@ -160,7 +179,15 @@ static void telem_publish(uint8_t cam_id, uint32_t now)
 	t->dgain_cmd |= rd8(&p);
 	t->aec_mode = rd8(&p);
 	t->dcg_state = rd8(&p);
+	/* 0x4000-0x4009 block: two reserved bytes and hwin_pad are read as part
+	 * of the burst but not published (nothing OB-relevant in them). */
+	t->blc_trig_ctrl = rd8(&p);
 	t->blc_ctrl = rd8(&p);
+	p += 2;                        /* 0x4002-0x4003 reserved */
+	t->blk_lvl_target = rd16(&p);
+	p += 2;                        /* 0x4006/07 hwin_pad */
+	t->bl_start = rd8(&p);
+	t->bl_end = rd8(&p);
 	t->isp_ctrl = rd8(&p);
 	t->isp_real_gain = rd16(&p);
 	t->isp_dig_gain = rd16(&p);
@@ -172,6 +199,28 @@ static void telem_publish(uint8_t cam_id, uint32_t now)
 		t->blc_offset[i] = (uint16_t)(((uint16_t)p[i * 4u] << 8) | p[i * 4u + 1u]);
 	}
 	p += 30;
+
+	/* #103 optical-black block, in telem_ops[] order. */
+	t->blk_ln_num = rd8(&p);
+	t->blc_ln_mode = rd8(&p);
+	t->zl_start = rd8(&p);
+	t->zl_end = rd8(&p);
+	t->blc_thres = rd16(&p);
+	t->zero_ln_num = rd16(&p);
+	t->dig_test_fail = rd8(&p);
+	for (uint8_t i = 0; i < 4u; i++) {   /* BLCoffset10000..10011, contiguous */
+		t->blc_offset_z[i] = rd16(&p);
+	}
+	for (uint8_t i = 0; i < 4u; i++) {   /* z_avg_00, _01, _10, _11 */
+		t->z_avg[i] = rd16(&p);
+	}
+	t->zavg_ctrl = rd8(&p);
+	p += 1;                              /* 0x40E9 row data-type selects */
+	t->zl_start2 = rd8(&p);
+	t->zl_end2 = rd8(&p);
+	t->blc_fault_latch = rd8(&p);
+	t->blc_fault_state = rd8(&p);
+	t->dtr_fault = rd8(&p);
 
 	if (p != &telem_staging[TELEM_RAW_BYTES]) {
 		/* Decode desynced from telem_ops[] — programming error, don't
@@ -191,10 +240,11 @@ static void telem_publish(uint8_t cam_id, uint32_t now)
 	if (was_valid &&
 	    (t->wd[0] != prev_wd0 || t->wd[1] != prev_wd1 ||
 	     t->vm_latched != prev_vml || t->vm_cp_latched != prev_vmcpl ||
-	     (uint8_t)(t->tpm_status & 0x0Fu) != prev_tpm)) {
-		printf("CAM%u TELEM fault change: wd=%02X/%02X vm=%02X cp=%02X tpm=%02X\r\n",
+	     (uint8_t)(t->tpm_status & 0x0Fu) != prev_tpm ||
+	     t->blc_fault_latch != prev_blcf)) {
+		printf("CAM%u TELEM fault change: wd=%02X/%02X vm=%02X cp=%02X tpm=%02X blc=%02X\r\n",
 		       cam_id + 1u, t->wd[0], t->wd[1], t->vm_latched,
-		       t->vm_cp_latched, t->tpm_status);
+		       t->vm_cp_latched, t->tpm_status, t->blc_fault_latch);
 	}
 }
 
