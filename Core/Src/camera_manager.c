@@ -36,6 +36,15 @@ static uint8_t  next_cam_idx = 0;
  * is naturally serialized with every other hi2c1 user. */
 static volatile bool    cam_temp_poll_due = false;     /* set by send_data() */
 static volatile uint8_t cam_recovery_pending = 0;   /* set by check_camera_failures() (frame ISR); serviced by camera_i2c_service() */
+/* #78: cameras whose reception aborted on an RX error, awaiting a
+ * frame-boundary re-arm (camera_service_resync at send_data entry). */
+static volatile uint8_t cam_resync_bits = 0;
+/* Frames of failure-detector grace granted after an RX-error resync, so a
+ * recoverable overrun (one lost frame) isn't misdiagnosed as camera death
+ * (3-miss threshold -> 10 s rail-off) while the re-armed reception waits
+ * for its first full frame. */
+#define CAM_RESYNC_GRACE_FRAMES 4
+static volatile uint8_t cam_resync_grace[CAMERA_COUNT] = {0};
 
 #define FPGA_I2C_ADDRESS 0x40  // Replace with your FPGA's I2C address
 #define HISTO_JSON_BUFFER_SIZE 34000
@@ -498,6 +507,47 @@ CameraDevice* get_camera_byID(int id) {
 		return NULL;
 	}
 	return &cam_array[id];
+}
+
+/* #78/#80: per-rate OV2312 frame timing. The deployed sensor config is a
+ * native-40 fps mode: VTS 0x0AD0 (2768 rows x ~9.03 us = 25.0 ms frame,
+ * >half vertical blanking). The FSIN slave rule (datasheet p.42) requires
+ * 0 < FSIN period - frame period < half a row, so a faster trigger needs a
+ * matching VTS: 60 Hz -> 0x0735 (1845 rows = 16.664 ms vs the 16.667 ms
+ * period). Bench-validated 2026-07-05 (issue #80). NOTE: shrinking the
+ * blanking moves the exposed-row band relative to FSIN — the console's
+ * LaserPulseDelayUsec must move with it (100 us at 40 Hz -> 8436 us at
+ * 60 Hz; owned by the SDK trigger overrides, sdk#129). */
+_Bool camera_set_capture_rate(uint8_t rate_hz)
+{
+	uint16_t vts;
+	switch (rate_hz) {
+	case 40: vts = 0x0AD0; break;
+	case 60: vts = 0x0735; break;
+	default: return false;
+	}
+	_Bool ok = true;
+	for (int i = 0; i < CAMERA_COUNT; i++) {
+		CameraDevice *cam = &cam_array[i];
+		if (!cam->isPowered || !cam->isConfigured) {
+			continue;
+		}
+		if (TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK) {
+			printf("set_capture_rate: failed to select Camera %d channel\r\n", i+1);
+			ok = false;
+			continue;
+		}
+		if (X02C1B_write_reg(cam, 0x380E, (uint8_t)(vts >> 8)) != 0 ||
+		    X02C1B_write_reg(cam, 0x380F, (uint8_t)(vts & 0xFF)) != 0) {
+			printf("set_capture_rate: VTS write failed Camera %d\r\n", i+1);
+			ok = false;
+		}
+	}
+	if (ok) {
+		printf("Capture rate %u Hz: VTS 0x%04X applied to configured cameras\r\n",
+		       rate_hz, vts);
+	}
+	return ok;
 }
 
 uint8_t get_cameras_present(void) {
@@ -1460,6 +1510,11 @@ static void check_camera_failures(void) {
 			if (has_event_bit) {
 				// Camera set its event bit, reset failure counter
 				camera_failure_counters[cam_id] = 0;
+			} else if (cam_resync_grace[cam_id] > 0) {
+				/* #78: reception is resyncing after a recoverable RX error —
+				 * missing frames here is expected, not camera death. */
+				cam_resync_grace[cam_id]--;
+				camera_failure_counters[cam_id] = 0;
 			} else {
 				// Camera didn't set its event bit, increment failure counter
 				camera_failure_counters[cam_id]++;
@@ -1508,8 +1563,10 @@ static _Bool histo_stall_suppress_frame(void) {
 	ready_bits = event_bits & event_bits_enabled;
 	event_bits = 0x00;
 	__enable_irq();
+	/* SPI re-arm happens in the RX completion callback (#78); USART cams
+	 * still re-arm at consume time. */
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
-		if ((ready_bits & (1u << cam_id)) != 0) {
+		if ((ready_bits & (1u << cam_id)) != 0 && cam_array[cam_id].useUsart) {
 			start_data_reception(cam_id);
 		}
 	}
@@ -1517,6 +1574,11 @@ static _Bool histo_stall_suppress_frame(void) {
 }
 
 _Bool send_data(void) {
+
+	/* #78: frame-boundary re-arm for cameras whose reception aborted on an
+	 * RX error — right after FSIN the FPGA is ~11 ms away from pushing, so
+	 * the fresh reception aligns with the next frame. */
+	camera_service_resync();
 
 	// Take care of statistics
 	if(!streaming_active && event_bits_enabled != 0x00){
@@ -1546,15 +1608,18 @@ _Bool send_data(void) {
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
-	if(get_timestamp_ms() - most_recent_frame_time < 15 ){
+	/* #78: window must stay well under the shortest supported frame period —
+	 * 16.7 ms at 60 Hz — or jitter on real frames gets swallowed. 10 ms is
+	 * still 2.5x the observed ~4 ms ringing. */
+	if(get_timestamp_ms() - most_recent_frame_time < 10 ){
 		/* Rate-limit this warning: on boards with FSIN ringing it fires on
-		 * EVERY frame (40 Hz), and the printf flood over UART/USB has been
+		 * EVERY frame, and the printf flood over UART/USB has been
 		 * an amplifier in several USB-death cascades. Keep the signal,
 		 * drop the volume. */
 		static uint32_t debounce_count = 0;
 		debounce_count++;
 		if ((debounce_count & 0xFF) == 1) {
-			printf("Frame sync debounce (<15ms): %lu events so far, passing.\r\n",
+			printf("Frame sync debounce (<10ms): %lu events so far, passing.\r\n",
 			       (unsigned long)debounce_count);
 		}
 		return true;
@@ -1735,15 +1800,15 @@ _Bool send_histogram_data(void) {
 		printf("Packet too large\r\n");
 	}
 
-	// --- Data ---
+	// --- Data --- (staging copy; SPI re-armed in RX callback, USART here — #78)
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
 		if((ready_bits & (0x01 << cam_id)) != 0) {
-			uint32_t *histo_ptr = (uint32_t *)cam_array[cam_id].pRecieveHistoBuffer;
+			const uint8_t *histo_ptr = camera_staged_histo(cam_id);
 		    packet_buffer[offset++] = HISTO_SOH;
 			packet_buffer[offset++] = cam_id;
 			memcpy(packet_buffer+offset,histo_ptr,HISTO_SIZE_32B*4);
 			offset += HISTO_SIZE_32B*4;
-			
+
 			uint32_t temp_bits;
 			memcpy(&temp_bits, (uint8_t*)&cam_temp[cam_id],4);
 
@@ -1753,9 +1818,10 @@ _Bool send_histogram_data(void) {
 			packet_buffer[offset++] = (uint8_t)((temp_bits >> 24) & 0xFF);
 
 			packet_buffer[offset++] = HISTO_EOH;
-			
-			// Re-arm reception as soon as data is copied
-			start_data_reception(cam_id);
+
+			if (cam_array[cam_id].useUsart) {
+				start_data_reception(cam_id);
+			}
 		}
 	}
 
@@ -1778,13 +1844,16 @@ _Bool send_histogram_data(void) {
 	return status;
 }
 
-/* #70: hard deadline for rle_compress, in microseconds. The frame period is
- * ~25 ms (40 fps); 15 ms leaves headroom for the payload copy + USB send +
- * per-camera re-arm that share the same budget. Above CMP_BUDGET_WARNING_US
- * (10 ms) is just a yellow-flag printf; at CMP_BUDGET_HARD_US the compressor
+/* #70: hard deadline for rle_compress, in microseconds. Sized for the
+ * shortest supported frame period — 16.7 ms at 60 Hz (25 ms at 40 Hz) —
+ * leaving headroom for the payload copy + USB send + per-camera re-arm that
+ * share the same budget (sensor-fw#78). Above CMP_BUDGET_WARNING_US (7 ms)
+ * is just a yellow-flag printf; at CMP_BUDGET_HARD_US the compressor
  * aborts and the caller falls back to an uncompressed frame instead of
- * risking the next frame's SPI/USART overrun (sensor-fw#70). */
-#define CMP_BUDGET_HARD_US 15000UL  /* 15 ms */
+ * risking the next frame's SPI/USART overrun (sensor-fw#70). Normal data
+ * compresses in ~3-5 ms at -O3, so the tighter deadline only bites on
+ * pathological frames that were falling back at 15 ms anyway. */
+#define CMP_BUDGET_HARD_US 11000UL  /* 11 ms */
 
 /*
  * PackBits-style byte-level RLE compressor.
@@ -1927,10 +1996,12 @@ _Bool send_histogram_data_cmp(void) {
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 24) & 0xFF);
 
-	/* Per-camera data blocks */
+	/* Per-camera data blocks — read from the completion-time staging copy.
+	 * SPI cams were re-armed in the RX callback (#78); USART cams re-arm
+	 * here (HAL_USART refuses an in-callback re-arm, see camera_rx_complete). */
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
 		if ((ready_bits & (0x01 << cam_id)) != 0) {
-			uint32_t *histo_ptr = (uint32_t *)cam_array[cam_id].pRecieveHistoBuffer;
+			const uint8_t *histo_ptr = camera_staged_histo(cam_id);
 			uncmp_payload[p_off++] = HISTO_SOH;
 			uncmp_payload[p_off++] = cam_id;
 			memcpy(uncmp_payload + p_off, histo_ptr, HISTO_SIZE_32B * 4);
@@ -1945,8 +2016,9 @@ _Bool send_histogram_data_cmp(void) {
 
 			uncmp_payload[p_off++] = HISTO_EOH;
 
-			/* Re-arm reception as soon as data is copied */
-			start_data_reception(cam_id);
+			if (cam_array[cam_id].useUsart) {
+				start_data_reception(cam_id);
+			}
 		}
 	}
 
@@ -1985,11 +2057,12 @@ _Bool send_histogram_data_cmp(void) {
 	}
 
 	/* Warn if compression time is eating into the frame budget.
-	 * Frame period is ~25 ms (40 fps).  Anything above 10 ms is a yellow
-	 * flag worth watching; above ~20 ms risks SPI overrun on the next frame. */
-#define CMP_BUDGET_WARNING_US  10000UL  /* 10 ms */
+	 * Frame period is 16.7 ms at 60 Hz / 25 ms at 40 Hz.  Anything above
+	 * 7 ms is a yellow flag worth watching; near the period it risks SPI
+	 * overrun on the next frame. */
+#define CMP_BUDGET_WARNING_US  7000UL  /* 7 ms */
 	if (elapsed_us > CMP_BUDGET_WARNING_US) {
-		printf("[CMP] WARN: compression took %lu us (>10 ms warning threshold), %d cams, "
+		printf("[CMP] WARN: compression took %lu us (>7 ms warning threshold), %d cams, "
 		       "%d->%d bytes (ratio %d%%)\r\n",
 		       (unsigned long)elapsed_us, count, p_off, cmp_len,
 		       (p_off > 0) ? (cmp_len * 100 / p_off) : 0);
@@ -2125,6 +2198,93 @@ _Bool send_fake_data(void) {
 	frame_id++;
 
 	return true;
+}
+
+/* #78: completion-time staging + immediate re-arm.
+ *
+ * Historically the per-frame send (FSIN ISR / deferred main loop) both
+ * consumed the RX buffers AND re-armed each camera's reception — so a
+ * camera whose completion landed after the send's event_bits snapshot
+ * wasn't re-armed until the NEXT send, and the FPGA's next histogram push
+ * hit an unarmed SPI (overrun -> false "camera dead"). The window between
+ * completion and re-arm scaled with FSIN/USB timing — the #68 dropout
+ * family, fatal at 60 Hz with 16 cameras.
+ *
+ * Now the RX completion callback copies the frame into a per-camera
+ * staging buffer and re-arms IMMEDIATELY (microseconds after DMA done,
+ * independent of send timing at any rate). The send reads the staging
+ * copy. A send delayed past the next completion can read a torn frame in
+ * the worst case — the host-side histogram row-sum check drops such
+ * frames — but reception itself never goes unarmed.
+ */
+static uint8_t histo_staging[CAMERA_COUNT][SPI_PACKET_LENGTH];
+
+/* #78: error-path resync. An RX error (overrun) mid-push used to abort +
+ * restart reception IMMEDIATELY — but the FPGA was mid-frame, so the fresh
+ * 4100-byte reception started at a random byte offset and stayed
+ * misaligned with the frame boundary forever (garbage completions, then
+ * false camera death). Instead the error path now aborts and flags the
+ * camera; the next frame boundary (send_data entry, right after FSIN,
+ * ~11 ms before the FPGA pushes) re-arms it cleanly. Costs the camera one
+ * frame per error instead of its life. */
+void camera_request_resync(uint8_t cam_id)
+{
+	if (cam_id < CAMERA_COUNT) {
+		cam_resync_bits |= (uint8_t)(1u << cam_id);
+		cam_resync_grace[cam_id] = CAM_RESYNC_GRACE_FRAMES;
+	}
+}
+
+void camera_service_resync(void)
+{
+	if (cam_resync_bits == 0) {
+		return;
+	}
+	__disable_irq();
+	uint8_t bits = cam_resync_bits;
+	cam_resync_bits = 0;
+	__enable_irq();
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		if ((bits & (1u << i)) != 0) {
+			if (start_data_reception(i)) {
+				printf("Camera %d: frame-boundary reception resync OK\r\n", i + 1);
+			} else {
+				/* Abort may not have settled yet (error-callback context) —
+				 * keep the flag and retry at the next frame boundary
+				 * instead of consuming the one recovery shot. */
+				printf("Camera %d: resync re-arm refused, retrying next frame\r\n", i + 1);
+				__disable_irq();
+				cam_resync_bits |= (uint8_t)(1u << i);
+				__enable_irq();
+			}
+		}
+	}
+}
+
+void camera_rx_complete(uint8_t cam_id)
+{
+	if (cam_id >= CAMERA_COUNT) {
+		return;
+	}
+	CameraDevice *cam = &cam_array[cam_id];
+	if (cam->pRecieveHistoBuffer != NULL) {
+		memcpy(histo_staging[cam_id], (const uint8_t *)cam->pRecieveHistoBuffer,
+		       cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+	}
+	/* SPI only: HAL_SPI sets READY before its completion callback, so the
+	 * immediate re-arm sticks. HAL_USART sets READY AFTER the callback
+	 * returns (USART_DMAReceiveCplt), so an in-callback Receive_DMA is
+	 * refused BUSY (and forcing the state would be clobbered by the HAL's
+	 * trailing State=READY). USART cams keep the send-path re-arm — they
+	 * have never been the overrun-prone links (SPI3/4/6 are). */
+	if (!cam->useUsart) {
+		start_data_reception(cam_id);
+	}
+}
+
+const uint8_t *camera_staged_histo(uint8_t cam_id)
+{
+	return histo_staging[cam_id];
 }
 
 _Bool start_data_reception(uint8_t cam_id){

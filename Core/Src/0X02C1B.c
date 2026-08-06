@@ -275,6 +275,34 @@ int X02C1B_detect(CameraDevice *cam)
     return 0;
 }
 
+/* #78/#80: public single-register write (camera_manager's per-rate VTS
+ * writer iterates cameras and owns the mux selection; the raw writer here
+ * is static). */
+int X02C1B_write_reg(CameraDevice *cam, uint16_t reg, uint8_t val)
+{
+    return X02C1B_write(cam->pI2c, reg, val);
+}
+
+/* #78: internal FSIN rate select. TIM4 runs at 240 MHz / (PSC 1000 + 1) ≈
+ * 239.76 kHz, so ARR 5999 ≈ 40 Hz and ARR 3999 ≈ 60 Hz (CCR2 keeps the 50%
+ * duty the camera FSIN input expects). ARR preload is disabled, so writes
+ * take effect immediately; the counter reset avoids one stretched period
+ * when shortening the rate while running. */
+int X02C1B_fsin_set_rate(uint8_t rate_hz)
+{
+    uint32_t arr, ccr;
+    switch (rate_hz) {
+    case 40: arr = 5999; ccr = 3000; break;
+    case 60: arr = 3999; ccr = 2000; break;
+    default: return -1;
+    }
+    __HAL_TIM_SET_AUTORELOAD(&htim4, arr);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, ccr);
+    __HAL_TIM_SET_COUNTER(&htim4, 0);
+    printf("Frame Sync rate set to %u Hz\r\n", rate_hz);
+    return 0;
+}
+
 int X02C1B_fsin_on()
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};

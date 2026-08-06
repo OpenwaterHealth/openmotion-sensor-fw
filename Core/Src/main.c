@@ -1872,11 +1872,12 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
   /* Attempt graceful recovery for any known camera USART peripheral.
    * Same fix as HAL_SPI_ErrorCallback: non-overrun errors (framing, noise,
    * DMA) previously fell through to Error_Handler() and halted the MCU.
-   * Any error on a known camera USART is recoverable via abort+restart. */
+   * #78: abort + frame-boundary resync (see the SPI callback) so the fresh
+   * reception aligns with the next frame instead of a random byte offset. */
   if (cam_id >= 0)
   {
     abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    camera_request_resync((uint8_t)cam_id);
     return;
   }
 
@@ -1980,11 +1981,14 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
    *   Error_Handler() entered from interrupt context →
    *   wait_for_usb_queues_to_finish() blocks (USB ISR can't run) →
    *   __disable_irq() → MCU completely dark.
-   * Now any error on a known camera SPI triggers abort+restart instead. */
+   * #78: abort now, but re-arm at the NEXT FRAME BOUNDARY (send_data via
+   * camera_service_resync) instead of immediately — an immediate restart
+   * mid-push started reception at a random byte offset and left the frame
+   * stream permanently misaligned (garbage completions → false death). */
   if (cam_id >= 0)
   {
     abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    camera_request_resync((uint8_t)cam_id);
     return;
   }
 
@@ -2000,22 +2004,29 @@ void set_event_bit_atomic(uint32_t bit) {
 }
 
 // Interrupt handler for SPI reception
+/* #78: camera_rx_complete stages the frame and re-arms reception
+ * IMMEDIATELY (see camera_manager.c) — the event bit then marks "staged
+ * data ready" for the next send, which no longer re-arms anything. */
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
   if (hspi->Instance == SPI2)
   {
+    camera_rx_complete(6);
     set_event_bit_atomic(BIT_6);
   }
   else if (hspi->Instance == SPI3)
   {
+    camera_rx_complete(5);
     set_event_bit_atomic(BIT_5);
   }
   else if (hspi->Instance == SPI4)
   {
+    camera_rx_complete(7);
     set_event_bit_atomic(BIT_7);
   }
   else if (hspi->Instance == SPI6)
   {
+    camera_rx_complete(1);
     set_event_bit_atomic(BIT_1);
   }
 }
@@ -2023,19 +2034,23 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)
 {
   if (husart->Instance == USART1)
-  { // Check if the interrupt is for USART2
+  {
+    camera_rx_complete(4);
     set_event_bit_atomic(BIT_4);
   }
   else if (husart->Instance == USART2)
-  { // Check if the interrupt is for USART2
+  {
+    camera_rx_complete(0);
     set_event_bit_atomic(BIT_0);
   }
   else if (husart->Instance == USART3)
-  { // Check if the interrupt is for USART2
+  {
+    camera_rx_complete(2);
     set_event_bit_atomic(BIT_2);
   }
   else if (husart->Instance == USART6)
-  { // Check if the interrupt is for USART2
+  {
+    camera_rx_complete(3);
     set_event_bit_atomic(BIT_3);
   }
 

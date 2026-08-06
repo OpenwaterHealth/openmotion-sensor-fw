@@ -910,7 +910,18 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		if(cmd.reserved == 0){
 			result = X02C1B_fsin_off();
 		} else {
-			result = X02C1B_fsin_on();
+			/* #78: reserved carries the rate — 1 = legacy enable at 40 Hz,
+			 * 40/60 = enable at that rate. Anything else is an error. The
+			 * camera VTS must match the trigger rate (#80), so both are
+			 * set together. */
+			uint8_t rate = cmd.reserved == 1 ? 40 : cmd.reserved;
+			result = X02C1B_fsin_set_rate(rate);
+			if(result == 0 && !camera_set_capture_rate(rate)){
+				result = -1;
+			}
+			if(result == 0){
+				result = X02C1B_fsin_on();
+			}
 		}
 
 		if(result != 0){
@@ -988,7 +999,15 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		if(cmd.reserved == 0){
 			result = X02C1B_FSIN_EXT_disable();
 		} else {
-			result = X02C1B_FSIN_EXT_enable();
+			/* #78/#80: reserved carries the trigger rate the external FSIN
+			 * will run at — 1 = legacy enable (40 Hz), 40/60 = enable with
+			 * the camera VTS retimed to match. The console generates the
+			 * edges; the cameras just need a frame period that fits. */
+			uint8_t ext_rate = cmd.reserved == 1 ? 40 : cmd.reserved;
+			result = camera_set_capture_rate(ext_rate) ? 0 : -1;
+			if(result == 0){
+				result = X02C1B_FSIN_EXT_enable();
+			}
 		}
 
 		if(result != 0){
