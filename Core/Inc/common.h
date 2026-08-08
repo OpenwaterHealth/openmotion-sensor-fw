@@ -39,6 +39,9 @@
 #define DEBUG_FLAG_CAMERA_RAW (1u << 10) /* #89: raw "scientific sensor" mode — disable every on-sensor pixel
                                           * correction (BLC/DC-BLC/dither/OTP-DPC) when cameras are
                                           * (re)configured. See X02C1B_raw_sensor in 0X02C1B.c */
+#define DEBUG_FLAG_FID_CORRUPT (1u << 11) /* #123: etch-a-sketch repro — periodically clear the top two
+                                           * bits of one camera's frame_id byte in the outgoing histogram
+                                           * (the EFT field corruption signature, sdk#220). camera_manager.c */
 
 
 /* #116 NVIC tiering — the camera RX -> re-arm chain must outrank the send
