@@ -27,5 +27,9 @@ def test_camera_manager_uses_one_packet_plan_for_every_send_path():
     assert '#include "histo_fault_inject.h"' in source
     assert "histo_fault_injector_plan" in source
     assert "histo_packet_timestamp_ms" in source
+    assert "histo_packet_ready_bits" in source
+    assert "histo_fault_disarmed_for_scan" in source
+    assert source.count("event_bits & event_bits_enabled") == 1
+    assert "histo_packet_ready_bits == 0u" in source
     assert '"HIL INJECT:' in source
     assert "DEBUG_FLAG_FID_CORRUPT_SUST" not in source

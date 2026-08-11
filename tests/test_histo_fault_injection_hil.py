@@ -13,6 +13,7 @@ from collections import Counter
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 
@@ -87,15 +88,54 @@ def _bring_up(sensor):
     assert sensor.camera_configure_registers(CAMERA_MASK) is True
 
 
+def _best_effort_cleanup(operations):
+    errors = []
+    for label, operation in operations:
+        try:
+            operation()
+        except Exception as exc:
+            errors.append(f"{label}: {exc!r}")
+    return errors
+
+
+def _report_cleanup_errors(errors, original_error):
+    if not errors:
+        return
+    message = "HIL cleanup failures: " + "; ".join(errors)
+    if original_error is not None and hasattr(original_error, "add_note"):
+        original_error.add_note(message)
+    elif original_error is None:
+        pytest.fail(message)
+
+
 def _shut_down(sensor):
-    try:
-        sensor.set_debug_flags(0)
-        sensor.disable_aggregator_fsin()
-        sensor.disable_camera(CAMERA_MASK)
-        sensor.uart.histo.stop_streaming()
-        sensor.disable_camera_power(CAMERA_MASK)
-    except Exception:
-        pass
+    return _best_effort_cleanup(
+        (
+            ("clear debug flags", lambda: sensor.set_debug_flags(0)),
+            ("disable FSIN", sensor.disable_aggregator_fsin),
+            ("disable cameras", lambda: sensor.disable_camera(CAMERA_MASK)),
+            ("stop histogram stream", sensor.uart.histo.stop_streaming),
+            (
+                "disable camera power",
+                lambda: sensor.disable_camera_power(CAMERA_MASK),
+            ),
+        )
+    )
+
+
+def test_best_effort_cleanup_attempts_every_operation():
+    called = []
+
+    def fail_first():
+        called.append("first")
+        raise RuntimeError("expected")
+
+    errors = _best_effort_cleanup(
+        (("first", fail_first), ("second", lambda: called.append("second")))
+    )
+
+    assert called == ["first", "second"]
+    assert errors == ["first: RuntimeError('expected')"]
 
 
 def _capture_mode(sensor, fault_flag, duration_s):
@@ -112,11 +152,17 @@ def _capture_mode(sensor, fault_flag, duration_s):
         assert sensor.enable_aggregator_fsin() is True
         time.sleep(duration_s)
     finally:
-        sensor.disable_aggregator_fsin()
-        sensor.disable_camera(CAMERA_MASK)
-        time.sleep(0.2)
-        histo.stop_streaming()
-        sensor.set_debug_flags(0)
+        original_error = sys.exc_info()[1]
+        cleanup_errors = _best_effort_cleanup(
+            (
+                ("clear debug flags", lambda: sensor.set_debug_flags(0)),
+                ("disable FSIN", sensor.disable_aggregator_fsin),
+                ("disable cameras", lambda: sensor.disable_camera(CAMERA_MASK)),
+                ("settle camera stream", lambda: time.sleep(0.2)),
+                ("stop histogram stream", histo.stop_streaming),
+            )
+        )
+        _report_cleanup_errors(cleanup_errors, original_error)
 
     stopped = threading.Event()
     stopped.set()
@@ -175,31 +221,75 @@ def _assert_wire_signature(fault_flag, packets):
         for packet in packets:
             counts = sorted(Counter(row[1] for row in packet).values())
             if len(counts) > 1:
-                disagreements.append(counts)
-        assert expected_counts in disagreements, (
-            f"expected frame-ID packet split {expected_counts}, observed "
+                disagreements.append((packet[0][2], counts))
+        assert len(disagreements) == 1, (
+            "expected exactly one frame-ID disagreement packet, observed "
             f"{disagreements}"
         )
+        timestamp_s, counts = disagreements[0]
+        assert counts == expected_counts
+        return timestamp_s
     elif fault_flag == DEBUG_FLAG_TIMESTAMP_FREEZE:
-        longest_run = run = 1
         timestamps = [packet[0][2] for packet in packets]
-        for previous, current in zip(timestamps, timestamps[1:]):
-            run = run + 1 if current == previous else 1
-            longest_run = max(longest_run, run)
-        assert longest_run >= 4, (
-            "expected the truthful packet plus three injected packets to "
-            f"share a timestamp; longest run was {longest_run}"
+        runs = []
+        start = 0
+        for index in range(1, len(timestamps) + 1):
+            if index == len(timestamps) or timestamps[index] != timestamps[start]:
+                if index - start > 1:
+                    runs.append((timestamps[start], index - start))
+                start = index
+        assert len(runs) == 1 and runs[0][1] == 4, (
+            "expected exactly one four-packet timestamp run, observed "
+            f"{runs}"
         )
+        return runs[0][0]
     else:
         by_camera = {}
         for packet in packets:
-            for camera, frame_id, _timestamp in packet:
-                by_camera.setdefault(camera, []).append(frame_id)
-        assert any(
-            ((current - previous) & 0xFF) == 2
-            for ids in by_camera.values()
-            for previous, current in zip(ids, ids[1:])
-        ), "expected a one-frame wire gap after the injected packet drop"
+            for camera, frame_id, timestamp in packet:
+                by_camera.setdefault(camera, []).append((frame_id, timestamp))
+        gaps = []
+        for camera, rows in by_camera.items():
+            for previous, current in zip(rows, rows[1:]):
+                step = (current[0] - previous[0]) & 0xFF
+                if step != 1:
+                    gaps.append((camera, current[1], step))
+        assert len(gaps) == 4, f"expected four one-frame gaps, observed {gaps}"
+        assert {camera for camera, _timestamp, _step in gaps} == set(by_camera)
+        assert {step for _camera, _timestamp, step in gaps} == {2}
+        timestamps = {timestamp for _camera, timestamp, _step in gaps}
+        assert len(timestamps) == 1
+        return timestamps.pop()
+
+
+def _assert_event_correlation(fault_flag, expected_event, events, timestamp_s):
+    matching = [event for event in events if type(event).__name__ == expected_event]
+    expected_counts = {
+        DEBUG_FLAG_FID_CORRUPT: 1,
+        DEBUG_FLAG_FID_CORRUPT_MULTI: 1,
+        DEBUG_FLAG_TIMESTAMP_FREEZE: 12,
+        DEBUG_FLAG_HISTO_DROP_ONCE: 4,
+    }
+    assert len(matching) == expected_counts[fault_flag], (
+        f"fault 0x{fault_flag:04X} expected {expected_counts[fault_flag]} "
+        f"{expected_event} events, observed {len(matching)}"
+    )
+    timestamp_field = {
+        DEBUG_FLAG_FID_CORRUPT: "timestamp_s",
+        DEBUG_FLAG_FID_CORRUPT_MULTI: "timestamp_s",
+        DEBUG_FLAG_TIMESTAMP_FREEZE: "original_timestamp_s",
+        DEBUG_FLAG_HISTO_DROP_ONCE: "current_timestamp_s",
+    }[fault_flag]
+    assert all(
+        np.isclose(getattr(event, timestamp_field), timestamp_s)
+        for event in matching
+    ), "SDK events did not point to the injected wire packet"
+    if fault_flag == DEBUG_FLAG_FID_CORRUPT_MULTI:
+        assert {event.reason for event in matching} == {
+            "no_single_outlier_consensus"
+        }
+    elif fault_flag == DEBUG_FLAG_HISTO_DROP_ONCE:
+        assert {event.missing_count for event in matching} == {1}
 
 
 @requires_bench
@@ -216,13 +306,15 @@ def test_fault_matrix_drives_expected_sdk_anomaly_events():
         _bring_up(sensor)
         for fault_flag, expected_event, duration_s in FAULT_CASES:
             packets = _capture_mode(sensor, fault_flag, duration_s)
-            _assert_wire_signature(fault_flag, packets)
+            injected_timestamp_s = _assert_wire_signature(fault_flag, packets)
             events = _pipeline_events(packets, side_idx)
-            observed = Counter(type(event).__name__ for event in events)
-            assert observed[expected_event] > 0, (
-                f"fault 0x{fault_flag:04X} did not produce {expected_event}; "
-                f"observed events: {dict(observed)}"
+            _assert_event_correlation(
+                fault_flag, expected_event, events, injected_timestamp_s
             )
     finally:
-        _shut_down(sensor)
-        interface.stop()
+        original_error = sys.exc_info()[1]
+        cleanup_errors = _shut_down(sensor)
+        cleanup_errors.extend(
+            _best_effort_cleanup((("stop interface", interface.stop),))
+        )
+        _report_cleanup_errors(cleanup_errors, original_error)

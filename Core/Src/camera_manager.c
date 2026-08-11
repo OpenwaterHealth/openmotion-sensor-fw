@@ -137,6 +137,8 @@ static histo_fault_injector_t histo_fault_injector;
 static histo_fault_plan_t histo_fault_plan;
 static uint32_t histo_packet_timestamp_ms = 0u;
 static uint32_t histo_fault_scan_flags = 0u;
+static uint8_t histo_packet_ready_bits = 0u;
+static bool histo_fault_disarmed_for_scan = false;
 
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
@@ -1565,12 +1567,9 @@ static void check_camera_failures(void) {
  * the cameras/SPI pipeline keeps flowing and check_camera_failures() stays
  * happy; only the USB HISTO frame is withheld. Short-circuits BEFORE
  * compression, so the #70 cmp budget guard never runs on a suppressed frame.
- * (#116: the per-camera re-arm this used to mirror now happens at
- * RX-complete via PendSV — consuming the event bits is all that's left.) */
+ * #116 moved re-arm to RX-complete via PendSV; send_data() has already
+ * consumed this packet's event bits before reaching this helper. */
 static _Bool histo_stall_suppress_frame(void) {
-	__disable_irq();
-	event_bits = 0x00;
-	__enable_irq();
 	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
 }
 
@@ -1601,24 +1600,27 @@ static void histo_fault_prepare(uint32_t debug_flags) {
 		.captured_timestamp_ms = fsin_timestamp_ms,
 		.wire_timestamp_ms = fsin_timestamp_ms,
 	};
+	uint32_t requested_flags = debug_flags & DEBUG_FLAG_HIL_FAULT_MASK;
+	if (requested_flags != histo_fault_scan_flags) {
+		/* Never resume stale scheduler state if the request is cleared and then
+		 * reselected. A scan boundary is the only place that re-arms it. */
+		histo_fault_disarmed_for_scan = true;
+	}
 	bool active_mode =
 		histo_fault_injector.mode >= HISTO_FAULT_FID_SINGLE &&
 		histo_fault_injector.mode <= HISTO_FAULT_PACKET_DROP;
-	if (!active_mode ||
-			(debug_flags & DEBUG_FLAG_HIL_FAULT_MASK) != histo_fault_scan_flags) {
+	if (!active_mode || histo_fault_disarmed_for_scan ||
+			histo_packet_ready_bits == 0u) {
 		/* Normal/Release fast path. A mid-scan clear or mode change disarms
-		 * the latched plan immediately; a new selection starts next scan. */
+		 * the latched plan for the rest of the scan. Calls with no ready packet
+		 * do not advance or consume a scheduled injection. */
 		return;
 	}
 
 	uint8_t raw_frame_ids[CAMERA_COUNT] = {0};
-	uint8_t packet_camera_mask = event_bits & event_bits_enabled;
-	if ((debug_flags & DEBUG_FLAG_FAKE_DATA) != 0u) {
-		packet_camera_mask = event_bits_enabled;
-	}
 	histo_fault_read_raw_ids(raw_frame_ids);
 	histo_fault_plan = histo_fault_injector_plan(
-		&histo_fault_injector, packet_camera_mask, raw_frame_ids,
+		&histo_fault_injector, histo_packet_ready_bits, raw_frame_ids,
 		fsin_timestamp_ms);
 	histo_packet_timestamp_ms = histo_fault_plan.wire_timestamp_ms;
 
@@ -1691,8 +1693,10 @@ _Bool send_data(void) {
 		}
 		histo_fault_injector_reset(&histo_fault_injector, dflags);
 		histo_fault_scan_flags = dflags & DEBUG_FLAG_HIL_FAULT_MASK;
+		histo_fault_disarmed_for_scan = false;
 		histo_fault_plan = (histo_fault_plan_t){0};
 		histo_packet_timestamp_ms = fsin_timestamp_ms;
+		histo_packet_ready_bits = 0u;
 		if (histo_fault_injector.mode == HISTO_FAULT_INVALID_SELECTION) {
 			printf("HIL INJECT refused: select exactly one fault flag "
 			       "(requested=0x%08lX)\r\n",
@@ -1752,6 +1756,14 @@ _Bool send_data(void) {
 	 * this before setting event_bits. */
 	if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
 		fill_frame_buffers();
+		histo_packet_ready_bits = event_bits_enabled;
+	} else {
+		/* Freeze one immutable view of this outgoing packet. Planning, buffer
+		 * mutation, send/drop, and DMA re-arm all use this same snapshot. */
+		__disable_irq();
+		histo_packet_ready_bits = event_bits & event_bits_enabled;
+		event_bits = 0x00;
+		__enable_irq();
 	}
 	histo_fault_prepare(dflags);
 	if (histo_stall_this_frame || histo_fault_plan.drop_packet) {
@@ -1875,21 +1887,11 @@ _Bool check_streaming(void){
 _Bool send_histogram_data(void) {
 	_Bool status = true;
 	int offset = 0;
-	uint8_t ready_bits = 0;
+	uint8_t ready_bits = histo_packet_ready_bits;
 
 	if(event_bits_enabled == 0x00){
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled: a dead camera's aborted DMA can complete
-	 * on garbage clock edges while its regulator browns out, setting a stale
-	 * event bit. Unmasked, that bit would put its garbage buffer in the
-	 * frame AND re-arm reception below — re-wedging the peripheral in
-	 * BUSY_RX ("camera not READY" on the next scan, field-hit 2026-06-11). */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
@@ -2094,18 +2096,11 @@ static _Bool send_uncompressed_histo(const uint8_t *payload, int payload_len) {
 _Bool send_histogram_data_cmp(void) {
 	_Bool status = true;
 	int p_off = 0;   /* offset into uncmp_payload (uncompressed staging) */
-	uint8_t ready_bits = 0;
+	uint8_t ready_bits = histo_packet_ready_bits;
 
 	if (event_bits_enabled == 0x00) {
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled — same rationale as send_histogram_data():
-	 * never include or re-arm a camera the stall detector disabled. */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
