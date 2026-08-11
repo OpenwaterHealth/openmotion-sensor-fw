@@ -10,6 +10,7 @@
 #include "crosslink.h"
 #include "0X02C1B.h"
 #include "camera_telemetry.h"
+#include "histo_fault_inject.h"
 #include "i2c_master.h"
 #include "uart_comms.h"
 #include "utils.h"
@@ -130,35 +131,12 @@ static bool streaming_first_frame = false;
 static uint32_t histo_stall_frame_count = 0;
 static bool histo_stall_tripped = false;
 
-/* #123: DEBUG_FLAG_FID_CORRUPT — deterministic "etch-a-sketch" repro (sdk#220).
- * The 2026-08-06 EFT field event delivered one camera's frame_id byte (the
- * FPGA-stamped high byte of the last histogram bin, blob offset 4095) with its
- * top two bits cleared (raw 0xC5→0x05) while the packet timestamp stayed
- * truthful; the host pipeline misreads that as a +64-frame gap. While the flag
- * is set, every FID_CORRUPT_INTERVAL_FRAMES frames a burst of
- * FID_CORRUPT_BURST_FRAMES consecutive frames gets the same corruption applied
- * to ONE camera (the highest-numbered enabled one, matching the field event's
- * packet position). A burst only arms when the victim's raw frame_id is in
- * 0xC0..0xFF: only there does &0x3F read as a forward (+64) step host-side —
- * lower raw values would be dropped as stale, reproducing nothing. The wire
- * CRC is computed after the mutation, so packets stay valid end-to-end, same
- * as the field corruption (which happened upstream of the MCU). State re-arms
- * at scan start, like the #75 stall counter. */
-#define FID_CORRUPT_INTERVAL_FRAMES 400u  /* ~10 s between bursts at 40 fps */
-#define FID_CORRUPT_BURST_FRAMES 3u
-static uint32_t fid_corrupt_frame_count = 0;
-static uint32_t fid_corrupt_next_burst = FID_CORRUPT_INTERVAL_FRAMES;
-static uint8_t  fid_corrupt_burst_left = 0;
-static int8_t   fid_corrupt_victim = -1;
-/* #123 sustained mode (DEBUG_FLAG_FID_CORRUPT_SUST): deterministic LCG,
- * re-seeded each scan so every run corrupts the same frame/camera pattern.
- * fid_corrupt_this_frame_mask is the per-frame set of cameras to corrupt,
- * computed once per frame in send_data() for either mode and consumed by
- * fid_corrupt_apply(). No per-frame printf in sustained mode — a 40 Hz
- * print stream from this context has amplified USB wedges before. */
-#define FID_CORRUPT_LCG_SEED 0x00E7C4A5u
-static uint32_t fid_corrupt_lcg = FID_CORRUPT_LCG_SEED;
-static uint8_t  fid_corrupt_this_frame_mask = 0;
+/* #123: one deterministic plan per outgoing histogram packet. The scheduler
+ * is pure state; this file owns buffer mutation, USB suppression, and logs. */
+static histo_fault_injector_t histo_fault_injector;
+static histo_fault_plan_t histo_fault_plan;
+static uint32_t histo_packet_timestamp_ms = 0u;
+static uint32_t histo_fault_scan_flags = 0u;
 
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
@@ -1596,73 +1574,90 @@ static _Bool histo_stall_suppress_frame(void) {
 	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
 }
 
-/* #123: apply the etch-a-sketch corruption to this frame's victim cameras:
- * clear the top two bits of each one's frame_id byte (blob offset
- * HISTO_SIZE_32B*4 - 1 — the FPGA-stamped high byte of the last bin, the
- * exact byte the 2026-08-06 EFT event corrupted). Reads the per-frame mask
- * computed in send_data(). Idempotent (&=), so it is safe to call once at
- * the common send entry (covers the plain and compressed paths, which both
- * read the camera buffers) and again in send_fake_data() after
- * fill_frame_buffers() has re-stamped the buffers. */
-static void fid_corrupt_apply(void) {
-	if (fid_corrupt_this_frame_mask == 0u) {
-		return;
+static void histo_fault_read_raw_ids(uint8_t raw_frame_ids[CAMERA_COUNT]) {
+	for (uint8_t camera = 0u; camera < CAMERA_COUNT; ++camera) {
+		uint8_t *buffer = cam_array[camera].pRecieveHistoBuffer;
+		raw_frame_ids[camera] = (buffer == NULL) ? 0u :
+			buffer[HISTO_SIZE_32B * 4 - 1];
 	}
-	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
-		if ((fid_corrupt_this_frame_mask & (1u << cam_id)) == 0u) {
+}
+
+static void histo_fault_apply_frame_ids(uint8_t camera_mask) {
+	for (uint8_t camera = 0u; camera < CAMERA_COUNT; ++camera) {
+		if ((camera_mask & (uint8_t)(1u << camera)) == 0u) {
 			continue;
 		}
-		uint8_t *buf = cam_array[cam_id].pRecieveHistoBuffer;
-		if (buf != NULL) {
-			buf[HISTO_SIZE_32B * 4 - 1] &= 0x3Fu;
+		uint8_t *buffer = cam_array[camera].pRecieveHistoBuffer;
+		if (buffer != NULL) {
+			buffer[HISTO_SIZE_32B * 4 - 1] &= 0x3Fu;
 		}
 	}
 }
 
-/* #123: once-per-frame burst scheduling for DEBUG_FLAG_FID_CORRUPT. Runs at
- * the common send entry (so it behaves identically from the FSIN ISR or the
- * #68 deferred main-loop path). One printf per burst, matching #75's
- * per-trip volume (per-frame prints from this context have amplified USB
- * wedges before). */
-static void fid_corrupt_advance(void) {
-	fid_corrupt_frame_count++;
-	if (fid_corrupt_burst_left > 0u) {
-		fid_corrupt_burst_left--;
-		if (fid_corrupt_burst_left == 0u) {
-			fid_corrupt_victim = -1;
+static void histo_fault_prepare(uint32_t debug_flags) {
+	histo_packet_timestamp_ms = fsin_timestamp_ms;
+	histo_fault_plan = (histo_fault_plan_t){
+		.mode = histo_fault_injector.mode,
+		.captured_timestamp_ms = fsin_timestamp_ms,
+		.wire_timestamp_ms = fsin_timestamp_ms,
+	};
+	bool active_mode =
+		histo_fault_injector.mode >= HISTO_FAULT_FID_SINGLE &&
+		histo_fault_injector.mode <= HISTO_FAULT_PACKET_DROP;
+	if (!active_mode ||
+			(debug_flags & DEBUG_FLAG_HIL_FAULT_MASK) != histo_fault_scan_flags) {
+		/* Normal/Release fast path. A mid-scan clear or mode change disarms
+		 * the latched plan immediately; a new selection starts next scan. */
+		return;
+	}
+
+	uint8_t raw_frame_ids[CAMERA_COUNT] = {0};
+	uint8_t packet_camera_mask = event_bits & event_bits_enabled;
+	if ((debug_flags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+		packet_camera_mask = event_bits_enabled;
+	}
+	histo_fault_read_raw_ids(raw_frame_ids);
+	histo_fault_plan = histo_fault_injector_plan(
+		&histo_fault_injector, packet_camera_mask, raw_frame_ids,
+		fsin_timestamp_ms);
+	histo_packet_timestamp_ms = histo_fault_plan.wire_timestamp_ms;
+
+	if (!histo_fault_plan.applied) {
+		return;
+	}
+	if (histo_fault_plan.corrupt_camera_mask != 0u) {
+		uint8_t first_camera = 0u;
+		while ((histo_fault_plan.corrupt_camera_mask &
+				(uint8_t)(1u << first_camera)) == 0u) {
+			++first_camera;
 		}
-		return;
+		uint8_t raw = raw_frame_ids[first_camera];
+		histo_fault_apply_frame_ids(histo_fault_plan.corrupt_camera_mask);
+		printf("HIL INJECT: mode=%s frame=%lu timestamp_ms=%lu "
+		       "camera_mask=0x%02X raw=0x%02X->0x%02X\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms,
+		       histo_fault_plan.corrupt_camera_mask, raw,
+		       (unsigned)(raw & 0x3Fu));
+	} else if (histo_fault_plan.drop_packet) {
+		printf("HIL INJECT: mode=%s frame=%lu captured_timestamp_ms=%lu "
+		       "action=drop_packet\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms);
+	} else {
+		printf("HIL INJECT: mode=%s frame=%lu captured_timestamp_ms=%lu "
+		       "wire_timestamp_ms=%lu\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms,
+		       (unsigned long)histo_fault_plan.wire_timestamp_ms);
 	}
-	if (fid_corrupt_frame_count < fid_corrupt_next_burst) {
-		return;
-	}
-	/* Victim: highest-numbered enabled camera (last in packet order, the
-	 * field event's position). */
-	int8_t victim = -1;
-	for (int8_t c = CAMERA_COUNT - 1; c >= 0; c--) {
-		if ((event_bits_enabled & (1u << c)) != 0u) {
-			victim = c;
-			break;
-		}
-	}
-	if (victim < 0 || cam_array[victim].pRecieveHistoBuffer == NULL) {
-		return;
-	}
-	/* Hold the burst until the victim's raw frame_id has both top bits set;
-	 * &0x3F only reads as a forward step host-side from 0xC0..0xFF. */
-	uint8_t raw = cam_array[victim].pRecieveHistoBuffer[HISTO_SIZE_32B * 4 - 1];
-	if ((raw & 0xC0u) != 0xC0u) {
-		return;
-	}
-	fid_corrupt_victim = victim;
-	fid_corrupt_burst_left = FID_CORRUPT_BURST_FRAMES;
-	fid_corrupt_next_burst = fid_corrupt_frame_count + FID_CORRUPT_INTERVAL_FRAMES;
-	printf("DEBUG: fid corrupt burst: cam=%d raw=0x%02X->0x%02X for %u frames\r\n",
-	       victim + 1, raw, (unsigned)(raw & 0x3Fu),
-	       (unsigned)FID_CORRUPT_BURST_FRAMES);
 }
 
 _Bool send_data(void) {
+	uint32_t dflags = logging_get_debug_flags();
 
 	// Take care of statistics
 	if(!streaming_active && event_bits_enabled != 0x00){
@@ -1694,18 +1689,23 @@ _Bool send_data(void) {
 			printf("DEBUG: histo stall armed, trips at frame %lu\r\n",
 			       (unsigned long)HISTO_STALL_TRIGGER_FRAMES);
 		}
-		/* #123: re-arm the fid-corrupt repro each scan (see statics above). */
-		fid_corrupt_frame_count = 0;
-		fid_corrupt_next_burst = FID_CORRUPT_INTERVAL_FRAMES;
-		fid_corrupt_burst_left = 0;
-		fid_corrupt_victim = -1;
-		fid_corrupt_lcg = FID_CORRUPT_LCG_SEED;
-		fid_corrupt_this_frame_mask = 0u;
-		if ((logging_get_debug_flags() & DEBUG_FLAG_FID_CORRUPT_SUST) != 0u) {
-			printf("DEBUG: fid corrupt SUSTAINED armed (~1/8 per cam per frame)\r\n");
-		} else if ((logging_get_debug_flags() & DEBUG_FLAG_FID_CORRUPT) != 0u) {
-			printf("DEBUG: fid corrupt armed, first burst at ~frame %lu\r\n",
-			       (unsigned long)FID_CORRUPT_INTERVAL_FRAMES);
+		histo_fault_injector_reset(&histo_fault_injector, dflags);
+		histo_fault_scan_flags = dflags & DEBUG_FLAG_HIL_FAULT_MASK;
+		histo_fault_plan = (histo_fault_plan_t){0};
+		histo_packet_timestamp_ms = fsin_timestamp_ms;
+		if (histo_fault_injector.mode == HISTO_FAULT_INVALID_SELECTION) {
+			printf("HIL INJECT refused: select exactly one fault flag "
+			       "(requested=0x%08lX)\r\n",
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		} else if (histo_fault_injector.mode == HISTO_FAULT_DISABLED_RELEASE) {
+			printf("HIL INJECT disabled: fault injection is unavailable in "
+			       "Release firmware (requested=0x%08lX)\r\n",
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		} else if (histo_fault_injector.mode != HISTO_FAULT_NONE) {
+			printf("HIL INJECT armed: mode=%s requested=0x%08lX "
+			       "reset=per_scan\r\n",
+			       histo_fault_mode_name(histo_fault_injector.mode),
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
 		}
 	}
 
@@ -1731,7 +1731,6 @@ _Bool send_data(void) {
 	check_camera_failures();
 	
 	bool success = false;
-	uint32_t dflags = logging_get_debug_flags();
 	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
 	 * suppress the send entirely (all modes: fake, compressed, plain). This
 	 * runs at the common send entry, so it behaves identically whether
@@ -1748,34 +1747,20 @@ _Bool send_data(void) {
 			       (unsigned long)histo_stall_frame_count);
 		}
 	}
-	/* #123: schedule this frame's etch-a-sketch corruption and mutate the
-	 * victim cameras' buffers before dispatch. The plain and compressed
-	 * paths read the buffers as mutated here; send_fake_data() re-applies
-	 * after its per-frame buffer refill. Sustained mode (all-scan random
-	 * hits, models a continuous EFT burst train) takes precedence over the
-	 * single-burst scheduler. */
-	if ((dflags & (DEBUG_FLAG_FID_CORRUPT | DEBUG_FLAG_FID_CORRUPT_SUST)) != 0u) {
-		fid_corrupt_this_frame_mask = 0u;
-		if ((dflags & DEBUG_FLAG_FID_CORRUPT_SUST) != 0u) {
-			for (uint8_t c = 0; c < CAMERA_COUNT; ++c) {
-				if ((event_bits_enabled & (1u << c)) == 0u) {
-					continue;
-				}
-				fid_corrupt_lcg = fid_corrupt_lcg * 1664525u + 1013904223u;
-				if (((fid_corrupt_lcg >> 24) & 0x07u) == 0u) {
-					fid_corrupt_this_frame_mask |= (uint8_t)(1u << c);
-				}
-			}
-		} else {
-			fid_corrupt_advance();
-			if (fid_corrupt_burst_left > 0u && fid_corrupt_victim >= 0) {
-				fid_corrupt_this_frame_mask =
-					(uint8_t)(1u << fid_corrupt_victim);
-			}
-		}
-		fid_corrupt_apply();
+	/* Fake buffers must be stamped before planning so the logged raw ID is
+	 * exactly the byte that will go on the wire. Real camera DMA already did
+	 * this before setting event_bits. */
+	if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+		fill_frame_buffers();
 	}
-	if (histo_stall_this_frame) {
+	histo_fault_prepare(dflags);
+	if (histo_stall_this_frame || histo_fault_plan.drop_packet) {
+		if (histo_fault_plan.drop_packet &&
+				(dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+			/* send_fake_data() normally advances this after USB send. Advance
+			 * the hidden packet too so the next visible fake ID has a gap. */
+			frame_id++;
+		}
 		success = histo_stall_suppress_frame();
 	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
 		success = send_fake_data();
@@ -1936,7 +1921,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -2140,7 +2125,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -2267,12 +2252,8 @@ _Bool send_histogram_data_cmp(void) {
 }
 
 _Bool send_fake_data(void) {
-
-	fill_frame_buffers();
-	/* #123: the refill above re-stamped every frame_id byte — re-apply this
-	 * frame's etch-a-sketch corruption (idempotent; no-op unless a burst is
-	 * active). Lets the repro run with FAKE_DATA, i.e. no cameras at all. */
-	fid_corrupt_apply();
+	/* send_data() fills and fault-mutates the fake buffers before dispatch so
+	 * the scheduler sees and logs the exact outgoing frame IDs. */
 
 	_Bool status = true;
 	int offset = 0;
@@ -2301,7 +2282,7 @@ _Bool send_fake_data(void) {
 	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);

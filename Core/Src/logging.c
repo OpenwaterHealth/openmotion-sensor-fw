@@ -112,6 +112,17 @@ void logging_set_debug_flags(uint32_t flags) {
 		       (debug_flags & DEBUG_FLAG_HISTO_CMP) ? " (histo compress ON)" : "",
 		       (debug_flags & DEBUG_FLAG_CAMERA_CROP) ? " (camera crop 1720 ON)" : "",
 		       (debug_flags & DEBUG_FLAG_CAMERA_RAW) ? " (camera RAW ON)" : "");
+		if (((prev_flags | debug_flags) & DEBUG_FLAG_HIL_FAULT_MASK) != 0u) {
+			printf("HIL fault request: mask=0x%04lX "
+			       "fid_single=%u fid_multi=%u timestamp_freeze=%u "
+			       "packet_drop=%u (new selection starts next scan; "
+			       "clearing disarms now; Debug builds only)\r\n",
+			       (unsigned long)(debug_flags & DEBUG_FLAG_HIL_FAULT_MASK),
+			       (debug_flags & DEBUG_FLAG_FID_CORRUPT) != 0u,
+			       (debug_flags & DEBUG_FLAG_FID_CORRUPT_MULTI) != 0u,
+			       (debug_flags & DEBUG_FLAG_TIMESTAMP_FREEZE) != 0u,
+			       (debug_flags & DEBUG_FLAG_HISTO_DROP_ONCE) != 0u);
+		}
 	}
 	if ((debug_flags & DEBUG_FLAG_USB_PRINTF) == 0u) {
 		// Drop any buffered log data so it doesn't flush later.

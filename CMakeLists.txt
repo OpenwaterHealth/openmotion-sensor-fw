@@ -125,6 +125,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/camera_manager.c
     Core/Src/camera_telemetry.c
     Core/Src/crosslink.c
+    Core/Src/histo_fault_inject.c
     Core/Src/histo_fake.c
     Core/Src/i2c_protocol.c
     Core/Src/i2c_master.c
