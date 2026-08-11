@@ -42,6 +42,11 @@
 #define DEBUG_FLAG_FID_CORRUPT (1u << 11) /* #123: etch-a-sketch repro — periodically clear the top two
                                            * bits of one camera's frame_id byte in the outgoing histogram
                                            * (the EFT field corruption signature, sdk#220). camera_manager.c */
+#define DEBUG_FLAG_FID_CORRUPT_SUST (1u << 12) /* #123: sustained variant — every enabled camera has a
+                                                * ~12.5% per-frame chance of the same corruption, all scan
+                                                * long (models a continuous EFT burst train; produces the
+                                                * non-resolving host-side warning flood). Takes precedence
+                                                * over the burst-mode bit when both are set. */
 
 
 /* #116 NVIC tiering — the camera RX -> re-arm chain must outrank the send

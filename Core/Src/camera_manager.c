@@ -150,6 +150,15 @@ static uint32_t fid_corrupt_frame_count = 0;
 static uint32_t fid_corrupt_next_burst = FID_CORRUPT_INTERVAL_FRAMES;
 static uint8_t  fid_corrupt_burst_left = 0;
 static int8_t   fid_corrupt_victim = -1;
+/* #123 sustained mode (DEBUG_FLAG_FID_CORRUPT_SUST): deterministic LCG,
+ * re-seeded each scan so every run corrupts the same frame/camera pattern.
+ * fid_corrupt_this_frame_mask is the per-frame set of cameras to corrupt,
+ * computed once per frame in send_data() for either mode and consumed by
+ * fid_corrupt_apply(). No per-frame printf in sustained mode — a 40 Hz
+ * print stream from this context has amplified USB wedges before. */
+#define FID_CORRUPT_LCG_SEED 0x00E7C4A5u
+static uint32_t fid_corrupt_lcg = FID_CORRUPT_LCG_SEED;
+static uint8_t  fid_corrupt_this_frame_mask = 0;
 
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
@@ -1587,20 +1596,26 @@ static _Bool histo_stall_suppress_frame(void) {
 	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
 }
 
-/* #123: apply the etch-a-sketch corruption to the victim camera's buffer for
- * this frame: clear the top two bits of the frame_id byte (blob offset
+/* #123: apply the etch-a-sketch corruption to this frame's victim cameras:
+ * clear the top two bits of each one's frame_id byte (blob offset
  * HISTO_SIZE_32B*4 - 1 — the FPGA-stamped high byte of the last bin, the
- * exact byte the 2026-08-06 EFT event corrupted). Idempotent (&=), so it is
- * safe to call once at the common send entry (covers the plain and compressed
- * paths, which both read the camera buffers) and again in send_fake_data()
- * after fill_frame_buffers() has re-stamped the buffers. */
+ * exact byte the 2026-08-06 EFT event corrupted). Reads the per-frame mask
+ * computed in send_data(). Idempotent (&=), so it is safe to call once at
+ * the common send entry (covers the plain and compressed paths, which both
+ * read the camera buffers) and again in send_fake_data() after
+ * fill_frame_buffers() has re-stamped the buffers. */
 static void fid_corrupt_apply(void) {
-	if (fid_corrupt_burst_left == 0u || fid_corrupt_victim < 0) {
+	if (fid_corrupt_this_frame_mask == 0u) {
 		return;
 	}
-	uint8_t *buf = cam_array[fid_corrupt_victim].pRecieveHistoBuffer;
-	if (buf != NULL) {
-		buf[HISTO_SIZE_32B * 4 - 1] &= 0x3Fu;
+	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
+		if ((fid_corrupt_this_frame_mask & (1u << cam_id)) == 0u) {
+			continue;
+		}
+		uint8_t *buf = cam_array[cam_id].pRecieveHistoBuffer;
+		if (buf != NULL) {
+			buf[HISTO_SIZE_32B * 4 - 1] &= 0x3Fu;
+		}
 	}
 }
 
@@ -1684,7 +1699,11 @@ _Bool send_data(void) {
 		fid_corrupt_next_burst = FID_CORRUPT_INTERVAL_FRAMES;
 		fid_corrupt_burst_left = 0;
 		fid_corrupt_victim = -1;
-		if ((logging_get_debug_flags() & DEBUG_FLAG_FID_CORRUPT) != 0u) {
+		fid_corrupt_lcg = FID_CORRUPT_LCG_SEED;
+		fid_corrupt_this_frame_mask = 0u;
+		if ((logging_get_debug_flags() & DEBUG_FLAG_FID_CORRUPT_SUST) != 0u) {
+			printf("DEBUG: fid corrupt SUSTAINED armed (~1/8 per cam per frame)\r\n");
+		} else if ((logging_get_debug_flags() & DEBUG_FLAG_FID_CORRUPT) != 0u) {
 			printf("DEBUG: fid corrupt armed, first burst at ~frame %lu\r\n",
 			       (unsigned long)FID_CORRUPT_INTERVAL_FRAMES);
 		}
@@ -1729,12 +1748,31 @@ _Bool send_data(void) {
 			       (unsigned long)histo_stall_frame_count);
 		}
 	}
-	/* #123: DEBUG_FLAG_FID_CORRUPT — schedule this frame's etch-a-sketch
-	 * corruption and mutate the victim's camera buffer before dispatch. The
-	 * plain and compressed paths read the buffers as mutated here;
-	 * send_fake_data() re-applies after its per-frame buffer refill. */
-	if ((dflags & DEBUG_FLAG_FID_CORRUPT) != 0u) {
-		fid_corrupt_advance();
+	/* #123: schedule this frame's etch-a-sketch corruption and mutate the
+	 * victim cameras' buffers before dispatch. The plain and compressed
+	 * paths read the buffers as mutated here; send_fake_data() re-applies
+	 * after its per-frame buffer refill. Sustained mode (all-scan random
+	 * hits, models a continuous EFT burst train) takes precedence over the
+	 * single-burst scheduler. */
+	if ((dflags & (DEBUG_FLAG_FID_CORRUPT | DEBUG_FLAG_FID_CORRUPT_SUST)) != 0u) {
+		fid_corrupt_this_frame_mask = 0u;
+		if ((dflags & DEBUG_FLAG_FID_CORRUPT_SUST) != 0u) {
+			for (uint8_t c = 0; c < CAMERA_COUNT; ++c) {
+				if ((event_bits_enabled & (1u << c)) == 0u) {
+					continue;
+				}
+				fid_corrupt_lcg = fid_corrupt_lcg * 1664525u + 1013904223u;
+				if (((fid_corrupt_lcg >> 24) & 0x07u) == 0u) {
+					fid_corrupt_this_frame_mask |= (uint8_t)(1u << c);
+				}
+			}
+		} else {
+			fid_corrupt_advance();
+			if (fid_corrupt_burst_left > 0u && fid_corrupt_victim >= 0) {
+				fid_corrupt_this_frame_mask =
+					(uint8_t)(1u << fid_corrupt_victim);
+			}
+		}
 		fid_corrupt_apply();
 	}
 	if (histo_stall_this_frame) {
