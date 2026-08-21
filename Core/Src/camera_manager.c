@@ -10,6 +10,7 @@
 #include "crosslink.h"
 #include "0X02C1B.h"
 #include "camera_telemetry.h"
+#include "histo_fault_inject.h"
 #include "i2c_master.h"
 #include "uart_comms.h"
 #include "utils.h"
@@ -129,6 +130,15 @@ static bool streaming_first_frame = false;
 #define HISTO_STALL_TRIGGER_FRAMES 1800u  /* ~45 s at 40 fps */
 static uint32_t histo_stall_frame_count = 0;
 static bool histo_stall_tripped = false;
+
+/* #123: one deterministic plan per outgoing histogram packet. The scheduler
+ * is pure state; this file owns buffer mutation, USB suppression, and logs. */
+static histo_fault_injector_t histo_fault_injector;
+static histo_fault_plan_t histo_fault_plan;
+static uint32_t histo_packet_timestamp_ms = 0u;
+static uint32_t histo_fault_scan_flags = 0u;
+static uint8_t histo_packet_ready_bits = 0u;
+static bool histo_fault_disarmed_for_scan = false;
 
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
@@ -1557,16 +1567,99 @@ static void check_camera_failures(void) {
  * the cameras/SPI pipeline keeps flowing and check_camera_failures() stays
  * happy; only the USB HISTO frame is withheld. Short-circuits BEFORE
  * compression, so the #70 cmp budget guard never runs on a suppressed frame.
- * (#116: the per-camera re-arm this used to mirror now happens at
- * RX-complete via PendSV — consuming the event bits is all that's left.) */
+ * #116 moved re-arm to RX-complete via PendSV; send_data() has already
+ * consumed this packet's event bits before reaching this helper. */
 static _Bool histo_stall_suppress_frame(void) {
-	__disable_irq();
-	event_bits = 0x00;
-	__enable_irq();
 	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
 }
 
+static void histo_fault_read_raw_ids(uint8_t raw_frame_ids[CAMERA_COUNT]) {
+	for (uint8_t camera = 0u; camera < CAMERA_COUNT; ++camera) {
+		uint8_t *buffer = cam_array[camera].pRecieveHistoBuffer;
+		raw_frame_ids[camera] = (buffer == NULL) ? 0u :
+			buffer[HISTO_SIZE_32B * 4 - 1];
+	}
+}
+
+static void histo_fault_apply_frame_ids(uint8_t camera_mask) {
+	for (uint8_t camera = 0u; camera < CAMERA_COUNT; ++camera) {
+		if ((camera_mask & (uint8_t)(1u << camera)) == 0u) {
+			continue;
+		}
+		uint8_t *buffer = cam_array[camera].pRecieveHistoBuffer;
+		if (buffer != NULL) {
+			buffer[HISTO_SIZE_32B * 4 - 1] &= 0x3Fu;
+		}
+	}
+}
+
+static void histo_fault_prepare(uint32_t debug_flags) {
+	histo_packet_timestamp_ms = fsin_timestamp_ms;
+	histo_fault_plan = (histo_fault_plan_t){
+		.mode = histo_fault_injector.mode,
+		.captured_timestamp_ms = fsin_timestamp_ms,
+		.wire_timestamp_ms = fsin_timestamp_ms,
+	};
+	uint32_t requested_flags = debug_flags & DEBUG_FLAG_HIL_FAULT_MASK;
+	if (requested_flags != histo_fault_scan_flags) {
+		/* Never resume stale scheduler state if the request is cleared and then
+		 * reselected. A scan boundary is the only place that re-arms it. */
+		histo_fault_disarmed_for_scan = true;
+	}
+	bool active_mode =
+		histo_fault_injector.mode >= HISTO_FAULT_FID_SINGLE &&
+		histo_fault_injector.mode <= HISTO_FAULT_PACKET_DROP;
+	if (!active_mode || histo_fault_disarmed_for_scan ||
+			histo_packet_ready_bits == 0u) {
+		/* Normal/Release fast path. A mid-scan clear or mode change disarms
+		 * the latched plan for the rest of the scan. Calls with no ready packet
+		 * do not advance or consume a scheduled injection. */
+		return;
+	}
+
+	uint8_t raw_frame_ids[CAMERA_COUNT] = {0};
+	histo_fault_read_raw_ids(raw_frame_ids);
+	histo_fault_plan = histo_fault_injector_plan(
+		&histo_fault_injector, histo_packet_ready_bits, raw_frame_ids,
+		fsin_timestamp_ms);
+	histo_packet_timestamp_ms = histo_fault_plan.wire_timestamp_ms;
+
+	if (!histo_fault_plan.applied) {
+		return;
+	}
+	if (histo_fault_plan.corrupt_camera_mask != 0u) {
+		uint8_t first_camera = 0u;
+		while ((histo_fault_plan.corrupt_camera_mask &
+				(uint8_t)(1u << first_camera)) == 0u) {
+			++first_camera;
+		}
+		uint8_t raw = raw_frame_ids[first_camera];
+		histo_fault_apply_frame_ids(histo_fault_plan.corrupt_camera_mask);
+		printf("HIL INJECT: mode=%s frame=%lu timestamp_ms=%lu "
+		       "camera_mask=0x%02X raw=0x%02X->0x%02X\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms,
+		       histo_fault_plan.corrupt_camera_mask, raw,
+		       (unsigned)(raw & 0x3Fu));
+	} else if (histo_fault_plan.drop_packet) {
+		printf("HIL INJECT: mode=%s frame=%lu captured_timestamp_ms=%lu "
+		       "action=drop_packet\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms);
+	} else {
+		printf("HIL INJECT: mode=%s frame=%lu captured_timestamp_ms=%lu "
+		       "wire_timestamp_ms=%lu\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms,
+		       (unsigned long)histo_fault_plan.wire_timestamp_ms);
+	}
+}
+
 _Bool send_data(void) {
+	uint32_t dflags = logging_get_debug_flags();
 
 	// Take care of statistics
 	if(!streaming_active && event_bits_enabled != 0x00){
@@ -1598,6 +1691,26 @@ _Bool send_data(void) {
 			printf("DEBUG: histo stall armed, trips at frame %lu\r\n",
 			       (unsigned long)HISTO_STALL_TRIGGER_FRAMES);
 		}
+		histo_fault_injector_reset(&histo_fault_injector, dflags);
+		histo_fault_scan_flags = dflags & DEBUG_FLAG_HIL_FAULT_MASK;
+		histo_fault_disarmed_for_scan = false;
+		histo_fault_plan = (histo_fault_plan_t){0};
+		histo_packet_timestamp_ms = fsin_timestamp_ms;
+		histo_packet_ready_bits = 0u;
+		if (histo_fault_injector.mode == HISTO_FAULT_INVALID_SELECTION) {
+			printf("HIL INJECT refused: select exactly one fault flag "
+			       "(requested=0x%08lX)\r\n",
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		} else if (histo_fault_injector.mode == HISTO_FAULT_DISABLED_RELEASE) {
+			printf("HIL INJECT disabled: fault injection is unavailable in "
+			       "Release firmware (requested=0x%08lX)\r\n",
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		} else if (histo_fault_injector.mode != HISTO_FAULT_NONE) {
+			printf("HIL INJECT armed: mode=%s requested=0x%08lX "
+			       "reset=per_scan\r\n",
+			       histo_fault_mode_name(histo_fault_injector.mode),
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		}
 	}
 
 	// Sometimes the frame sync fires 4ms after the previous frame due to electrical noise. Ignore these.
@@ -1622,7 +1735,6 @@ _Bool send_data(void) {
 	check_camera_failures();
 	
 	bool success = false;
-	uint32_t dflags = logging_get_debug_flags();
 	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
 	 * suppress the send entirely (all modes: fake, compressed, plain). This
 	 * runs at the common send entry, so it behaves identically whether
@@ -1639,7 +1751,28 @@ _Bool send_data(void) {
 			       (unsigned long)histo_stall_frame_count);
 		}
 	}
-	if (histo_stall_this_frame) {
+	/* Fake buffers must be stamped before planning so the logged raw ID is
+	 * exactly the byte that will go on the wire. Real camera DMA already did
+	 * this before setting event_bits. */
+	if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+		fill_frame_buffers();
+		histo_packet_ready_bits = event_bits_enabled;
+	} else {
+		/* Freeze one immutable view of this outgoing packet. Planning, buffer
+		 * mutation, send/drop, and DMA re-arm all use this same snapshot. */
+		__disable_irq();
+		histo_packet_ready_bits = event_bits & event_bits_enabled;
+		event_bits = 0x00;
+		__enable_irq();
+	}
+	histo_fault_prepare(dflags);
+	if (histo_stall_this_frame || histo_fault_plan.drop_packet) {
+		if (histo_fault_plan.drop_packet &&
+				(dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+			/* send_fake_data() normally advances this after USB send. Advance
+			 * the hidden packet too so the next visible fake ID has a gap. */
+			frame_id++;
+		}
 		success = histo_stall_suppress_frame();
 	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
 		success = send_fake_data();
@@ -1754,21 +1887,11 @@ _Bool check_streaming(void){
 _Bool send_histogram_data(void) {
 	_Bool status = true;
 	int offset = 0;
-	uint8_t ready_bits = 0;
+	uint8_t ready_bits = histo_packet_ready_bits;
 
 	if(event_bits_enabled == 0x00){
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled: a dead camera's aborted DMA can complete
-	 * on garbage clock edges while its regulator browns out, setting a stale
-	 * event bit. Unmasked, that bit would put its garbage buffer in the
-	 * frame AND re-arm reception below — re-wedging the peripheral in
-	 * BUSY_RX ("camera not READY" on the next scan, field-hit 2026-06-11). */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
@@ -1800,7 +1923,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1973,18 +2096,11 @@ static _Bool send_uncompressed_histo(const uint8_t *payload, int payload_len) {
 _Bool send_histogram_data_cmp(void) {
 	_Bool status = true;
 	int p_off = 0;   /* offset into uncmp_payload (uncompressed staging) */
-	uint8_t ready_bits = 0;
+	uint8_t ready_bits = histo_packet_ready_bits;
 
 	if (event_bits_enabled == 0x00) {
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled — same rationale as send_histogram_data():
-	 * never include or re-arm a camera the stall detector disabled. */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
@@ -2004,7 +2120,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -2131,8 +2247,8 @@ _Bool send_histogram_data_cmp(void) {
 }
 
 _Bool send_fake_data(void) {
-
-	fill_frame_buffers();
+	/* send_data() fills and fault-mutates the fake buffers before dispatch so
+	 * the scheduler sees and logs the exact outgoing frame IDs. */
 
 	_Bool status = true;
 	int offset = 0;
@@ -2161,7 +2277,7 @@ _Bool send_fake_data(void) {
 	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
