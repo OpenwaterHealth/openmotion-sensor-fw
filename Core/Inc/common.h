@@ -39,7 +39,13 @@
 #define DEBUG_FLAG_CAMERA_RAW (1u << 10) /* #89: raw "scientific sensor" mode — disable every on-sensor pixel
                                           * correction (BLC/DC-BLC/dither/OTP-DPC) when cameras are
                                           * (re)configured. See X02C1B_raw_sensor in 0X02C1B.c */
-
+#define DEBUG_FLAG_FID_CORRUPT       (1u << 11) /* #123 HIL: one bad camera ID; SDK consensus should repair it */
+#define DEBUG_FLAG_FID_CORRUPT_MULTI (1u << 12) /* #123 HIL: two bad camera IDs; SDK must report ambiguity */
+#define DEBUG_FLAG_TIMESTAMP_FREEZE  (1u << 13) /* #123 HIL: freeze three packet timestamps */
+#define DEBUG_FLAG_HISTO_DROP_ONCE    (1u << 14) /* #123 HIL: consume/re-arm but omit one packet */
+#define DEBUG_FLAG_HIL_FAULT_MASK (DEBUG_FLAG_FID_CORRUPT | \
+		DEBUG_FLAG_FID_CORRUPT_MULTI | DEBUG_FLAG_TIMESTAMP_FREEZE | \
+		DEBUG_FLAG_HISTO_DROP_ONCE)
 
 /* #116 NVIC tiering — the camera RX -> re-arm chain must outrank the send
  * path, or a stalled send (COMM TX spin, rle_compress, logging waits) blocks
