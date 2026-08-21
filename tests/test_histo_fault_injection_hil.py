@@ -80,6 +80,11 @@ def _connect(side):
 
 
 def _bring_up(sensor):
+    # Force a fresh FPGA/camera configuration for every fault case. The
+    # firmware intentionally treats program/configure as idempotent while a
+    # rail remains on, so a stream-only restart would retain camera state.
+    assert sensor.disable_camera_power(CAMERA_MASK) is True
+    time.sleep(0.3)
     assert sensor.enable_camera_power(CAMERA_MASK) is True
     time.sleep(0.5)
     assert sensor.program_fpga(
@@ -211,6 +216,9 @@ def _pipeline_events(packets, side_idx):
         )
         batch = repair.process(classify.process(batch))
         events.extend(batch.events)
+    before_stop = len(batch.events)
+    repair.on_scan_stop(batch)
+    events.extend(batch.events[before_stop:])
     return events
 
 
@@ -267,7 +275,7 @@ def _assert_event_correlation(fault_flag, expected_event, events, timestamp_s):
     expected_counts = {
         DEBUG_FLAG_FID_CORRUPT: 1,
         DEBUG_FLAG_FID_CORRUPT_MULTI: 1,
-        DEBUG_FLAG_TIMESTAMP_FREEZE: 12,
+        DEBUG_FLAG_TIMESTAMP_FREEZE: 1,
         DEBUG_FLAG_HISTO_DROP_ONCE: 4,
     }
     assert len(matching) == expected_counts[fault_flag], (
@@ -277,8 +285,8 @@ def _assert_event_correlation(fault_flag, expected_event, events, timestamp_s):
     timestamp_field = {
         DEBUG_FLAG_FID_CORRUPT: "timestamp_s",
         DEBUG_FLAG_FID_CORRUPT_MULTI: "timestamp_s",
-        DEBUG_FLAG_TIMESTAMP_FREEZE: "original_timestamp_s",
-        DEBUG_FLAG_HISTO_DROP_ONCE: "current_timestamp_s",
+        DEBUG_FLAG_TIMESTAMP_FREEZE: "timestamp_s",
+        DEBUG_FLAG_HISTO_DROP_ONCE: "timestamp_s",
     }[fault_flag]
     assert all(
         np.isclose(getattr(event, timestamp_field), timestamp_s)
@@ -288,8 +296,10 @@ def _assert_event_correlation(fault_flag, expected_event, events, timestamp_s):
         assert {event.reason for event in matching} == {
             "no_single_outlier_consensus"
         }
+    elif fault_flag == DEBUG_FLAG_TIMESTAMP_FREEZE:
+        assert matching[0].n_frames >= 1
     elif fault_flag == DEBUG_FLAG_HISTO_DROP_ONCE:
-        assert {event.missing_count for event in matching} == {1}
+        assert {event.n_filled for event in matching} == {1}
 
 
 @requires_bench
@@ -303,8 +313,11 @@ def test_fault_matrix_drives_expected_sdk_anomaly_events():
     side_idx = 0 if side == "left" else 1
     interface, sensor = _connect(side)
     try:
-        _bring_up(sensor)
         for fault_flag, expected_event, duration_s in FAULT_CASES:
+            # Match the production scan lifecycle. Reprogramming the FPGA is
+            # required between scans; merely stopping and restarting the
+            # camera stream can retain the previous histogram accumulator.
+            _bring_up(sensor)
             packets = _capture_mode(sensor, fault_flag, duration_s)
             injected_timestamp_s = _assert_wire_signature(fault_flag, packets)
             events = _pipeline_events(packets, side_idx)
