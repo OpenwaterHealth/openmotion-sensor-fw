@@ -30,12 +30,12 @@ permissions:
 #                      open-motion-sensor-bl secret of the same name. The CBC crypto
 #                      scheme's sign step requires it (sign_firmware.py --aes-key).
 #
-#   BL_REPO_TOKEN      PAT / fine-grained token with *read* access to
-#                      OpenwaterHealth/open-motion-sensor-bl (contents + releases).
-#                      Needed only because that repo is private: used to check out
-#                      py-tools/sign_firmware.py and to download the bootloader
-#                      release binary. Falls back to GITHUB_TOKEN if the bl repo is
-#                      made public.
+#   (No token is needed for OpenwaterHealth/open-motion-sensor-bl access —
+#   the repo is public, so the built-in github.token covers the py-tools
+#   checkout and the bootloader release download. #126: the old BL_REPO_TOKEN
+#   PAT dated from when that repo was private; when it expired it 401'd every
+#   build. If the bl repo ever goes private again, restore a read-access
+#   cross-repo credential at the three github.token sites below.)
 #
 # The AES + ECDSA keypair MUST match what is embedded in open-motion-sensor-bl.
 # A mismatch silently produces a bootloader that rejects this firmware.
