@@ -85,6 +85,13 @@ int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *w
     return HAL_OK;
 }
 
+/* First-chunk staging only: the command byte(s) plus the leading data slice
+ * are copied here; every later chunk transmits straight from the caller's
+ * data pointer. The previous implementation staged the WHOLE stream in
+ * bitstream_buffer, zeroing the very data it was asked to send whenever the
+ * caller's data WAS bitstream_buffer (the host-upload SRAM path, issue #82). */
+static uint8_t xfer_stage[BITSTREAM_CHUNK_SIZE];
+
 static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *cmd, int cmd_len, uint8_t *data, size_t data_len) {
 	HAL_StatusTypeDef ret;
     size_t offset = 0;
@@ -93,10 +100,11 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
     int num_chunks = (total_len + BITSTREAM_CHUNK_SIZE - 1) / BITSTREAM_CHUNK_SIZE;  // Calculate number of chunks
     uint8_t *pData;
 	uint16_t datalen;
+	size_t first_data_len = ((total_len > BITSTREAM_CHUNK_SIZE)
+	                          ? BITSTREAM_CHUNK_SIZE : total_len) - (size_t)cmd_len;
 
-	memset(bitstream_buffer, 0, MAX_BITSTREAM_SIZE);
-    memcpy(bitstream_buffer, cmd, cmd_len);  // copy the long write command in
-    memcpy(bitstream_buffer + cmd_len, data, data_len);
+    memcpy(xfer_stage, cmd, cmd_len);
+    memcpy(xfer_stage + cmd_len, data, first_data_len);
 
     for (int i = 0; i < num_chunks; i++) {
         size_t current_chunk_size = (total_len - offset > BITSTREAM_CHUNK_SIZE)
@@ -120,7 +128,9 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
             delay_ms(1);  // Add a small delay to avoid busy looping
         }
 
-        pData = (uint8_t*)&bitstream_buffer[offset];
+        /* chunk 0 = staged cmd+data head; chunks 1..n stream directly from
+         * the source at (stream offset - cmd_len) */
+        pData = (i == 0) ? xfer_stage : data + (offset - (size_t)cmd_len);
         datalen = (uint16_t)current_chunk_size;
 
         // Reset completion flags
@@ -405,7 +415,9 @@ int fpga_program_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, bool rom_bit
     if(rom_bitstream)
     {
     	write_buf[0] = 0x7A; write_buf[1] = 0x00; write_buf[2] = 0x00; write_buf[3] = 0x00;
-    	if(xi2c_write_long(hi2c, DevAddress, write_buf, 4, (uint8_t *)bitstream_buffer, bitstream_len) != HAL_OK)
+    	/* Host uploads land at bitstream_buffer + 4 (OW_FPGA_BITSTREAM keeps
+    	 * the first 4 bytes free — legacy of the old in-place cmd staging). */
+    	if(xi2c_write_long(hi2c, DevAddress, write_buf, 4, (uint8_t *)bitstream_buffer + 4, bitstream_len) != HAL_OK)
     	{
     		return 1; // program sram failed
     	}
