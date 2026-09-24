@@ -29,7 +29,7 @@ HAL_StatusTypeDef i2c_mem_read(I2C_HandleTypeDef *pI2c, uint8_t dev_addr,
                                uint16_t reg_addr, uint8_t reg_addr_size,
                                uint8_t *pBuffer, uint16_t len, uint8_t mux_channel);
 
-void reset_slaves(I2C_HandleTypeDef * pI2c);
+void reset_slaves(const I2C_HandleTypeDef * pI2c);
 HAL_StatusTypeDef TCA9548A_SelectChannel(I2C_HandleTypeDef *hi2c, uint8_t address, uint8_t channel);
 HAL_StatusTypeDef TCA9548A_SelectBroadcast(I2C_HandleTypeDef *hi2c, uint8_t address);
 /* NOTE: there is intentionally no TCA9548A_EnableChannel (additive select).

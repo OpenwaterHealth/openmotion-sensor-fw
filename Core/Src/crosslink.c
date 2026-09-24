@@ -85,14 +85,12 @@ int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *w
     return HAL_OK;
 }
 
-static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *cmd, int cmd_len, uint8_t *data, size_t data_len) {
+static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, const uint8_t *cmd, int cmd_len, const uint8_t *data, size_t data_len) {
 	HAL_StatusTypeDef ret;
     size_t offset = 0;
     uint32_t frame_flag;
     size_t total_len = data_len+cmd_len;
     int num_chunks = (total_len + BITSTREAM_CHUNK_SIZE - 1) / BITSTREAM_CHUNK_SIZE;  // Calculate number of chunks
-    uint8_t *pData;
-	uint16_t datalen;
 
 	memset(bitstream_buffer, 0, MAX_BITSTREAM_SIZE);
     memcpy(bitstream_buffer, cmd, cmd_len);  // copy the long write command in
@@ -120,8 +118,8 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
             delay_ms(1);  // Add a small delay to avoid busy looping
         }
 
-        pData = (uint8_t*)&bitstream_buffer[offset];
-        datalen = (uint16_t)current_chunk_size;
+        uint8_t *pData = (uint8_t*)&bitstream_buffer[offset];
+        uint16_t datalen = (uint16_t)current_chunk_size;
 
         // Reset completion flags
         txComplete = 0;
@@ -444,7 +442,6 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
 		delay_ms(1000);
 
 		// Activation Key
-		uint8_t activation_key[] = {0xFF, 0xA4, 0xC6, 0xF4, 0x8A};
 		xi2c_write_bytes(hi2c, DevAddress, activation_key, 5);
 		HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
 		delay_ms(10);
@@ -520,16 +517,19 @@ int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *G
 }
 
 // Callback implementations
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
     txComplete = 1;
 }
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
     rxComplete = 1;
 }
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 {
     i2cError = 1;
