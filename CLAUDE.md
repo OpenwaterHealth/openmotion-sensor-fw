@@ -206,6 +206,17 @@ Build config is chosen from the trigger:
 - `*-rc.*` or final `X.Y.Z` tag → **Release** (`-Os`).
 - branch push / `workflow_dispatch` → **Debug**.
 
+### Safety & security scan (`.github/workflows/safety-security-scan.yml`)
+
+Port of the console-fw scan; runs on push to `main`/`next` and PRs into them. Four gates, any failure fails the job:
+
+1. **cppcheck** (`warning,style,performance,portability`, fail on any finding) over `Core/Src` + `USB/Class/{COMMS,HISTO,IMU}/Src`. ST/CubeMX + third-party files are suppressed (same boundary as `docs/misra-deviations.md`). The `-D` flags are load-bearing: without `__ALIGN_BEGIN/__ALIGN_END/__ASM` cppcheck silently **skips** `main.c`, `camera_manager.c` and the USB class files; without `uint32_t=unsigned long` it false-flags every `%lu`.
+2. **lizard** — CCN ≤ 15, ≤ 100 lines. Exceptions in `lizard_whitelist.csv`; its "legacy baseline" section is pay-down-only — never add to it, and delete an entry when that function gets under threshold.
+3. **grype** against `sbom.cdx.json` (HIGH/CRITICAL fails), SARIF → Security tab. The SBOM has no component versions/purls yet, so this gate can't match anything until it's filled in.
+4. SBOM + SARIF archived as `firmware-compliance-report`.
+
+Run gates 1–2 locally before pushing — tools are pip-pinned so results match CI: `pip install cppcheck==1.5.1 lizard==1.23.0` (cppcheck wheel 1.5.1 = Cppcheck 2.17.1; apt's older cppcheck reports a different set), then paste the two `run:` blocks from the workflow. Suppress a finding only for a fixed signature (HAL weak callback, USB class `Setup`, etc.), inline, with the reason: `// cppcheck-suppress <id> ; <why>`.
+
 ## Git workflow
 
 - **Branching:** feature branches off `next`, PR to `next`, `next` → `main` for release. Releases are tagged on `main`.

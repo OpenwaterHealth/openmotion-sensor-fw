@@ -1,0 +1,106 @@
+name: "Medical Firmware Safety & Security Scan"
+
+# Sensor-module port of openmotion-console-fw's safety-security-scan.yml.
+# Refs OpenwaterHealth/openmotion-bloodflow-app#534.
+
+on:
+  push:
+    branches: [ main, next ]
+  pull_request:
+    branches: [ main, next ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # upload-sarif
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Pinned via pip so a local run reproduces CI exactly (Ubuntu's apt
+      # cppcheck lags and reports a different finding set).
+      - name: Install Analysis Tools
+        run: pip3 install cppcheck==1.5.1 lizard==1.23.0   # cppcheck wheel 1.5.1 = Cppcheck 2.17.1
+
+      # 1. Cppcheck — safety & standards
+      # --error-exitcode=1 fails the build on any finding. ST/CubeMX and
+      # third-party sources are out of scope (see docs/misra-deviations.md).
+      # The -D defines model the arm-none-eabi target so files are analyzed
+      # rather than skipped:
+      #   __ALIGN_BEGIN/__ALIGN_END/__ASM — toolchain macros from headers cppcheck
+      #     isn't given; without them cppcheck aborts camera_manager.c, main.c
+      #     and every USB class file with unknownMacro/syntaxError.
+      #   uint32_t/int32_t — newlib on arm-none-eabi types these as (unsigned)
+      #     long, so "%lu" is correct for uint32_t; the host default (int)
+      #     would flag every such printf.
+      - name: Run Cppcheck (Safety & Standards)
+        run: |
+          cppcheck --enable=warning,style,performance,portability \
+                   --std=c11 \
+                   --check-level=exhaustive \
+                   --error-exitcode=1 \
+                   --force \
+                   --inline-suppr \
+                   --template="[{severity}] {file}:{line} {id} - {message}" \
+                   -D__ALIGN_BEGIN= -D__ALIGN_END= -D__ASM=__asm__ \
+                   -D"uint32_t=unsigned long" -D"int32_t=long" \
+                   --suppress=missingIncludeSystem \
+                   --suppress=*:Core/Src/lwrb.c \
+                   --suppress=*:Core/Src/jsmn.c \
+                   --suppress=*:Core/Src/system_stm32h7xx.c \
+                   --suppress=*:Core/Src/stm32h7xx_hal_msp.c \
+                   --suppress=*:Core/Src/syscalls.c \
+                   --suppress=*:Core/Src/sysmem.c \
+                   ./Core/Src ./USB/Class/COMMS/Src ./USB/Class/HISTO/Src ./USB/Class/IMU/Src
+
+      # 2. Complexity Analysis (Lizard)
+      # IEC 62304 recommends low cyclomatic complexity for testability.
+      # Fails if any function exceeds CCN 15 or 100 lines. Third-party and
+      # ST-generated files are excluded; justified exceptions (and the
+      # pre-gate legacy baseline) live in lizard_whitelist.csv.
+      - name: Check Code Complexity (IEC 62304 Requirement)
+        run: |
+          lizard ./Core/Src ./USB/Class/COMMS/Src ./USB/Class/HISTO/Src ./USB/Class/IMU/Src \
+            -C 15 -L 100 -w \
+            -x "*/jsmn.c" \
+            -x "*/lwrb.c" \
+            -x "*/system_stm32h7xx.c" \
+            -x "*/stm32h7xx_hal_msp.c" \
+            -x "*/syscalls.c" \
+            -x "*/sysmem.c" \
+            --whitelist lizard_whitelist.csv
+
+      # 3. Vulnerability Scan against the committed SBOM
+      # grype consumes the CycloneDX SBOM and checks each component against
+      # the Grype vulnerability database (NVD, OSV, GHSA, and others).
+      # Fails the build on any HIGH or CRITICAL finding.
+      - name: Scan SBOM for Vulnerabilities (grype)
+        id: grype
+        uses: anchore/scan-action@v6
+        with:
+          sbom: "sbom.cdx.json"
+          fail-build: true
+          severity-cutoff: high
+          output-format: sarif
+
+      # 4. Upload SARIF results to GitHub Security tab
+      - name: Upload SARIF to GitHub Security
+        if: always() && steps.grype.conclusion != 'skipped'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+
+      # 5. Upload Audit Artifacts
+      # Keeps a record of the scan results for regulatory submission.
+      - name: Archive Regulatory Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-compliance-report
+          path: |
+            sbom.cdx.json
+            ${{ steps.grype.outputs.sarif }}
