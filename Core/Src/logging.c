@@ -76,6 +76,7 @@ int _write(int fd, const void *buf, size_t count){
 	return count;
 }
 #else
+// cppcheck-suppress constParameterPointer ; fputc signature is fixed by newlib
 PUTCHAR_PROTOTYPE
 {
   /* Place your implementation of fputc here */
@@ -193,13 +194,13 @@ static uint8_t usart_start_tx_dma_transfer(void) {
     return 1;
 }
 
-void logging_UART_TxHalfCpltCallback(UART_HandleTypeDef *huart)
+void logging_UART_TxHalfCpltCallback(const UART_HandleTypeDef *huart)
 {
 
 }
 
 
-void logging_UART_ErrorCallback(UART_HandleTypeDef *huart)
+void logging_UART_ErrorCallback(const UART_HandleTypeDef *huart)
 {
 
 }

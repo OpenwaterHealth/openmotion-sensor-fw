@@ -264,7 +264,7 @@ void camera_telemetry_service(void)
 		for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
 			uint8_t cam = telem_rr_idx;
 			telem_rr_idx = (uint8_t)((telem_rr_idx + 1u) % CAMERA_COUNT);
-			CameraDevice *p = get_camera_byID(cam);
+			const CameraDevice *p = get_camera_byID(cam);
 			if (p != NULL && p->isPresent && p->isPowered) {
 				telem_active = (int8_t)cam;
 				telem_op_idx = 0;

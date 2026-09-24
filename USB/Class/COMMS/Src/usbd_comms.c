@@ -30,7 +30,7 @@ static uint8_t comms_queue_tail = 0;
 static uint8_t comms_queue_count = 0;
 static USBD_HandleTypeDef *comms_pdev = NULL;
 
-static uint8_t comms_queue_enqueue(uint8_t *data, uint16_t length);
+static uint8_t comms_queue_enqueue(const uint8_t *data, uint16_t length);
 static uint8_t comms_queue_dequeue(uint8_t **data, uint16_t *length);
 static uint8_t comms_queue_is_empty(void);
 static uint8_t comms_queue_is_full(void);
@@ -233,7 +233,7 @@ static uint8_t comms_queue_is_full(void)
   return (comms_queue_count >= COMMS_QUEUE_SIZE);
 }
 
-static uint8_t comms_queue_enqueue(uint8_t *data, uint16_t length)
+static uint8_t comms_queue_enqueue(const uint8_t *data, uint16_t length)
 {
   if (comms_queue_is_full() != 0) {
     printf("COMMS enqueue fail: queue full (count=%u size=%u enq=%lu deq=%lu datain=%lu txfail=%lu)\r\n",
@@ -301,6 +301,7 @@ static uint8_t comms_process_queue(void)
   return USBD_COMMS_SetTxBuffer(comms_pdev, data, length);
 }
 
+// cppcheck-suppress constParameterCallback ; USBD_ClassTypeDef.Setup signature is fixed by the ST USB core
 static uint8_t USBD_Comms_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
 {
   // Ignore everything, don't stall
@@ -405,7 +406,7 @@ static uint8_t USBD_Comms_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
   return status;
 }
 
-uint8_t USBD_COMMS_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t len, uint8_t ep_idx)
+uint8_t USBD_COMMS_SendData(USBD_HandleTypeDef *pdev, const uint8_t *data, uint16_t len, uint8_t ep_idx)
 {
   UNUSED(ep_idx);
 
@@ -452,7 +453,7 @@ uint8_t USBD_COMMS_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
   return comms_queue_enqueue(data, len);
 }
 
-uint8_t  USBD_COMMS_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)
+uint8_t  USBD_COMMS_SetTxBuffer(USBD_HandleTypeDef *pdev, const uint8_t  *pbuff, uint16_t length)
 {
   uint8_t ret = USBD_OK;
 
@@ -492,7 +493,7 @@ uint8_t  USBD_COMMS_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint1
 }
 
 
-uint8_t USBD_COMMS_Transmit(USBD_HandleTypeDef *pdev, uint8_t* Buf, uint16_t Len)
+uint8_t USBD_COMMS_Transmit(USBD_HandleTypeDef *pdev, const uint8_t* Buf, uint16_t Len)
 {
 	return USBD_COMMS_SetTxBuffer(pdev, Buf, Len);
 }
@@ -539,14 +540,14 @@ void USBD_COMMS_RecoverFromError(void)
   __enable_irq();
 }
 
-__weak void USBD_COMMS_TxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum)
+__weak void USBD_COMMS_TxCpltCallback(const uint8_t *Buf, uint32_t Len, uint8_t epnum)
 {
 	UNUSED(Buf);
 	UNUSED(Len);
 	UNUSED(epnum);
 }
 
-__weak void USBD_COMMS_RxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum)
+__weak void USBD_COMMS_RxCpltCallback(const uint8_t *Buf, uint32_t Len, uint8_t epnum)
 {
 	UNUSED(Buf);
 	UNUSED(Len);

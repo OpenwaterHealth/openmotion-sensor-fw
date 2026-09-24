@@ -167,7 +167,7 @@ void camera_manager_get_diag_stats(cam_diag_stats_t *out) {
 
 
 static bool camera_is_present(uint8_t cam_id) {
-	CameraDevice *cam = &cam_array[cam_id];
+	const CameraDevice *cam = &cam_array[cam_id];
 	if (!cam->isPresent) {
 		printf("Camera %d not present\r\n", cam_id + 1);
 		return false;
@@ -586,7 +586,7 @@ uint8_t get_cameras_present(void) {
 uint8_t get_camera_status(uint8_t cam_id) {
 	uint8_t status_flags = 0x00;
 
-	if (cam_id < 0 || cam_id >= CAMERA_COUNT) {
+	if (cam_id >= CAMERA_COUNT) {
 		printf("Get Camera %d Status Failed\r\n", cam_id + 1);
 		return 0x00;
 	}
@@ -1254,10 +1254,7 @@ static void poll_camera_temperatures(void)
         }
 
         // Restore the active camera's I2C channel
-        if (active_cam != NULL)
-        {
-            TCA9548A_SelectChannel(&hi2c1, 0x70, active_cam->i2c_target);
-        }
+        TCA9548A_SelectChannel(&hi2c1, 0x70, active_cam->i2c_target);
     }
 }
 
@@ -2286,7 +2283,7 @@ _Bool send_fake_data(void) {
 	// --- Data --- (iterate over all cameras so payload length matches header)
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
 		if((event_bits_enabled & (0x01 << cam_id)) != 0) {
-			uint32_t *histo_ptr = (uint32_t *) cam_array[cam_id].pRecieveHistoBuffer;
+			const uint32_t *histo_ptr = (const uint32_t *) cam_array[cam_id].pRecieveHistoBuffer;
 			packet_buffer[offset++] = HISTO_SOH;
 			packet_buffer[offset++] = cam_id;
 			memcpy(packet_buffer+offset,histo_ptr,HISTO_SIZE_32B*4);
@@ -2736,7 +2733,7 @@ _Bool disable_camera_stream(uint8_t cam_id){
 
 /* -------- BEGIN CAMERA POWER TOGGLE FUNCTIONS -------- */
 _Bool enable_camera_power(uint8_t cam_id){
-	if(cam_id < 0 || cam_id >= CAMERA_COUNT)
+	if(cam_id >= CAMERA_COUNT)
 	{
 		printf("Enable Power for Camera %d Failed\r\n", cam_id+1);
 		return false;
@@ -2772,7 +2769,7 @@ _Bool enable_camera_power(uint8_t cam_id){
 }
 
 _Bool disable_camera_power(uint8_t cam_id){
-	if(cam_id < 0 || cam_id >= CAMERA_COUNT)
+	if(cam_id >= CAMERA_COUNT)
 	{
 		printf("Disable Power for Camera %d Failed\r\n", cam_id+1);
 		return false;
@@ -2806,7 +2803,7 @@ _Bool get_camera_power_status(uint8_t cam_id){
 		return false;
 	}
 
-	CameraDevice *cam = get_camera_byID(cam_id);
+	const CameraDevice *cam = get_camera_byID(cam_id);
 	return cam->isPowered;
 }
 

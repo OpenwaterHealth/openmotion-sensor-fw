@@ -271,8 +271,8 @@ static uint8_t USBD_IMU_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   * @param  req: usb requests
   * @retval status
   */
-static uint8_t USBD_IMU_Setup(USBD_HandleTypeDef *pdev,
-                                   USBD_SetupReqTypedef *req)
+// cppcheck-suppress constParameterCallback ; USBD_ClassTypeDef.Setup signature is fixed by the ST USB core
+static uint8_t USBD_IMU_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
 {
   USBD_StatusTypeDef ret = USBD_OK;
   return (uint8_t)ret;
@@ -326,12 +326,12 @@ static uint8_t USBD_IMU_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 }
 
 
-uint8_t USBD_IMU_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t len, uint8_t ep_idx)
+uint8_t USBD_IMU_SendData(const USBD_HandleTypeDef *pdev, const uint8_t *data, uint16_t len, uint8_t ep_idx)
 {
   return (uint8_t)USBD_OK;
 }
 
-uint8_t  USBD_IMU_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)
+uint8_t  USBD_IMU_SetTxBuffer(USBD_HandleTypeDef *pdev, const uint8_t  *pbuff, uint16_t length)
 {
 	uint8_t ret = USBD_OK;
 	if(imu_ep_enabled == 1 && imu_ep_data==0)

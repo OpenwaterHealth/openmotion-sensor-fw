@@ -294,7 +294,7 @@ static void PrintI2CSpeed(I2C_HandleTypeDef *hi2c)
   uint32_t scl_freq = i2c_clk_freq / ((presc + 1) * (scll + 1 + sclh + 1));
 
   // Print I2C speed
-  printf("I2C Speed: %ld Hz\r\n", scl_freq); // Print the I2C speed in kHz
+  printf("I2C Speed: %lu Hz\r\n", scl_freq); // Print the I2C speed in kHz
 }
 
 /* USER CODE END 0 */
@@ -1792,6 +1792,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 }
@@ -2006,6 +2007,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
  * path. Instance -> cam_id mapping matches the old BIT_n assignments. */
 
 // Interrupt handler for SPI reception
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
   if (hspi->Instance == SPI2)
@@ -2026,6 +2028,7 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
   }
 }
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)
 {
   if (husart->Instance == USART1)
@@ -2047,6 +2050,7 @@ void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)
 
 }
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM4) // Call data sender (internal FSIN))
@@ -2303,7 +2307,7 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
 
-  uint32_t *stack_ptr;
+  const uint32_t *stack_ptr;
 
   HAL_GPIO_TogglePin(ERROR_LED_GPIO_Port, ERROR_LED_Pin);
   printf(">>> HARD FAULT <<<\r\n");
@@ -2343,6 +2347,7 @@ void Error_Handler(void)
   * @param  line: assert_param error line source number
   * @retval None
   */
+// cppcheck-suppress constParameterPointer ; assert_failed signature is fixed by stm32h7xx_hal_conf.h
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
