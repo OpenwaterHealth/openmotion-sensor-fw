@@ -167,6 +167,7 @@ _Bool camera_image_mode_enter(uint8_t mask);
 _Bool camera_image_mode_exit(void);
 bool  camera_image_mode_active(uint8_t cam_id); /* cam is in the active image mask */
 bool  camera_image_mode_rx(uint8_t cam_id);     /* HAL RxCplt hook; true = consumed by image path */
+bool  camera_image_mode_rx_half(uint8_t cam_id); /* HAL RxHalfCplt hook (circular line ring) */
 void  camera_image_link_error(uint8_t cam_id);  /* HAL error-callback recovery while in image mode */
 void  camera_image_rearm_service(void);         /* LPTIM5 software-IRQ body: deferred DMA re-arm */
 void  camera_image_service(void);               /* main-loop line-timeout tick (~2 ms) */

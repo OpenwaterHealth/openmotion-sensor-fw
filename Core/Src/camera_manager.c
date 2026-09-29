@@ -2299,6 +2299,72 @@ static uint32_t image_last_progress_tick[CAMERA_COUNT];
                                   * granularity, so >=3 ticks guarantees more
                                   * than 2 ms of real mid-line silence */
 
+/* USB batching (bench 2026-09-29): one bulk transfer per 2424-B line meant
+ * ~1.2 k host reads/s at sweep timing; the host fell behind, the 4-deep
+ * HISTO queue filled and lines were dropped. Completed line envelopes are
+ * appended here and handed to USBD_HISTO_SendData only when the endpoint is
+ * idle, so under load one transfer carries up to 13 lines (the SDK framer
+ * already splits concatenated envelopes). Touched only from the camera DMA
+ * RxCplt ISRs and the USB ISR (all NVIC priority 0, so mutually exclusive)
+ * and from the main loop with IRQs masked. */
+#define IMAGE_TX_STAGE_SIZE USB_HISTO_MAX_SIZE
+/* Two stages: lines append to image_tx_stage (the fill stage) while USB
+ * transmits the other one in place (USBD_HISTO_SendNoCopy -- no copy in ISR
+ * context). image_tx_stage is re-pointed at each hand-off. */
+static uint8_t           image_tx_bufs[2][IMAGE_TX_STAGE_SIZE];
+static uint8_t          *image_tx_stage = image_tx_bufs[0];
+static volatile uint32_t image_tx_len = 0;
+static volatile uint32_t image_tx_batches = 0;
+static volatile uint32_t image_tx_max_batch = 0;
+static volatile uint32_t image_tx_stage_full = 0;
+
+/* Hand the staged lines to USB if the endpoint is idle. Caller excludes the
+ * camera/USB ISRs. */
+static void image_tx_flush(void)
+{
+	if (image_tx_len == 0u || USBD_HISTO_TxIdle() == 0u) {
+		return;
+	}
+	uint8_t sret = USBD_HISTO_SendNoCopy(&hUsbDeviceHS, image_tx_stage, (uint16_t)image_tx_len);
+	if (sret == USBD_OK) {
+		uint32_t n = image_tx_len / IMAGE_PKT_TOTAL_SIZE;
+		if (n > image_tx_max_batch) image_tx_max_batch = n;
+		image_tx_batches++;
+		/* USB now owns this stage until TxCplt; fill the other one. The
+		 * other stage is free: TxIdle() means its transfer completed. */
+		image_tx_stage = (image_tx_stage == image_tx_bufs[0]) ? image_tx_bufs[1] : image_tx_bufs[0];
+		image_tx_len = 0;
+	}
+}
+
+/* USB ISR: a HISTO transfer just finished -- ship whatever accumulated. */
+void USBD_HISTO_TxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum)
+{
+	(void)Buf; (void)Len; (void)epnum;
+	if (image_mode_on) {
+		image_tx_flush();
+	}
+}
+
+/* IMGDBG: image-path diagnostics, printed once a second from the main loop
+ * while image mode is on and DEBUG_FLAG_USB_PRINTF is set (never from ISR
+ * context; without the flag printf is a blocking UART write). */
+static volatile uint32_t imgdbg_rx[CAMERA_COUNT];
+static volatile uint32_t imgdbg_ok[CAMERA_COUNT];
+static volatile uint32_t imgdbg_already[CAMERA_COUNT];
+static volatile uint32_t imgdbg_fail[CAMERA_COUNT];
+static volatile uint32_t imgdbg_fail_status[CAMERA_COUNT];
+static volatile uint32_t imgdbg_fail_state[CAMERA_COUNT];
+static volatile uint32_t imgdbg_lerr[CAMERA_COUNT];
+static volatile uint32_t imgdbg_lerr_code[CAMERA_COUNT];
+static volatile uint32_t imgdbg_to[CAMERA_COUNT];
+static volatile uint32_t imgdbg_idle[CAMERA_COUNT];
+static volatile uint32_t imgdbg_rearm_calls;
+static volatile uint32_t imgdbg_rx_cyc[CAMERA_COUNT];
+static volatile uint32_t imgdbg_isr_max_cyc;
+static volatile uint32_t imgdbg_rx2arm_max_cyc;
+static uint32_t imgdbg_last_print;
+
 bool camera_image_mode_active(uint8_t cam_id)
 {
 	return image_mode_on && ((image_mode_mask & (1u << cam_id)) != 0u);
@@ -2308,10 +2374,65 @@ bool camera_image_mode_active(uint8_t cam_id)
  * offset. Returns true when a reception is armed after this call --
  * including the already-armed case, which happens when an error-callback
  * recovery re-armed the camera before the deferred LPTIM5 re-arm ran. */
+/* Circular line ring (bench 2026-09-29). A one-shot DMA per line has to be
+ * re-armed between pushes, and the gap between pushes at sweep timing
+ * (row time - 0.69 ms drain, ~60-150 us) is shorter than the completion
+ * ISR + deferred re-arm: every other line overran the link. Each camera
+ * instead receives into a 2-line ring with a CIRCULAR DMA that never stops;
+ * the half-transfer and transfer-complete callbacks each hand over one
+ * finished line, which leaves a whole row period to copy it out. The FPGA
+ * pushes exactly IMAGE_LINE_SIZE bytes per line, so the halves stay aligned;
+ * a bad magic byte (a lost byte on the link) triggers a resync from the main
+ * loop in an idle gap. cam 1 (SPI6) is served by the BDMA, which only reaches
+ * SRAM4. */
+#define IMAGE_RING_SIZE (2u * IMAGE_LINE_SIZE)
+__ALIGN_BEGIN __attribute__((section(".sram4"))) static volatile uint8_t image_ring_sram4[IMAGE_RING_SIZE] __ALIGN_END;
+__ALIGN_BEGIN static volatile uint8_t image_ring[CAMERA_COUNT][IMAGE_RING_SIZE] __ALIGN_END;
+static volatile uint8_t image_resync_pending = 0x00;
+
+static uint8_t *camera_image_ring(uint8_t cam_id)
+{
+	return (cam_id == 1u) ? (uint8_t *)image_ring_sram4 : (uint8_t *)image_ring[cam_id];
+}
+
+static DMA_HandleTypeDef *camera_image_hdmarx(uint8_t cam_id)
+{
+	CameraDevice *cam = &cam_array[cam_id];
+	return cam->useUsart ? cam->pUart->hdmarx : cam->pSpi->hdmarx;
+}
+
+/* Switch a camera's RX DMA between DMA_NORMAL (histogram one-shots) and
+ * DMA_CIRCULAR (image ring). Reception must already be aborted. */
+static void camera_image_dma_mode(uint8_t cam_id, uint32_t mode)
+{
+	DMA_HandleTypeDef *h = camera_image_hdmarx(cam_id);
+	if (h == NULL || h->Init.Mode == mode) {
+		return;
+	}
+	(void)HAL_DMA_DeInit(h);
+	h->Init.Mode = mode;
+	(void)HAL_DMA_Init(h);
+}
+
+/* Abort one camera's reception WITHOUT abort_data_reception()'s 10 ms
+ * settle delay -- the image path runs this from ISR context (link-error
+ * callbacks, the LPTIM5 re-arm), where a 10 ms busy-wait loses every line
+ * that lands meanwhile. HAL_*_Abort also clears the peripheral error flags
+ * (ORE/OVR) and resets a DMA stream left in an error state. */
+static void camera_image_abort_nodelay(uint8_t cam_id)
+{
+	CameraDevice *cam = &cam_array[cam_id];
+	if (cam->useUsart) {
+		(void)HAL_USART_Abort(cam->pUart);
+	} else {
+		(void)HAL_SPI_Abort(cam->pSpi);
+	}
+}
+
 static _Bool camera_image_arm(uint8_t cam_id)
 {
 	CameraDevice *cam = &cam_array[cam_id];
-	uint8_t *dst = cam->pRecieveHistoBuffer + IMAGE_PKT_LINE_OFFSET;
+	uint8_t *dst = camera_image_ring(cam_id);
 	HAL_StatusTypeDef status;
 
 	if (!image_mode_on) {
@@ -2325,16 +2446,33 @@ static _Bool camera_image_arm(uint8_t cam_id)
 	if (cam->useUsart) {
 		if (cam->pUart->State == HAL_USART_STATE_BUSY_RX ||
 		    cam->pUart->State == HAL_USART_STATE_BUSY_TX_RX) {
+			imgdbg_already[cam_id]++;
 			return true; /* already armed */
 		}
-		status = HAL_USART_Receive_DMA(cam->pUart, dst, IMAGE_LINE_SIZE);
+		status = HAL_USART_Receive_DMA(cam->pUart, dst, IMAGE_RING_SIZE);
+		if (status != HAL_OK) {
+			/* A previous overrun can leave the RX DMA stream in an error
+			 * state that makes every later Receive_DMA fail (bench,
+			 * 2026-09-29): clear it and retry once. */
+			imgdbg_fail_state[cam_id] = cam->pUart->State | (cam->pUart->ErrorCode << 8);
+			camera_image_abort_nodelay(cam_id);
+			status = HAL_USART_Receive_DMA(cam->pUart, dst, IMAGE_RING_SIZE);
+		}
 	} else {
 		if (cam->pSpi->State == HAL_SPI_STATE_BUSY_RX ||
 		    cam->pSpi->State == HAL_SPI_STATE_BUSY_TX_RX) {
+			imgdbg_already[cam_id]++;
 			return true; /* already armed */
 		}
-		status = HAL_SPI_Receive_DMA(cam->pSpi, dst, IMAGE_LINE_SIZE);
+		status = HAL_SPI_Receive_DMA(cam->pSpi, dst, IMAGE_RING_SIZE);
+		if (status != HAL_OK) {
+			imgdbg_fail_state[cam_id] = cam->pSpi->State | (cam->pSpi->ErrorCode << 8);
+			camera_image_abort_nodelay(cam_id);
+			status = HAL_SPI_Receive_DMA(cam->pSpi, dst, IMAGE_RING_SIZE);
+		}
 	}
+	if (status == HAL_OK) { imgdbg_ok[cam_id]++; }
+	else { imgdbg_fail[cam_id]++; imgdbg_fail_status[cam_id] = status; }
 	return status == HAL_OK;
 }
 
@@ -2385,6 +2523,15 @@ _Bool camera_image_mode_enter(uint8_t mask)
 		image_last_progress_tick[i] = now;
 	}
 	image_rearm_pending = 0x00;
+	image_resync_pending = 0x00;
+	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+		imgdbg_rx[i] = imgdbg_ok[i] = imgdbg_already[i] = imgdbg_fail[i] = 0;
+		imgdbg_fail_status[i] = imgdbg_fail_state[i] = imgdbg_lerr[i] = imgdbg_lerr_code[i] = imgdbg_to[i] = imgdbg_idle[i] = 0;
+	}
+	imgdbg_rearm_calls = 0; imgdbg_isr_max_cyc = 0; imgdbg_rx2arm_max_cyc = 0;
+	image_tx_len = 0; image_tx_batches = 0; image_tx_max_batch = 0; image_tx_stage_full = 0;
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 	image_mode_mask = mask;
 	image_mode_on = true; /* BEFORE arming, so RxCplt/error callbacks route image-side */
 
@@ -2394,7 +2541,8 @@ _Bool camera_image_mode_enter(uint8_t mask)
 			continue;
 		}
 		abort_data_reception(i); /* kill any in-flight 4100-B histogram DMA */
-		memset((uint8_t *)cam_array[i].pRecieveHistoBuffer, 0, IMAGE_PKT_TOTAL_SIZE);
+		camera_image_dma_mode(i, DMA_CIRCULAR);
+		memset(camera_image_ring(i), 0, IMAGE_RING_SIZE);
 		if (!camera_image_arm(i)) {
 			printf("Image mode: failed to arm camera %d\r\n", i + 1);
 			ok = false;
@@ -2430,6 +2578,9 @@ _Bool camera_image_mode_exit(void)
 		/* Masked cams: abort the image DMA. Previously-streaming cams: abort
 		 * the stale histogram DMA left from suspension. */
 		abort_data_reception(i);
+		if ((mask & bit) != 0u) {
+			camera_image_dma_mode(i, DMA_NORMAL); /* histogram one-shots again */
+		}
 		/* #172 hygiene, same as enable_camera_stream(): never leave stale
 		 * bytes where the next scan's first frame could ship them. */
 		if (cam_array[i].pRecieveHistoBuffer != NULL) {
@@ -2484,13 +2635,26 @@ void camera_image_get_status(image_mode_resp_t *out)
  * NOTE: DEBUG_FLAG_HISTO_THROTTLE / DEBUG_FLAG_HISTO_SPARSE act inside
  * USBD_HISTO_SendData and would silently swallow image lines -- do not run
  * image mode with those flags set (documented in CLAUDE.md). */
-bool camera_image_mode_rx(uint8_t cam_id)
+static void camera_image_line_done(uint8_t cam_id, uint32_t half)
 {
-	if (!camera_image_mode_active(cam_id)) {
-		return false;
+	uint32_t c0 = DWT->CYCCNT;
+	imgdbg_rx[cam_id]++;
+	imgdbg_rx_cyc[cam_id] = c0;
+	const uint8_t *line = camera_image_ring(cam_id) + half * IMAGE_LINE_SIZE;
+	if (line[0] != 0xB6u || line[1] != 0x01u) {
+		/* Ring out of step with the pushes (a lost or extra byte): drop and
+		 * let the main loop restart the ring in an idle gap. */
+		image_gap_count[cam_id]++;
+		image_resync_pending |= (uint8_t)(1u << cam_id);
+		return;
 	}
-	CameraDevice *cam = &cam_array[cam_id];
-	uint8_t *pkt = cam->pRecieveHistoBuffer;
+	if (image_tx_len + IMAGE_PKT_TOTAL_SIZE > IMAGE_TX_STAGE_SIZE) {
+		image_tx_stage_full++;
+		image_gap_count[cam_id]++; /* dropped line -- host sees the gap, retries the sweep */
+		image_tx_flush();
+		return;
+	}
+	uint8_t *pkt = &image_tx_stage[image_tx_len];
 	uint32_t ts = get_timestamp_ms(); /* same TIM5 timebase as histogram frames */
 	int offset = 0;
 
@@ -2506,22 +2670,42 @@ bool camera_image_mode_rx(uint8_t cam_id)
 	pkt[offset++] = (uint8_t)((ts >> 24) & 0xFF);
 	pkt[offset++] = HISTO_SOH;
 	pkt[offset++] = cam_id;
-	/* pkt[12..2419] = the 2408-B line, already DMA'd in place. */
+	memcpy(&pkt[offset], line, IMAGE_LINE_SIZE);
 	offset += IMAGE_LINE_SIZE;
 	pkt[offset++] = HISTO_EOH;
-	/* Same CRC span quirk as send_histogram_data(): SOF through the last
-	 * payload byte, EXCLUDING the EOH just written (offset-1 bytes). */
-	uint16_t crc = util_crc16(pkt, offset - 1);
-	pkt[offset++] = (uint8_t)(crc & 0xFF);
-	pkt[offset++] = (uint8_t)((crc >> 8) & 0xFF);
+	/* Transport CRC deliberately NOT computed for image packets (written as
+	 * 0x0000). The software CRC over the 2420-B envelope took ~600 us in this
+	 * ISR (bench 2026-09-29, 480 MHz, code in flash), longer than the gap
+	 * between line pushes at sweep timing -- the next line then overran the
+	 * link before the re-arm and the stream wedged after line 0. Each line
+	 * already carries the FPGA's end-to-end CRC-16, which the host verifies;
+	 * the SDK never checked this envelope CRC for TYPE_IMAGE. */
+	pkt[offset++] = 0x00;
+	pkt[offset++] = 0x00;
 	pkt[offset++] = HISTO_EOF;
+	image_tx_len += IMAGE_PKT_TOTAL_SIZE;
+	image_tx_flush();
+	{ uint32_t d = DWT->CYCCNT - c0; if (d > imgdbg_isr_max_cyc) imgdbg_isr_max_cyc = d; }
+}
 
-	if (USBD_HISTO_SendData(&hUsbDeviceHS, pkt, IMAGE_PKT_TOTAL_SIZE, 0) != USBD_OK) {
-		image_gap_count[cam_id]++; /* dropped line -- host sees the gap, retries the sweep */
+/* RxCplt: second ring half complete. The circular DMA keeps running -- no
+ * re-arm. Returns true when the completion belonged to the image path. */
+bool camera_image_mode_rx(uint8_t cam_id)
+{
+	if (!camera_image_mode_active(cam_id)) {
+		return false;
 	}
+	camera_image_line_done(cam_id, 1u);
+	return true;
+}
 
-	image_rearm_pending |= (uint8_t)(1u << cam_id);
-	NVIC_SetPendingIRQ(LPTIM5_IRQn); /* re-arm fires after this ISR returns */
+/* RxHalfCplt: first ring half complete. */
+bool camera_image_mode_rx_half(uint8_t cam_id)
+{
+	if (!camera_image_mode_active(cam_id)) {
+		return false;
+	}
+	camera_image_line_done(cam_id, 0u);
 	return true;
 }
 
@@ -2531,8 +2715,11 @@ bool camera_image_mode_rx(uint8_t cam_id)
  * the histogram path already runs abort+restart from. */
 void camera_image_link_error(uint8_t cam_id)
 {
+	imgdbg_lerr[cam_id]++;
+	{ CameraDevice *c = &cam_array[cam_id];
+	  imgdbg_lerr_code[cam_id] = c->useUsart ? c->pUart->ErrorCode : c->pSpi->ErrorCode; }
 	image_gap_count[cam_id]++;
-	abort_data_reception(cam_id);
+	camera_image_abort_nodelay(cam_id);
 	(void)camera_image_arm(cam_id);
 }
 
@@ -2551,6 +2738,8 @@ void camera_image_rearm_service(void)
 		}
 		for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
 			if ((pending & (1u << i)) != 0u) {
+				imgdbg_rearm_calls++;
+				{ uint32_t d = DWT->CYCCNT - imgdbg_rx_cyc[i]; if (d > imgdbg_rx2arm_max_cyc) imgdbg_rx2arm_max_cyc = d; }
 				if (!camera_image_arm(i)) {
 					image_gap_count[i]++; /* arm failed; timeout service retries */
 				}
@@ -2579,7 +2768,28 @@ void camera_image_service(void)
 	if (!image_mode_on) {
 		return;
 	}
+	__disable_irq();
+	image_tx_flush();
+	__enable_irq();
 	uint32_t now = HAL_GetTick();
+	if ((now - imgdbg_last_print) >= 1000u &&
+	    (logging_get_debug_flags() & DEBUG_FLAG_USB_PRINTF) != 0u) {
+		printf("IMGDBG tx batches=%lu maxbatch=%lu stagefull=%lu\r\n",
+		       image_tx_batches, image_tx_max_batch, image_tx_stage_full);
+		imgdbg_last_print = now;
+		uint32_t mhz = SystemCoreClock / 1000000u;
+		for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+			if ((image_mode_mask & (1u << i)) == 0u) continue;
+			CameraDevice *c = &cam_array[i];
+			DMA_HandleTypeDef *h = c->useUsart ? c->pUart->hdmarx : c->pSpi->hdmarx;
+			uint32_t st = c->useUsart ? c->pUart->State : c->pSpi->State;
+			printf("IMGDBG c%u rx=%lu ok=%lu alr=%lu fail=%lu(s=%lu st=%lx) lerr=%lu(e=%lx) to=%lu idle=%lu rearm=%lu isr=%luus rx2arm=%luus ndtr=%lu hst=%lx mhz=%lu\r\n",
+			       i, imgdbg_rx[i], imgdbg_ok[i], imgdbg_already[i], imgdbg_fail[i], imgdbg_fail_status[i],
+			       imgdbg_fail_state[i], imgdbg_lerr[i], imgdbg_lerr_code[i], imgdbg_to[i], imgdbg_idle[i], imgdbg_rearm_calls,
+			       imgdbg_isr_max_cyc / mhz, imgdbg_rx2arm_max_cyc / mhz,
+			       (unsigned long)(h ? __HAL_DMA_GET_COUNTER(h) : 0), st, mhz);
+		}
+	}
 	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
 		if ((image_mode_mask & (1u << i)) == 0u) {
 			continue;
@@ -2589,21 +2799,59 @@ void camera_image_service(void)
 		if (hdma == NULL) {
 			continue;
 		}
+		/* Safety net: a camera that is neither receiving nor queued for the
+		 * LPTIM5 re-arm has lost its reception (a failed arm used to leave it
+		 * dead for the rest of the session). The main loop is the lowest
+		 * priority, so a READY state seen here is never the transient window
+		 * between RxCplt and the deferred re-arm. */
+		_Bool busy = cam->useUsart
+			? (cam->pUart->State == HAL_USART_STATE_BUSY_RX || cam->pUart->State == HAL_USART_STATE_BUSY_TX_RX)
+			: (cam->pSpi->State == HAL_SPI_STATE_BUSY_RX || cam->pSpi->State == HAL_SPI_STATE_BUSY_TX_RX);
+		if (!busy && (image_rearm_pending & (1u << i)) == 0u) {
+			image_gap_count[i]++;
+			imgdbg_idle[i]++;
+			__disable_irq();
+			image_rearm_pending |= (uint8_t)(1u << i);
+			__enable_irq();
+			NVIC_SetPendingIRQ(LPTIM5_IRQn);
+			continue;
+		}
 		uint32_t remaining = __HAL_DMA_GET_COUNTER(hdma);
+		if ((image_resync_pending & (1u << i)) != 0u) {
+			/* Restart the ring at a push boundary: wait (<=2 ms) until the
+			 * link has been silent for 40 us, i.e. we are between lines. */
+			uint32_t hz = SystemCoreClock;
+			uint32_t t0 = DWT->CYCCNT, quiet = DWT->CYCCNT, last = remaining;
+			while ((DWT->CYCCNT - t0) < hz / 500u) {
+				uint32_t r = __HAL_DMA_GET_COUNTER(hdma);
+				if (r != last) { last = r; quiet = DWT->CYCCNT; }
+				else if ((DWT->CYCCNT - quiet) > hz / 25000u) { break; }
+			}
+			__disable_irq();
+			image_resync_pending &= (uint8_t)~(1u << i);
+			camera_image_abort_nodelay(i);
+			(void)camera_image_arm(i);
+			__enable_irq();
+			imgdbg_to[i]++;
+			image_last_ndtr[i] = IMAGE_RING_SIZE;
+			image_last_progress_tick[i] = now;
+			continue;
+		}
 		if (remaining != image_last_ndtr[i]) {
 			image_last_ndtr[i] = remaining;
 			image_last_progress_tick[i] = now;
 			continue;
 		}
-		if (remaining == IMAGE_LINE_SIZE || remaining == 0u) {
-			image_last_progress_tick[i] = now;
+		if (remaining == IMAGE_RING_SIZE || remaining == IMAGE_LINE_SIZE) {
+			image_last_progress_tick[i] = now; /* parked on a line boundary */
 			continue;
 		}
 		if ((now - image_last_progress_tick[i]) >= IMAGE_LINE_TIMEOUT_MS) {
+			/* Stalled mid-line: a push was cut short. Realign. */
 			image_gap_count[i]++;
-			abort_data_reception(i);
-			(void)camera_image_arm(i); /* on failure the next pass retries */
-			image_last_ndtr[i] = IMAGE_LINE_SIZE;
+			__disable_irq();
+			image_resync_pending |= (uint8_t)(1u << i);
+			__enable_irq();
 			image_last_progress_tick[i] = now;
 		}
 	}

@@ -1823,6 +1823,18 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
     cam_id = 3;
   }
 
+  /* Image mode: no printf here. printf is a blocking serial write and this
+   * runs in ISR context -- a few ms of it loses every line that lands
+   * meanwhile (bench 2026-09-29). Clear the flag, count, recover. */
+  if (cam_id >= 0 && camera_image_mode_active((uint8_t)cam_id)) {
+    if (husart->ErrorCode & HAL_USART_ERROR_ORE) {
+      __HAL_USART_CLEAR_OREFLAG(husart);
+      cam_overrun_count[cam_id]++;
+    }
+    camera_image_link_error((uint8_t)cam_id);
+    return;
+  }
+
   // Print which USART instance caused the error
   if (husart->Instance == USART1)
   {
@@ -1912,6 +1924,16 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
   else if (hspi->Instance == SPI6)
   {
     cam_id = 1;
+  }
+
+  /* Image mode: no printf in ISR context (see HAL_USART_ErrorCallback). */
+  if (cam_id >= 0 && camera_image_mode_active((uint8_t)cam_id)) {
+    if (hspi->ErrorCode & HAL_SPI_ERROR_OVR) {
+      __HAL_SPI_CLEAR_OVRFLAG(hspi);
+      cam_overrun_count[cam_id]++;
+    }
+    camera_image_link_error((uint8_t)cam_id);
+    return;
   }
 
   // Print which SPI instance caused the error
@@ -2027,6 +2049,31 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
    * histogram frame -- forwarded + re-armed by the image path. */
   if (camera_image_mode_rx((uint8_t)cam_id)) { return; }
   set_event_bit_atomic(1u << cam_id);
+}
+
+/* Drip-scan circular line ring: the half-transfer callback delivers the
+ * first line of the 2-line ring (the image path is the only user of
+ * half-transfer events; histogram DMAs are DMA_NORMAL). */
+void HAL_SPI_RxHalfCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  int8_t cam_id = -1;
+  if (hspi->Instance == SPI2)      { cam_id = 6; }
+  else if (hspi->Instance == SPI3) { cam_id = 5; }
+  else if (hspi->Instance == SPI4) { cam_id = 7; }
+  else if (hspi->Instance == SPI6) { cam_id = 1; }
+  if (cam_id < 0) { return; }
+  (void)camera_image_mode_rx_half((uint8_t)cam_id);
+}
+
+void HAL_USART_RxHalfCpltCallback(USART_HandleTypeDef *husart)
+{
+  int8_t cam_id = -1;
+  if (husart->Instance == USART1)      { cam_id = 4; }
+  else if (husart->Instance == USART2) { cam_id = 0; }
+  else if (husart->Instance == USART3) { cam_id = 2; }
+  else if (husart->Instance == USART6) { cam_id = 3; }
+  if (cam_id < 0) { return; }
+  (void)camera_image_mode_rx_half((uint8_t)cam_id);
 }
 
 void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)

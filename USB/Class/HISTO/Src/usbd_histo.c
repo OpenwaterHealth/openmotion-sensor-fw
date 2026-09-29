@@ -458,6 +458,17 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
   return histo_queue_enqueue(data, len);
 }
 
+/* True when a USBD_HISTO_SendData() call would transmit immediately (no
+ * transfer in flight, nothing queued). Drip-scan image mode batches lines
+ * in its own staging buffer and only hands it over when this is true, so a
+ * slow host gets many lines per bulk transfer instead of one. Call with the
+ * camera/USB ISRs excluded (same priority, or IRQs masked). */
+uint8_t USBD_HISTO_TxIdle(void)
+{
+  return (uint8_t)(histo_ep_enabled == 1 && histo_ep_data == 0 &&
+                   histo_queue_is_empty() != 0);
+}
+
 /* Drop any histogram packets left in the software TX queue (and the
  * hardware EP FIFO) from a previous scan.  The queue is otherwise only
  * reset on USB (de)enumeration, so packets still queued when a scan stops
@@ -556,6 +567,7 @@ uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint1
 #endif /* USE_USBD_COMPOSITE */
 
 		USBD_LL_FlushEP(pdev, HISTOInEpAdd);
+		pTxHistoBuff = histo_tx_buffer; /* a SendNoCopy may have pointed it elsewhere */
 		memset((uint32_t*)pTxHistoBuff,0,USB_HISTO_MAX_SIZE/4);
 		memcpy(pTxHistoBuff,pbuff,length);
 
@@ -582,6 +594,45 @@ uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint1
 		ret = USBD_BUSY;
 	}
   return ret;
+}
+
+/* Zero-copy variant for drip-scan image batches (bench 2026-09-29): the
+ * copying path spent ~2.3 ms per 32 KB batch in ISR context (memset + memcpy),
+ * long enough to overrun the camera line rings. The core runs in slave mode,
+ * so packets are fed to the FIFO by the CPU straight from pbuff: the caller
+ * must keep pbuff untouched until USBD_HISTO_TxCpltCallback reports the
+ * transfer done. Only valid when USBD_HISTO_TxIdle(). */
+uint8_t USBD_HISTO_SendNoCopy(USBD_HandleTypeDef *pdev, uint8_t *pbuff, uint16_t length)
+{
+	if (pdev == NULL || pbuff == NULL || length == 0 || length > USB_HISTO_MAX_SIZE) {
+		return USBD_FAIL;
+	}
+	if (pdev->dev_state != USBD_STATE_CONFIGURED) {
+		return USBD_FAIL;
+	}
+	if (histo_ep_enabled != 1 || histo_ep_data != 0 || histo_queue_is_empty() == 0) {
+		return USBD_BUSY;
+	}
+#ifdef USE_USBD_COMPOSITE
+	HISTOInEpAdd  = USBD_CoreGetEPAdd(pdev, USBD_EP_IN, USBD_EP_TYPE_BULK, HISTO_InstID);
+#endif /* USE_USBD_COMPOSITE */
+	USBD_LL_FlushEP(pdev, HISTOInEpAdd);
+	pTxHistoBuff = pbuff;
+	tx_histo_total_len = length;
+	tx_histo_ptr = 0;
+	uint16_t pkt_len = MIN((pdev->dev_speed == USBD_SPEED_HIGH)?HISTO_HS_MAX_PACKET_SIZE:HISTO_FS_MAX_PACKET_SIZE, tx_histo_total_len);
+	pdev->ep_in[HISTOInEpAdd & 0xFU].total_length = tx_histo_total_len;
+	uint8_t ret = USBD_LL_Transmit(pdev, HISTOInEpAdd, pTxHistoBuff, pkt_len);
+	if (ret == USBD_OK) {
+		histo_ep_data = 1;
+		histo_tx_armed_ms = HAL_GetTick();
+		histo_tx_progress = histo_datain_count;
+	} else {
+		histo_tx_fail_count++;
+		histo_ep_data = 0;
+		pTxHistoBuff = histo_tx_buffer;
+	}
+	return ret;
 }
 
 static uint8_t USBD_HISTO_RegisterInterface(USBD_HandleTypeDef *pdev, uint8_t *buffer)
