@@ -161,7 +161,14 @@ typedef struct __attribute__((packed)) {
 	                                   * line timeouts + USB send drops + link-error
 	                                   * recoveries. The host retries missing lines via the
 	                                   * FPGA sweep-start-line register. */
-} image_mode_resp_t;                  /* 36 B */
+	/* Breakdown (appended 2026-09-29; hosts that read only the first 36 B
+	 * are unaffected). Counts since the last enter, per camera: */
+	uint32_t link_err[CAMERA_COUNT];   /* SPI OVR / USART ORE etc. error callbacks */
+	uint32_t bad_magic[CAMERA_COUNT];  /* ring half out of step with the pushes */
+	uint32_t resync[CAMERA_COUNT];     /* ring restarts done by the main loop */
+	uint32_t stage_full[CAMERA_COUNT]; /* lines dropped: USB staging buffer full */
+	uint32_t lines_ok[CAMERA_COUNT];   /* lines staged for USB */
+} image_mode_resp_t;                  /* 196 B */
 
 _Bool camera_image_mode_enter(uint8_t mask);
 _Bool camera_image_mode_exit(void);

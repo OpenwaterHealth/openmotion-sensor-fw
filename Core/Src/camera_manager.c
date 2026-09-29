@@ -2358,6 +2358,9 @@ static volatile uint32_t imgdbg_fail_state[CAMERA_COUNT];
 static volatile uint32_t imgdbg_lerr[CAMERA_COUNT];
 static volatile uint32_t imgdbg_lerr_code[CAMERA_COUNT];
 static volatile uint32_t imgdbg_to[CAMERA_COUNT];
+static volatile uint32_t imgdbg_badmagic[CAMERA_COUNT];
+static volatile uint32_t imgdbg_stagefull[CAMERA_COUNT];
+static volatile uint32_t imgdbg_staged[CAMERA_COUNT];
 static volatile uint32_t imgdbg_idle[CAMERA_COUNT];
 static volatile uint32_t imgdbg_rearm_calls;
 static volatile uint32_t imgdbg_rx_cyc[CAMERA_COUNT];
@@ -2527,6 +2530,7 @@ _Bool camera_image_mode_enter(uint8_t mask)
 	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
 		imgdbg_rx[i] = imgdbg_ok[i] = imgdbg_already[i] = imgdbg_fail[i] = 0;
 		imgdbg_fail_status[i] = imgdbg_fail_state[i] = imgdbg_lerr[i] = imgdbg_lerr_code[i] = imgdbg_to[i] = imgdbg_idle[i] = 0;
+		imgdbg_badmagic[i] = imgdbg_stagefull[i] = imgdbg_staged[i] = 0;
 	}
 	imgdbg_rearm_calls = 0; imgdbg_isr_max_cyc = 0; imgdbg_rx2arm_max_cyc = 0;
 	image_tx_len = 0; image_tx_batches = 0; image_tx_max_batch = 0; image_tx_stage_full = 0;
@@ -2616,6 +2620,11 @@ void camera_image_get_status(image_mode_resp_t *out)
 	out->reserved[1] = 0;
 	for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
 		out->gap_count[i] = image_gap_count[i];
+		out->link_err[i] = imgdbg_lerr[i];
+		out->bad_magic[i] = imgdbg_badmagic[i];
+		out->resync[i] = imgdbg_to[i];
+		out->stage_full[i] = imgdbg_stagefull[i];
+		out->lines_ok[i] = imgdbg_staged[i];
 	}
 }
 
@@ -2645,15 +2654,18 @@ static void camera_image_line_done(uint8_t cam_id, uint32_t half)
 		/* Ring out of step with the pushes (a lost or extra byte): drop and
 		 * let the main loop restart the ring in an idle gap. */
 		image_gap_count[cam_id]++;
+		imgdbg_badmagic[cam_id]++;
 		image_resync_pending |= (uint8_t)(1u << cam_id);
 		return;
 	}
 	if (image_tx_len + IMAGE_PKT_TOTAL_SIZE > IMAGE_TX_STAGE_SIZE) {
 		image_tx_stage_full++;
+		imgdbg_stagefull[cam_id]++;
 		image_gap_count[cam_id]++; /* dropped line -- host sees the gap, retries the sweep */
 		image_tx_flush();
 		return;
 	}
+	imgdbg_staged[cam_id]++;
 	uint8_t *pkt = &image_tx_stage[image_tx_len];
 	uint32_t ts = get_timestamp_ms(); /* same TIM5 timebase as histogram frames */
 	int offset = 0;
