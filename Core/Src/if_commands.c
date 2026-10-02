@@ -515,15 +515,23 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
 		VERBOSE_CMD("[CMD] OW_FPGA_PROG_SRAM addr=0x%02X reserved=%u\r\n", cmd.addr, cmd.reserved);
 		uartResp->command = OW_FPGA_PROG_SRAM;
 		uartResp->packet_type = OW_RESP;
-		// TODO: Add parameter to force update currently defaults to false
+		/* #68: reserved==2 forces the SRAM load — with force off, an
+		 * NVCM-programmed part skips the SRAM load and silently keeps
+		 * running the burned image, so a newer BUNDLED bitstream never
+		 * takes effect (~10 s/camera when forced). */
 	    for (uint8_t i = 0; i < 8; i++) {
 	        if (((cmd.addr >> i) & 0x01) != 0) {
 	        	_Bool func_ret = false;
+	        	_Bool force_sram = (cmd.reserved == 2);
 
-	        	if(cmd.reserved == 1) {
-	        		func_ret = program_fpga(i, false);
+	        	if(cmd.reserved == 1 || force_sram) {
+	        		func_ret = program_fpga(i, force_sram);
 	        	} else {
-	        		func_ret = program_sram_fpga(i, true, 0, 0, false);
+	        		/* reserved==0: host-uploaded bitstream, NVCM-gated.
+	        		 * reserved==3: host-uploaded bitstream, FORCED — skips the
+	        		 * isProgrammed/NVCM gates (required on NVCM-burned parts,
+	        		 * same rationale as reserved==2). */
+	        		func_ret = program_sram_fpga(i, true, 0, 0, cmd.reserved == 3);
 	        	}
 	    		if(!func_ret)
 	    		{
