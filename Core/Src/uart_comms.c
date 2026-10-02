@@ -95,7 +95,7 @@ static void ClearBuffer_DMA(void)
                             HAL_MAX_DELAY);
 }
 
-_Bool comms_interface_send(UartPacket *pResp) {
+_Bool comms_interface_send(const UartPacket *pResp) {
 	static volatile _Bool send_in_progress = false;
 
 	if (__get_IPSR() != 0U) {
@@ -348,12 +348,12 @@ NextDataPacket:
 
 
 // Callback functions
-void USBD_COMMS_RxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum) {
-	static volatile uint32_t rx_overrun_count = 0;
+void USBD_COMMS_RxCpltCallback(const uint8_t *Buf, uint32_t Len, uint8_t epnum) {
 	uint16_t copy_len;
 	uint8_t q_head;
 
 	if (rx_cmd_q_count >= RX_CMD_QUEUE_DEPTH) {
+		static volatile uint32_t rx_overrun_count = 0;
 		rx_overrun_count++;
 		printf("COMM RX QUEUE FULL: count=%lu len=%lu\r\n",
 			   (unsigned long)rx_overrun_count,
@@ -376,7 +376,7 @@ void USBD_COMMS_RxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum) {
 	}
 }
 
-void USBD_COMMS_TxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum) {
+void USBD_COMMS_TxCpltCallback(const uint8_t *Buf, uint32_t Len, uint8_t epnum) {
 	tx_flag = 1;
 	USB_NotifyTxSuccess();
 }

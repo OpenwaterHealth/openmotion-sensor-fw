@@ -20,6 +20,6 @@ void delay_us(uint32_t us);
 uint32_t get_timestamp_ms(void);
 void GPIO_SetHiZ(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
 void GPIO_SetOutput(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_PinState PinState);
-void print_hex_buf(const char *label, uint8_t *buf, size_t len);
+void print_hex_buf(const char *label, const uint8_t *buf, size_t len);
 
 #endif /* INC_UTILS_H_ */

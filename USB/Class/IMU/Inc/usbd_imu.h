@@ -46,7 +46,7 @@ extern "C" {
 extern USBD_ClassTypeDef USBD_IMU;
 #define USBD_IMU_CLASS &USBD_IMU
 
-uint8_t  USBD_IMU_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length);
+uint8_t  USBD_IMU_SetTxBuffer(USBD_HandleTypeDef *pdev, const uint8_t  *pbuff, uint16_t length);
 
 void USBD_IMU_TxCpltCallback(uint8_t *Buf, uint32_t Len, uint8_t epnum);
 

@@ -343,13 +343,13 @@ float X02C1B_read_temp(CameraDevice *cam)
     return temperature;
 }
 
-static int X02C1B_set_gain(CameraDevice *cam)
+static int X02C1B_set_gain(const CameraDevice *cam)
 {
 
 	return 0;
 }
 
-static int X02C1B_get_gain(CameraDevice *cam)
+static int X02C1B_get_gain(const CameraDevice *cam)
 {
 
 	return 0;
@@ -426,9 +426,8 @@ int X02C1B_read_security_uid(CameraDevice *cam, uint8_t uid_bytes[6], uint64_t *
         return -1;
     }
 
-    int ret;
     for (int i = 0; i < 6; i++) {
-        ret = X02C1B_read(cam->pI2c, uid_regs[i], &uid_bytes[i]);
+        int ret = X02C1B_read(cam->pI2c, uid_regs[i], &uid_bytes[i]);
         if (ret < 0) {
             printf("Camera %d: Failed to read UID register 0x%04X\r\n",
                    cam->id + 1, uid_regs[i]);

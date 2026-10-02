@@ -19,8 +19,8 @@
  void logging_set_debug_flags(uint32_t flags);
  uint32_t logging_get_debug_flags(void);
  void logging_UART_TxCpltCallback(UART_HandleTypeDef *huart);
- void logging_UART_TxHalfCpltCallback(UART_HandleTypeDef *huart);
- void logging_UART_ErrorCallback(UART_HandleTypeDef *huart);
+ void logging_UART_TxHalfCpltCallback(const UART_HandleTypeDef *huart);
+ void logging_UART_ErrorCallback(const UART_HandleTypeDef *huart);
 
 #ifdef __cplusplus
 }
