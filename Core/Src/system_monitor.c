@@ -58,7 +58,8 @@ static uint8_t s_ecc_log_count[ECC_MON_COUNT];
  * misreading the old fields. "SEC2" = #137 shutdown-reason fields. */
 #define SYSMON_MAGIC 0x53454332u  /* "SEC2" */
 
-typedef struct {
+/* 8-byte aligned and sized: persist_commit() rewrites it in 64-bit words. */
+typedef struct __attribute__((aligned(8))) {
     uint32_t magic;
     uint32_t boot_count;
     uint32_t por_count;
@@ -83,6 +84,8 @@ typedef struct {
 
 _Static_assert(SYSMON_SHUTDOWN_COUNT <= SYSMON_SHUTDOWN_SLOTS,
                "add wire slots (and bump SYSMON_RESET_HISTORY_VERSION)");
+_Static_assert((sizeof(sysmon_persist_t) % sizeof(uint64_t)) == 0u,
+               "persist_commit() works in whole 64-bit words");
 
 static const char * const shutdown_names[SYSMON_SHUTDOWN_COUNT] = {
     "power off", "unexpected (watchdog, external reset or brown-out)", "host reset",
@@ -93,6 +96,23 @@ static const char * const shutdown_names[SYSMON_SHUTDOWN_COUNT] = {
  * it (startup_stm32h743xx.s skips [__noinit_start__, __noinit_end__)). */
 __attribute__((section(".noinit"))) static sysmon_persist_t s_persist;
 extern uint64_t __noinit_start__[], __noinit_end__[];
+
+/* AXI-SRAM ECC works on 64-bit words. A narrower write (every field here is
+ * 32-bit) waits in the ECC controller's one-word cache for the rest of its
+ * word, and a reset discards it: the last field written before a reset is
+ * lost (ST FAQ "STM32H7 SRAM/Backup SRAM content is not preserved after
+ * reset"). Bench-observed on the fault path, which spins into the watchdog
+ * right after marking. Commit after every update by rewriting each word of
+ * the block with an aligned 64-bit read + write, as ST recommends. */
+static void persist_commit(void)
+{
+    volatile uint64_t *w = (volatile uint64_t *)(void *)&s_persist;
+    for (size_t i = 0u; i < (sizeof(s_persist) / sizeof(uint64_t)); i++) {
+        uint64_t v = w[i];
+        w[i] = v;
+    }
+    __DSB();
+}
 
 /* Volatile flag reserved for future ISR-side use */
 static volatile uint8_t s_ecc_event_pending __attribute__((unused));
@@ -162,6 +182,7 @@ void system_monitor_capture_reset_cause(void)
 #ifdef RCC_RSR_LPWRRSTF
     if (rsr & RCC_RSR_LPWRRSTF)  { s_persist.lpwr_count++; }
 #endif
+    persist_commit();
 }
 
 void system_monitor_print_history(void)
@@ -195,7 +216,7 @@ void system_monitor_mark_shutdown(sysmon_shutdown_t reason)
 {
     s_persist.pending_shutdown = (uint32_t)reason;
     s_persist.alive_ms = HAL_GetTick();
-    __DSB();
+    persist_commit();
 }
 
 void system_monitor_get_reset_history(sysmon_reset_history_t *out)
@@ -359,4 +380,5 @@ void system_monitor_poll(void)
     scan_dma_stream_bank(DMA2, false, 0, "DMA2");
     scan_dma_stream_bank(DMA2, true,  4, "DMA2");
     scan_bdma();
+    persist_commit();   /* heartbeat + any ECC/DMA counts */
 }
