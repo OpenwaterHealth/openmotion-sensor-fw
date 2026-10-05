@@ -89,8 +89,10 @@ static const char * const shutdown_names[SYSMON_SHUTDOWN_COUNT] = {
     "host DFU", "ECC reset", "CPU fault", "Error_Handler",
 };
 
-/* Placed in .noinit so the C runtime does not zero it at startup. */
+/* Placed in .noinit so neither the C runtime nor the startup ECC seed zeroes
+ * it (startup_stm32h743xx.s skips [__noinit_start__, __noinit_end__)). */
 __attribute__((section(".noinit"))) static sysmon_persist_t s_persist;
+extern uint64_t __noinit_start__[], __noinit_end__[];
 
 /* Volatile flag reserved for future ISR-side use */
 static volatile uint8_t s_ecc_event_pending __attribute__((unused));
@@ -106,7 +108,13 @@ void system_monitor_capture_reset_cause(void)
      * the magic; treat any boot where the magic doesn't match as cold. */
     bool cold_boot = (s_persist.magic != SYSMON_MAGIC);
     if (cold_boot) {
-        memset(&s_persist, 0, sizeof(s_persist));
+        /* The startup seed skipped .noinit, so after a power-on its ECC lines
+         * are unseeded: zero them with full 64-bit stores before any narrower
+         * write (see startup_stm32h743xx.s). Any flag the magic read above
+         * latched is cleared by system_monitor_ecc_enable(). */
+        for (volatile uint64_t *p = __noinit_start__; p < __noinit_end__; p++) {
+            *p = 0u;
+        }
         s_persist.magic = SYSMON_MAGIC;
     }
 

@@ -91,12 +91,26 @@ Reset_Handler:
   strd  r2, r3, [r0], #8
   cmp   r0, r1
   blo   1b
-  ldr   r0, =0x24000000          /* AXI SRAM (RAM_D1) 512 KB - holds the stack */
-  ldr   r1, =0x24080000
+  /* AXI SRAM (RAM_D1) 512 KB - holds the stack. Seeded in two runs around
+     .noinit, which must survive a warm reset: it holds the reset history
+     (system_monitor.c, sensor-fw #137), and the C code seeds it itself on a
+     cold boot. The linker script keeps both bounds 8-byte aligned. */
+  ldr   r0, =0x24000000
+  ldr   r1, =__noinit_start__
 2:
-  strd  r2, r3, [r0], #8
   cmp   r0, r1
-  blo   2b
+  bhs   7f
+  strd  r2, r3, [r0], #8
+  b     2b
+7:
+  ldr   r0, =__noinit_end__
+  ldr   r1, =0x24080000
+8:
+  cmp   r0, r1
+  bhs   9f
+  strd  r2, r3, [r0], #8
+  b     8b
+9:
   ldr   r0, =0x30000000          /* SRAM1  128 KB @ 0x30000000 */
   ldr   r1, =0x30020000
 3:
