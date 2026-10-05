@@ -40,7 +40,7 @@ static volatile uint8_t histo_queue_count = 0;
 static USBD_HandleTypeDef *histo_pdev = NULL;
 
 /* Private function prototypes */
-static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length);
+static uint8_t histo_queue_enqueue(const uint8_t *data, uint16_t length);
 static uint8_t histo_queue_dequeue(uint8_t **data, uint16_t *length);
 static uint8_t histo_queue_is_empty(void);
 static uint8_t histo_queue_is_full(void);
@@ -249,7 +249,7 @@ static uint8_t histo_queue_is_full(void)
   return (histo_queue_count >= HISTO_QUEUE_SIZE);
 }
 
-static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length)
+static uint8_t histo_queue_enqueue(const uint8_t *data, uint16_t length)
 {
   if (histo_queue_is_full() != 0) {
     printf("HISTO enqueue fail: queue full (count=%u size=%u enq=%lu deq=%lu datain=%lu txfail=%lu)\r\n",
@@ -337,6 +337,7 @@ static uint8_t histo_process_queue(void)
   return USBD_HISTO_SetTxBuffer(histo_pdev, data, length);
 }
 
+// cppcheck-suppress constParameterCallback ; USBD_ClassTypeDef.Setup signature is fixed by the ST USB core
 static uint8_t USBD_Histo_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
 {
   // Ignore everything, don't stall
@@ -391,7 +392,7 @@ static uint8_t USBD_Histo_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 /* Last timestamp when a histogram packet was actually sent (for DEBUG_FLAG_HISTO_THROTTLE) */
 static uint32_t histo_last_send_ms = 0;
 
-uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t len, uint8_t ep_idx)
+uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, const uint8_t *data, uint16_t len, uint8_t ep_idx)
 {
   UNUSED(ep_idx);
   
@@ -544,7 +545,7 @@ void USBD_HISTO_CheckTxStuck(void)
   USBD_HISTO_FlushQueue("txstuck");
 }
 
-uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)
+uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, const uint8_t  *pbuff, uint16_t length)
 {
 	uint8_t ret = USBD_OK;
 

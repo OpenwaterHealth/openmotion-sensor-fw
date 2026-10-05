@@ -74,7 +74,7 @@ uint16_t util_hw_crc16(uint8_t* buf, uint32_t size)
 	return (uint16_t)uwCRCValue;
 }
 
-void print_hex_buf(const char *label, uint8_t *buf, size_t len) {
+void print_hex_buf(const char *label, const uint8_t *buf, size_t len) {
     if (label != NULL) { printf("%s: ", label); }
     for (size_t i = 0; i < len; i++) {
         printf("%02X ", buf[i]);

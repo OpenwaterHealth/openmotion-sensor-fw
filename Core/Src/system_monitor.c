@@ -214,7 +214,7 @@ static const uint8_t s_fe_bit_lo[4] = { 0,  6, 16, 22 };
 static void scan_dma_stream_bank(DMA_TypeDef *dma, bool high, uint8_t stream_base,
                                  const char *name)
 {
-    volatile uint32_t * const isr = high ? &dma->HISR  : &dma->LISR;
+    const volatile uint32_t * const isr = high ? &dma->HISR  : &dma->LISR;
     volatile uint32_t * const ifc = high ? &dma->HIFCR : &dma->LIFCR;
     uint32_t v = *isr;
     if (v == 0u) { return; }

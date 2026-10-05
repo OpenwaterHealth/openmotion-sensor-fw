@@ -1264,7 +1264,6 @@ UartPacket process_if_command(UartPacket cmd)
 	uartReturn.packet_type = OW_RESP;
 	uartReturn.addr = cmd.addr;
 	uartReturn.reserved = cmd.reserved;
-	uartReturn.packet_type = OW_RESP;
 	uartReturn.data_len = 0;
 	uartReturn.data = 0;
 	switch (cmd.packet_type)
