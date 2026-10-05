@@ -7,6 +7,7 @@
 #include "system_monitor.h"
 #include "main.h"
 #include "stm32h7xx_hal.h"
+#include "usb_device.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -52,7 +53,10 @@ static uint8_t s_ecc_log_count[ECC_MON_COUNT];
 /* ------------------------------------------------------------------ */
 /* Persistent counters (survive IWDG/soft reset, NOT power-on/BOR)     */
 /* ------------------------------------------------------------------ */
-#define SYSMON_MAGIC 0x5345434Cu  /* "SECL" */
+/* Change the magic whenever the layout below changes: a warm reset into a
+ * firmware with a different layout then reads as a cold boot instead of
+ * misreading the old fields. "SEC2" = #137 shutdown-reason fields. */
+#define SYSMON_MAGIC 0x53454332u  /* "SEC2" */
 
 typedef struct {
     uint32_t magic;
@@ -70,7 +74,20 @@ typedef struct {
     uint32_t ecc_last_monitor;   /* index into ecc_handles */
     uint32_t dma_err_count;
     uint32_t last_rcc_csr;
+    uint32_t pending_shutdown;   /* #137: set by system_monitor_mark_shutdown(); 0 = none */
+    uint32_t last_shutdown;      /* sysmon_shutdown_t: how the previous session ended */
+    uint32_t shutdown_count[SYSMON_SHUTDOWN_SLOTS];
+    uint32_t alive_ms;           /* this session's uptime at its last heartbeat */
+    uint32_t prev_alive_ms;      /* the previous session's alive_ms */
 } sysmon_persist_t;
+
+_Static_assert(SYSMON_SHUTDOWN_COUNT <= SYSMON_SHUTDOWN_SLOTS,
+               "add wire slots (and bump SYSMON_RESET_HISTORY_VERSION)");
+
+static const char * const shutdown_names[SYSMON_SHUTDOWN_COUNT] = {
+    "power off", "unexpected (watchdog, external reset or brown-out)", "host reset",
+    "host DFU", "ECC reset", "CPU fault", "Error_Handler",
+};
 
 /* Placed in .noinit so the C runtime does not zero it at startup. */
 __attribute__((section(".noinit"))) static sysmon_persist_t s_persist;
@@ -95,6 +112,23 @@ void system_monitor_capture_reset_cause(void)
 
     s_persist.boot_count++;
     s_persist.last_rcc_csr = rsr;
+
+    /* #137: how did the previous session end? Nothing in RAM => it lost power.
+     * A warm boot with no mark is a reset the firmware didn't ask for. */
+    uint32_t reason;
+    if (cold_boot) {
+        reason = SYSMON_SHUTDOWN_POWER_OFF;
+    } else if (s_persist.pending_shutdown > SYSMON_SHUTDOWN_UNEXPECTED &&
+               s_persist.pending_shutdown < SYSMON_SHUTDOWN_COUNT) {
+        reason = s_persist.pending_shutdown;
+    } else {
+        reason = SYSMON_SHUTDOWN_UNEXPECTED;
+    }
+    s_persist.last_shutdown = reason;
+    s_persist.shutdown_count[reason]++;
+    s_persist.pending_shutdown = 0u;
+    s_persist.prev_alive_ms = s_persist.alive_ms;
+    s_persist.alive_ms = 0u;
 
     if (rsr & RCC_RSR_BORRSTF)   { s_persist.bor_count++; }
     if (rsr & RCC_RSR_PORRSTF)   { s_persist.por_count++; }
@@ -122,6 +156,9 @@ void system_monitor_print_history(void)
            (unsigned long)s_persist.wwdg_count,
            (unsigned long)s_persist.bor_count,
            (unsigned long)s_persist.lpwr_count);
+    printf("Last shutdown: %s (previous session alive %lu ms)\r\n",
+           shutdown_names[s_persist.last_shutdown],
+           (unsigned long)s_persist.prev_alive_ms);
     if (s_persist.ecc_sbe_count || s_persist.ecc_dbe_count) {
         printf("ECC stats:  SBE=%lu DBE=%lu  last @0x%08lx (mon %lu)\r\n",
                (unsigned long)s_persist.ecc_sbe_count,
@@ -133,6 +170,38 @@ void system_monitor_print_history(void)
         printf("DMA stats:  transfer-errors=%lu\r\n",
                (unsigned long)s_persist.dma_err_count);
     }
+}
+
+void system_monitor_mark_shutdown(sysmon_shutdown_t reason)
+{
+    s_persist.pending_shutdown = (uint32_t)reason;
+    s_persist.alive_ms = HAL_GetTick();
+    __DSB();
+}
+
+void system_monitor_get_reset_history(sysmon_reset_history_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->struct_version    = SYSMON_RESET_HISTORY_VERSION;
+    out->last_shutdown     = (uint8_t)s_persist.last_shutdown;
+    out->boot_count        = s_persist.boot_count;
+    out->prev_alive_ms     = s_persist.prev_alive_ms;
+    out->uptime_ms         = HAL_GetTick();
+    memcpy(out->shutdown_count, s_persist.shutdown_count, sizeof(out->shutdown_count));
+    out->por_count         = s_persist.por_count;
+    out->pin_count         = s_persist.pin_count;
+    out->sft_count         = s_persist.sft_count;
+    out->iwdg_count        = s_persist.iwdg_count;
+    out->wwdg_count        = s_persist.wwdg_count;
+    out->bor_count         = s_persist.bor_count;
+    out->lpwr_count        = s_persist.lpwr_count;
+    out->last_rcc_rsr      = s_persist.last_rcc_csr;
+    out->ecc_sbe_count     = s_persist.ecc_sbe_count;
+    out->ecc_dbe_count     = s_persist.ecc_dbe_count;
+    out->ecc_last_addr     = s_persist.ecc_last_addr;
+    out->ecc_last_monitor  = s_persist.ecc_last_monitor;
+    out->dma_err_count     = s_persist.dma_err_count;
+    out->usb_recover_count = USB_GetRecoverCount();
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,7 +266,7 @@ static void ecc_poll(void)
                    (unsigned long)s_persist.ecc_dbe_count);
             /* Flush UART before pulling the trigger. */
             for (volatile uint32_t d = 0; d < 200000u; d++) { __NOP(); }
-            __DSB();
+            system_monitor_mark_shutdown(SYSMON_SHUTDOWN_ECC);
             NVIC_SystemReset();
         }
     }
@@ -259,6 +328,10 @@ void system_monitor_poll(void)
     uint32_t now = HAL_GetTick();
     if ((now - last_ms) < DMA_POLL_MS) { return; }
     last_ms = now;
+
+    /* #137 heartbeat: survives a reset, so the next boot knows how long this
+     * session ran (0 = never reached the main loop). */
+    s_persist.alive_ms = now;
 
     ecc_poll();
 

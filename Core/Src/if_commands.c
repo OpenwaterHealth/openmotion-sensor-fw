@@ -22,6 +22,7 @@
 #include "motion_config.h"
 #include "sensor_serial.h"
 #include "logging.h"
+#include "system_monitor.h"
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
@@ -79,6 +80,18 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		camera_manager_get_diag_stats(&diag_stats_resp);
 		uartResp->data_len = sizeof(diag_stats_resp);
 		uartResp->data = (uint8_t *)&diag_stats_resp;
+		break;
+	}
+	case OW_CMD_RESET_HISTORY: {
+		/* #137: why the module last went down, plus the persistent reset
+		 * counters. Read-only; printf-independent like OW_CMD_DIAG_STATS. */
+		VERBOSE_CMD("[CMD] OW_CMD_RESET_HISTORY\r\n");
+		uartResp->command = OW_CMD_RESET_HISTORY;
+		uartResp->packet_type = OW_RESP;
+		static sysmon_reset_history_t reset_history_resp;
+		system_monitor_get_reset_history(&reset_history_resp);
+		uartResp->data_len = sizeof(reset_history_resp);
+		uartResp->data = (uint8_t *)&reset_history_resp;
 		break;
 	}
 	case OW_CMD_PING:
