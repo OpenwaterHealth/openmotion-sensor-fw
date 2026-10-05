@@ -100,6 +100,33 @@ static volatile uint8_t s_ecc_event_pending __attribute__((unused));
 /* ------------------------------------------------------------------ */
 /* Reset cause                                                         */
 /* ------------------------------------------------------------------ */
+/* The startup seed skipped .noinit, so after a power-on its ECC lines are
+ * unseeded: zero them with full 64-bit stores before any narrower write (see
+ * startup_stm32h743xx.s). Any flag the magic read latched is cleared by
+ * system_monitor_ecc_enable(). Compared as addresses: the two bounds are
+ * distinct linker symbols. */
+static void noinit_seed(void)
+{
+    const uintptr_t end = (uintptr_t)__noinit_end__;
+    for (uintptr_t a = (uintptr_t)__noinit_start__; a < end; a += sizeof(uint64_t)) {
+        *(volatile uint64_t *)a = 0u;
+    }
+}
+
+/* #137: how did the previous session end? Nothing in RAM => it lost power.
+ * A warm boot with no mark is a reset the firmware didn't ask for. */
+static uint32_t previous_shutdown_reason(bool cold_boot)
+{
+    uint32_t pending = s_persist.pending_shutdown;
+    if (cold_boot) {
+        return SYSMON_SHUTDOWN_POWER_OFF;
+    }
+    if (pending > SYSMON_SHUTDOWN_UNEXPECTED && pending < SYSMON_SHUTDOWN_COUNT) {
+        return pending;
+    }
+    return SYSMON_SHUTDOWN_UNEXPECTED;
+}
+
 void system_monitor_capture_reset_cause(void)
 {
     uint32_t rsr = RCC->RSR;
@@ -108,30 +135,14 @@ void system_monitor_capture_reset_cause(void)
      * the magic; treat any boot where the magic doesn't match as cold. */
     bool cold_boot = (s_persist.magic != SYSMON_MAGIC);
     if (cold_boot) {
-        /* The startup seed skipped .noinit, so after a power-on its ECC lines
-         * are unseeded: zero them with full 64-bit stores before any narrower
-         * write (see startup_stm32h743xx.s). Any flag the magic read above
-         * latched is cleared by system_monitor_ecc_enable(). */
-        for (volatile uint64_t *p = __noinit_start__; p < __noinit_end__; p++) {
-            *p = 0u;
-        }
+        noinit_seed();
         s_persist.magic = SYSMON_MAGIC;
     }
 
     s_persist.boot_count++;
     s_persist.last_rcc_csr = rsr;
 
-    /* #137: how did the previous session end? Nothing in RAM => it lost power.
-     * A warm boot with no mark is a reset the firmware didn't ask for. */
-    uint32_t reason;
-    if (cold_boot) {
-        reason = SYSMON_SHUTDOWN_POWER_OFF;
-    } else if (s_persist.pending_shutdown > SYSMON_SHUTDOWN_UNEXPECTED &&
-               s_persist.pending_shutdown < SYSMON_SHUTDOWN_COUNT) {
-        reason = s_persist.pending_shutdown;
-    } else {
-        reason = SYSMON_SHUTDOWN_UNEXPECTED;
-    }
+    uint32_t reason = previous_shutdown_reason(cold_boot);
     s_persist.last_shutdown = reason;
     s_persist.shutdown_count[reason]++;
     s_persist.pending_shutdown = 0u;
