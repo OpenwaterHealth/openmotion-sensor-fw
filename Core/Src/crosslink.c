@@ -332,9 +332,11 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
             if (xi2c_write_and_read(hi2c, DevAddress, wbuf, 4,
                                     &out->nvcm_rows[r * 16], 16) == HAL_OK) {
                 out->num_rows_read = r + 1;
+#if DEBUG_ENABLED
                 char lbl[12];
-                snprintf(lbl, sizeof(lbl), "ROW%u", (unsigned)r);
+                (void)snprintf(lbl, sizeof(lbl), "ROW%u", (unsigned)r);
                 nvcm_log_buf(lbl, &out->nvcm_rows[r * 16], 16);
+#endif
             } else {
                 printf("NVCM: ROW%u read FAILED\r\n", (unsigned)r);
                 break;

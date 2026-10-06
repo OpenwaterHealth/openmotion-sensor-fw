@@ -469,7 +469,7 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, const uint8_t *data, uint1
  * cameras, so frame 1 of the new scan is the first packet the host sees.
  * Touches state shared with the frame ISR (USBD_HISTO_SendData) and the
  * USB ISR (USBD_Histo_DataIn), so it runs in a critical section. */
-void USBD_HISTO_FlushQueue(const char *who)
+void USBD_HISTO_FlushQueue(USBD_HISTO_FlushReason reason)
 {
   uint32_t primask = __get_PRIMASK();
   __disable_irq();
@@ -500,7 +500,10 @@ void USBD_HISTO_FlushQueue(const char *who)
    *   ep = a transfer was still in flight
    *   e-d= enq-deq; this should EQUAL q. If e-d != q the count was corrupted by
    *        a cross-ISR race; if e-d == q > 0 the scan honestly left frames unsent. */
-  printf("HISTO flush(%s): q=%u ep=%u e-d=%ld\r\n", who, pending, inflight, gap);
+  printf("HISTO flush(%s): q=%u ep=%u e-d=%ld\r\n",
+         (reason == HISTO_FLUSH_SCAN_START) ? "start" :
+         (reason == HISTO_FLUSH_SCAN_STOP) ? "stop" : "txstuck",
+         pending, inflight, gap);
 }
 
 /* Stuck-TX watchdog. A multi-packet histogram transfer is chained by the
@@ -542,7 +545,7 @@ void USBD_HISTO_CheckTxStuck(void)
   /* FlushQueue clears histo_ep_data/tx bookkeeping under a critical
    * section and prints its own one-line diagnostic, so the endpoint is
    * usable again as soon as this returns. */
-  USBD_HISTO_FlushQueue("txstuck");
+  USBD_HISTO_FlushQueue(HISTO_FLUSH_TX_STUCK);
 }
 
 uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, const uint8_t  *pbuff, uint16_t length)

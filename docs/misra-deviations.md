@@ -29,7 +29,12 @@ firmware **compiles and links at `-Os`** (`cmake --build --preset Release`).
 ## Deviations (intentionally NOT fixed)
 
 - **Rule 21.6 (`<stdio.h>`)** — `printf` is the firmware's logging transport over UART/USB;
-  pervasive and intentional. Not removed.
+  pervasive and intentional. Not removed. It is compiled out of Release images (#139).
+- **Rules 21.1 / 21.2 (`printf` redefined as a macro)** — `Core/Inc/debug_printf.h`,
+  force-included by CMake after `<stdio.h>`, defines `printf(...)` as dead code when
+  `DEBUG_ENABLED` is 0 (#139). This keeps debug strings out of production images
+  without touching ~415 call sites. Deviated by decision; GCC (arm-none-eabi) handles it
+  as intended.
 - **Rule 17.7 (unused return value)** — 534 instances, predominantly `(void)`-less
   `printf` / `memcpy` / `snprintf` / HAL calls. Deviated by decision; not mass-cast in this pass.
 - **Rule 21.1 (reserved identifiers)** — flagged on identifier/macro forms in project headers; deviated.

@@ -148,6 +148,9 @@ Histogram path: FPGA computes 1024-bin histograms from MIPI CSI-2 cameras → SP
 - **Camera enumeration is not a real probe.** `if_commands.c` sets `isPresent = true` for any powered slot (TODO: "due to a bug in the scan camera sensors…"). Don't trust `isPresent` for camera health.
 - **Debug flags can mask real sensor issues.** `DEBUG_FLAG_FAKE_DATA` injects synthetic histograms; `DEBUG_FLAG_HISTO_SPARSE` throttles to 15 s; `DEBUG_FLAG_HISTO_THROTTLE` throttles to 5 s. Check the active flags before diagnosing "no data."
 - **DFU works, but the jump-to-app hangs.** `OW_CMD_DFU` (`if_commands.c`) enters the bootloader fine; the ROM's jump back to the app is what's unreliable — always finish a deploy with a power cycle. See Deployment.
+- **`printf` does nothing in Release.** CMake force-includes `Core/Inc/debug_printf.h` into every application C file. When `DEBUG_ENABLED` is 0 (Release, so every rc/final tag), that header redefines `printf` as a call the compiler drops, so its format strings never reach the image. Release has no UART or USB logs, and `DEBUG_FLAG_USB_PRINTF` does nothing there. For logs, use a Debug build (`-dev` tags) or configure Release with `-DDEBUG_LOG=ON`. Two rules follow:
+  - Keep `printf` arguments free of side effects; they aren't evaluated in Release.
+  - Never use `printf` for functional output. A string passed into a function that only prints it (instead of straight to `printf`) still ends up in the image.
 
 ## USB classes
 
@@ -232,6 +235,6 @@ Run gates 1–2 locally before pushing — tools are pip-pinned so results match
 | Change histogram packet format | `USB_HISTO_MAX_SIZE` in `USB/Class/HISTO/Inc/usbd_histo.h` → `frame_buffer` in `camera_manager.c` → match parser in `openmotion-sdk/omotion/MotionProcessing.py`. |
 | Update FPGA bitstream pin / version | Edit `FPGA_BITSTREAM_URL` in `CMakeLists.txt`, **and** confirm the new bitstream size matches the `163489` constant in `crosslink.c`. Reconfigure to redownload. |
 | Flash a sensor | `python scripts/deploy.py --device left` (always with `--power-cycle-cmd`). See Deployment. |
-| Debug a camera that won't enumerate | Don't trust `isPresent` (`if_commands.c`). Set `DEBUG_FLAG_USB_PRINTF` via `OW_CMD_DEBUG_FLAGS`, watch UART for the init sequence, check I2C/SPI health via `OW_IMU_*` / `OW_CAMERA_*`. |
+| Debug a camera that won't enumerate | Don't trust `isPresent` (`if_commands.c`). On a Debug build, set `DEBUG_FLAG_USB_PRINTF` via `OW_CMD_DEBUG_FLAGS`, watch UART for the init sequence, check I2C/SPI health via `OW_IMU_*` / `OW_CAMERA_*`. |
 | Investigate dropped histograms | USB-TX failures are silent (`camera_manager.c`), plus any active `DEBUG_FLAG_HISTO_*` throttles. |
 | Touch persistent config | `Core/Src/flash_eeprom.c` + `motion_config.c`. Respect sector 7 bank 2 boundary at `0x081FE000`. |
