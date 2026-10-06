@@ -101,6 +101,7 @@ The firmware enumerates as a USB composite device (`COMMS_HISTO_IMU(HS)`) with t
 - DMA-backed TX and RX.
 - Used for `printf`-style debug output to a serial console.
 - Debug verbosity controlled by runtime `debug_flags` bitmask.
+- Debug builds only: Release images compile the output out (see §12.4).
 
 ---
 
@@ -173,7 +174,7 @@ All command and response traffic on the COMMS interface uses a fixed binary pack
 
 | Bit | Constant | Effect |
 |---|---|---|
-| 0 | `DEBUG_FLAG_USB_PRINTF` | Route `printf` output to USB CDC |
+| 0 | `DEBUG_FLAG_USB_PRINTF` | Route `printf` output to USB CDC (Debug builds only; Release has no log output) |
 | 1 | `DEBUG_FLAG_HISTO_THROTTLE` | Only transmit one histogram packet every ~5 s |
 | 2 | `DEBUG_FLAG_FAKE_DATA` | Use synthesized histogram data; all cameras powered off |
 | 3 | `DEBUG_FLAG_HISTO_SPARSE` | Transmit histogram data in small chunks over ~15 s to reduce EMI |
@@ -513,6 +514,11 @@ On boot, the firmware reads RCC reset-cause flags and logs:
 - DMA-backed UART4 TX for non-blocking `printf` output.
 - Verbosity controlled by `debug_flags` bitmask (set via `OW_CMD_DEBUG_FLAGS`).
 - `VERBOSE_CMD()` macro guards command-handler `printf` calls behind `DEBUG_FLAG_CMD_VERBOSE`.
+- `printf` is compiled out of Release images (#139). CMake force-includes
+  `Core/Inc/debug_printf.h` into every application C file. When `DEBUG_ENABLED` is 0 (Release,
+  so every rc and final tag), that header redefines `printf` as dead code. Release images
+  therefore carry no log strings and print nothing on UART or USB. Configure with
+  `-DDEBUG_LOG=ON` to get logs in a Release build.
 
 ---
 

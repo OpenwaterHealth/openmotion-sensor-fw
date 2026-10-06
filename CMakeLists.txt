@@ -109,6 +109,25 @@ if(BARE_METAL)
     target_compile_definitions(stm32cubemx INTERFACE BARE_METAL_BUILD=1)
 endif()
 
+# Debug output: printf compiles into Debug and out of Release, so production
+# images don't carry the log strings (#139). debug_printf.h is force-included
+# into the application's C files. -DDEBUG_LOG=ON keeps logs in Release.
+if(NOT DEFINED DEBUG_LOG)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(DEBUG_LOG ON)
+    else()
+        set(DEBUG_LOG OFF)
+    endif()
+endif()
+if(DEBUG_LOG)
+    target_compile_definitions(stm32cubemx INTERFACE DEBUG_ENABLED=1)
+else()
+    target_compile_definitions(stm32cubemx INTERFACE DEBUG_ENABLED=0)
+endif()
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+    "$<$<COMPILE_LANGUAGE:C>:SHELL:-include ${CMAKE_SOURCE_DIR}/Core/Inc/debug_printf.h>")
+message(STATUS "Debug output : ${DEBUG_LOG}")
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths

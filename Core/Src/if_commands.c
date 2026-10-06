@@ -769,7 +769,7 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		/* Scan start: clear any leftover frames before arming cameras — a
 		 * backstop to the stop-path drain below. Enable path only. */
 		if (cmd.reserved == 1) {
-			USBD_HISTO_FlushQueue("start");
+			USBD_HISTO_FlushQueue(HISTO_FLUSH_SCAN_START);
 		}
 		uint8_t status = 0;
 		for (uint8_t i = 0; i < 8; i++) {
@@ -787,7 +787,7 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		 * shrink from here. Disable path only — this is the primary "keep it
 		 * from getting dirty" guard; the start-path flush is just a backstop. */
 		if (cmd.reserved == 0) {
-			USBD_HISTO_FlushQueue("stop");
+			USBD_HISTO_FlushQueue(HISTO_FLUSH_SCAN_STOP);
 		}
 		if(status != cmd.addr) // if the status bits are not true for all the cameras addressed, error
 		{
