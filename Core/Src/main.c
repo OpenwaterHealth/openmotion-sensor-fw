@@ -2290,6 +2290,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     MX_USB_DEVICE_DeInit();
     delay_ms(300);
     // Reset the board
+    system_monitor_mark_shutdown(_enter_dfu ? SYSMON_SHUTDOWN_HOST_DFU
+                                            : SYSMON_SHUTDOWN_HOST_RESET);
     NVIC_SystemReset();
 
   }
@@ -2306,6 +2308,9 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+
+  /* #137: first, so the next boot reports it even if the prints below hang. */
+  system_monitor_mark_shutdown(SYSMON_SHUTDOWN_ERROR_HANDLER);
 
   const uint32_t *stack_ptr;
 

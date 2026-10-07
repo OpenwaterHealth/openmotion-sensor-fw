@@ -137,7 +137,8 @@ typedef enum {
 	OW_CMD_DEBUG_FLAGS = 0x0C,
 	OW_CMD_DFU = 0x0D,
 	OW_CMD_NOP = 0x0E,
-	OW_CMD_RESET = 0x0F
+	OW_CMD_RESET = 0x0F,
+	OW_CMD_RESET_HISTORY = 0x10 /* #137: sysmon_reset_history_t — last shutdown reason + persistent reset counters */
 } MotionGlobalCommands;
 
 typedef enum {
