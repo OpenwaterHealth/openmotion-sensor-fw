@@ -173,7 +173,7 @@ jobs:
         with:
           repository: OpenwaterHealth/open-motion-sensor-bl
           ref: ${{ steps.bl.outputs.tag }}
-          token: ${{ secrets.BL_REPO_TOKEN }}
+          token: ${{ github.token }}   # public repo; BL_REPO_TOKEN expired (openmotion-console-fw #79)
           path: _bl
           sparse-checkout: py-tools
 
