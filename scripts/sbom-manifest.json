@@ -1,0 +1,252 @@
+{
+  "description": "Open-Motion sensor firmware (STM32H743VI): camera/IMU acquisition, histogram processing, USB command interface; runs from the secure bootloader's application slot.",
+  "components": [
+    {
+      "type": "library",
+      "name": "CMSIS Device STM32H7xx",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "1.10.6",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "purl": "pkg:github/STMicroelectronics/cmsis-device-h7@v1.10.6",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h:108-111"
+        },
+        {
+          "name": "openwater:version-evidence",
+          "value": "no version macro in Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h; version from the STM32CubeH7 package the tree was taken from (CVA 2026-09-28)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "jsmn",
+      "supplier": {
+        "name": "Serge Zaitsev"
+      },
+      "version": "0.0.0-20141117-cf38b7d",
+      "description": "JSON tokenizer (jsmn.c/jsmn.h) from https://github.com/zserge/jsmn, built without JSMN_STRICT. The in-tree copy predates the first upstream release (v1.0.0): it is closest to upstream commit cf38b7d (2014-11-17) and is locally modified (extra \"reserved\" argument on jsmn_init/jsmn_parse).",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "purl": "pkg:github/zserge/jsmn@cf38b7d17157ba674199238da776d822b184c154",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zserge/jsmn"
+        }
+      ],
+      "properties": [
+        {
+          "name": "openwater:version-status",
+          "value": "no upstream version: pre-release snapshot identified by nearest upstream commit; locally modified"
+        },
+        {
+          "name": "openwater:upstream-latest-release",
+          "value": "v1.1.0 (2019-04-20); last upstream commit 25647e6 (2021-10-14)"
+        },
+        {
+          "name": "openwater:support-level",
+          "value": "upstream inactive - no release since 2019, no commits since 2021"
+        },
+        {
+          "name": "openwater:known-vulnerability-note",
+          "value": "CVE-2026-88369 is recorded against jsmn; see CVA J3"
+        },
+        {
+          "name": "openwater:evidence",
+          "value": "Core/Src/jsmn.c, Core/Inc/jsmn.h (byte-identical in console and sensor firmware); compared with every upstream revision of jsmn.c/jsmn.h - cf38b7d is the nearest (53 differing lines, the local modifications)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lwrb (Lightweight ring buffer)",
+      "supplier": {
+        "name": "Tilen Majerle"
+      },
+      "version": "2.0.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "purl": "pkg:github/MaJerle/lwrb@v2.0.0",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "Core/Src/lwrb.c:32 banner (v2.0.0), Core/Inc/lwrb.h"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "STM32CubeMX generated startup and system code",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "6.16.1",
+      "description": "startup_stm32h743xx.s, system_stm32h7xx.c, syscalls.c, sysmem.c, HAL timebase, USB glue.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "purl": "pkg:generic/st/stm32cubemx-generated-code@6.16.1",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "*.ioc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "newlib-nano (libc, libm) and libgcc",
+      "supplier": {
+        "name": "Arm / Red Hat (newlib), FSF (libgcc)"
+      },
+      "version": "4.5.0",
+      "description": "C runtime linked statically from Arm GNU Toolchain 15.2.Rel1 (--specs=nano.specs, -lm).",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "newlib licenses (BSD-style) / GPL-3.0 with GCC runtime exception"
+          }
+        }
+      ],
+      "cpe": "cpe:2.3:a:newlib_project:newlib:4.5.0:*:*:*:*:*:*:*",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "cmake/gcc-arm-none-eabi.cmake; toolchain 15.2.Rel1 ships newlib 4.5.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "STM32 USB Device Library (Core, modified)",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "2.11.5",
+      "description": "In-tree copy under USB/Core. usbd_core.c, usbd_ctlreq.c and usbd_ioreq.c are byte-identical to upstream v2.11.4/v2.11.5; usbd_def.h is modified (CLASS_TYPE_IMU/HISTO/COMMS). Does not contain the v2.11.6 endpoint-index fix.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:github/STMicroelectronics/stm32-mw-usb-device@v2.11.5",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "USB/Core (git blob hashes vs. STMicroelectronics/stm32-mw-usb-device tags)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "STM32 USB Device Library CompositeBuilder (modified)",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "2.11.5",
+      "description": "Composite device builder, (c) 2021 ST, modified for the custom classes.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:generic/st/stm32-usb-device-compositebuilder@2.11.5",
+      "properties": [
+        {
+          "name": "openwater:version-status",
+          "value": "assumed same release as USB/Core; file is modified"
+        },
+        {
+          "name": "openwater:evidence",
+          "value": "USB/Class/CompositeBuilder"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "USB IMU class (derived from ST HID class)",
+      "supplier": {
+        "name": "Openwater / STMicroelectronics"
+      },
+      "description": "Custom USB class derived from the ST HID class ((c) 2015 ST banner). HISTO and COMMS classes are Openwater code.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:generic/openwater/usbd-imu-class",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "USB/Class/IMU"
+        },
+        {
+          "name": "openwater:version-status",
+          "value": "undetermined - no version identifier in the source tree"
+        }
+      ]
+    },
+    {
+      "type": "firmware",
+      "name": "openmotion-camera-fpga bitstream",
+      "supplier": {
+        "name": "Openwater"
+      },
+      "version": "1.0.0",
+      "description": "Lattice CrossLink (LIF-MD6000) histogram FPGA bitstream, 163,489 bytes, merged at 0x081A0000 into the bare-metal-fpga and production images. Leftover from when the firmware loaded the FPGA SRAM at every boot: the camera FPGAs are now programmed into one-time-programmable NVCM at the factory, and the firmware skips the SRAM load when it detects an NVCM-booted FPGA (camera_manager.c program_fpga). The load path remains as a fallback. Not contained in the signed slot image. Its own SBOM: openmotion-camera-fpga-1.0.0.cdx.json.",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2be4c7e601ac2a38c81e56a2745a40060ee4092d7cc6dc9af94df654a1317ddf"
+        }
+      ],
+      "purl": "pkg:github/OpenwaterHealth/openmotion-camera-fpga@1.0.0",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "CMake file(DOWNLOAD) from releases/latest (not pinned); the release build log shows the download, and the size matches release 1.0.0, the only release on the build date"
+        }
+      ]
+    }
+  ],
+  "_note": "Reviewed static components. Versions that are machine-readable in the tree (HAL, CMSIS, toolchain, build image, bundled bootloader, signing key) are added by scripts/gen_sbom.py at build time and must not be listed here."
+}
