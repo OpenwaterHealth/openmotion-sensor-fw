@@ -62,7 +62,7 @@ jobs:
           BL_REPO_TOKEN: ${{ secrets.BL_REPO_TOKEN }}
         run: |
           missing=0
-          for v in FW_SIGNING_KEY SECOREBIN_AES_KEY BL_REPO_TOKEN; do
+          for v in FW_SIGNING_KEY SECOREBIN_AES_KEY; do
             if [ -z "${!v}" ]; then
               echo "::error::Required secret '$v' is not set. Add it under" \
                    "Settings -> Secrets and variables -> Actions. BL_REPO_TOKEN" \
@@ -154,7 +154,7 @@ jobs:
       - name: Resolve open-motion-sensor-bl release tag
         id: bl
         env:
-          GH_TOKEN: ${{ secrets.BL_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}   # bootloader repo is public; the PAT in BL_REPO_TOKEN expired (same fix as openmotion-console-fw #79)
         run: |
           set -euo pipefail
           REQ="${{ github.event.inputs.bl_release }}"
@@ -179,7 +179,7 @@ jobs:
 
       - name: Download bootloader binary from open-motion-sensor-bl release
         env:
-          GH_TOKEN: ${{ secrets.BL_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}   # bootloader repo is public; the PAT in BL_REPO_TOKEN expired (same fix as openmotion-console-fw #79)
         run: |
           set -euo pipefail
           mkdir -p _artifacts
