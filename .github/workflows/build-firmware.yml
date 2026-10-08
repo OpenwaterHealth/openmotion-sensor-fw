@@ -126,7 +126,6 @@ jobs:
           path: |
             _artifacts/motion-sensor-fw-baremetal.bin
             _artifacts/motion-sensor-fw-baremetal.hex
-            _artifacts/motion-sensor-fw-slot-unsigned.bin
 
       - name: Upload bare-metal (app + FPGA) artifact
         uses: actions/upload-artifact@v4
@@ -192,7 +191,7 @@ jobs:
           echo "**Build Time:** ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
           echo "**Build Config:** ${{ steps.cfg.outputs.config }}" >> notes.md
           echo "" >> notes.md
-          echo "Developer build: images are **unsigned**. Factory and field-update images for this tag come from the manual *Clinical build* workflow." >> notes.md
+          echo "Developer build: images are **unsigned**; bare-metal images are workflow artifacts only (not published, CVA R10). Factory and field-update images for this tag come from the manual *Clinical build* workflow." >> notes.md
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -204,8 +203,8 @@ jobs:
           body_path: notes.md
           overwrite_files: true
           make_latest: ${{ steps.reltype.outputs.prerelease == 'false' }}
+          # Bare-metal images are NOT release assets (CVA R10): an unsigned image that runs at
+          # 0x08000000 installs through the STM32 ROM loader with no signature check. Developers
+          # get them from the run's workflow artifacts.
           files: |
-            _artifacts/motion-sensor-fw-baremetal.bin
-            _artifacts/motion-sensor-fw-baremetal.hex
-            _artifacts/motion-sensor-fw-baremetal-fpga.bin
-            _artifacts/motion-sensor-fw-baremetal-fpga.hex
+            _artifacts/motion-sensor-fw-slot-unsigned.bin
