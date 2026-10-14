@@ -41,9 +41,15 @@ extern USBD_HandleTypeDef hUsbDeviceHS;
 volatile uint32_t comm_tx_dropped_count = 0;
 volatile uint32_t comm_tx_failed_count = 0;
 
-/* Upper bound on the COMM transmit-complete spin, used OUTSIDE a scan only.
- * While streaming the wait is skipped entirely -- see comms_interface_send. */
-#define TX_TIMEOUT 500
+/* Outside a scan, how long a send waits for the PREVIOUS transfer to finish
+ * before giving up on this one. A host that is reading drains a transfer in
+ * well under 1 ms, so this only covers back-to-back sends (a log line, then a
+ * reply). Kept far below the 250 ms IWDG window (#136). While streaming there
+ * is no wait at all -- see comms_interface_send. */
+#define TX_BUSY_WAIT_MS 20U
+/* A transfer the host still hasn't taken after this long is treated as lost:
+ * the next send releases tx_flag, so a missed completion can't wedge COMM. */
+#define TX_TIMEOUT 500U
 #define RX_CMD_QUEUE_DEPTH 4U
 #define RX_CMD_BUFFER_SIZE 512U
 
@@ -104,6 +110,29 @@ static void ClearBuffer_DMA(void)
                             HAL_MAX_DELAY);
 }
 
+/* HAL_GetTick() when the in-flight COMM transfer was armed. */
+static volatile uint32_t tx_start_ms = 0;
+
+/* The previous COMM transfer is still in flight. Outside a scan, give this
+ * send a short bounded wait for it. If it has been outstanding for TX_TIMEOUT,
+ * treat its completion as lost and release tx_flag, as the old post-send
+ * timeout did, so COMM can't wedge. Silent while streaming (see below). */
+static void comms_wait_previous_tx(void)
+{
+	if (!camera_is_streaming()) {
+		uint32_t t0 = HAL_GetTick();
+		while (!tx_flag && ((HAL_GetTick() - t0) < TX_BUSY_WAIT_MS)) { }
+	}
+	if (!tx_flag && ((HAL_GetTick() - tx_start_ms) >= TX_TIMEOUT)) {
+		if (!camera_is_streaming()) {
+			/* Only buffers: the caller holds send_in_progress. */
+			printf("COMM USB TX Timeout\r\n");
+		}
+		tx_flag = 1;
+		USB_NotifyTxFailure();
+	}
+}
+
 _Bool comms_interface_send(const UartPacket *pResp) {
 	static volatile _Bool send_in_progress = false;
 
@@ -121,11 +150,14 @@ _Bool comms_interface_send(const UartPacket *pResp) {
 	}
 	send_in_progress = true;
 
+	if (!tx_flag) {
+		comms_wait_previous_tx();
+	}
 	if(!tx_flag){
 		/* Previous transfer still in flight. While streaming this is the
-		 * normal drop path (the wait below is skipped, so callers routinely
-		 * arrive before completion) and it MUST stay silent: a printf here
-		 * routes back into this same function and amplifies. */
+		 * normal drop path (nothing waits for completion, so callers routinely
+		 * arrive before it) and it MUST stay silent: a printf here routes back
+		 * into this same function and amplifies. */
 		comm_tx_dropped_count++;
 		if (!camera_is_streaming()) {
 			printf("Comm tx not complete from last time");
@@ -172,6 +204,7 @@ _Bool comms_interface_send(const UartPacket *pResp) {
 	txBuffer[bufferIndex++] = OW_END_BYTE;
 
 	// Initiate transmission via USB CDC
+	tx_start_ms = HAL_GetTick();
 	tx_flag = 0;  // Set the flag before starting transmission
 	uint8_t tx_status = USBD_COMMS_SendData(&hUsbDeviceHS, txBuffer, bufferIndex, 0);
 	if (tx_status != USBD_OK) {
@@ -196,45 +229,29 @@ _Bool comms_interface_send(const UartPacket *pResp) {
 		printf("F:%d C: 0x%02X V: 0x%02X S:%d\r\n", pResp->id, pResp->addr, pResp->reserved, bufferIndex);
 	}
 
-	/* While a scan is streaming, do NOT wait for completion.
+	/* Do NOT wait for completion: the transfer has been handed to the USB
+	 * stack, and its completion callback sets tx_flag. The packet is already
+	 * copied into txBuffer, so the caller's buffer is free on return.
 	 *
 	 * This function runs in the main loop, which also performs the per-camera
-	 * DMA re-arm every 25 ms frame (send_data -> start_data_reception). Any
-	 * block here costs a camera permanently: overrun -> "failed to setup
-	 * receive" -> 10 s rail-off -> dead until the next configure (#102).
+	 * DMA re-arm every 25 ms frame (send_data -> start_data_reception) and
+	 * feeds the 250 ms IWDG. The old wait here held the loop for up to 500 ms
+	 * whenever the host stopped reading for a moment: during a scan that cost
+	 * cameras (overrun -> "failed to setup receive" -> rail-off, #102, #115),
+	 * and with the 250 ms watchdog (#136) it would reset the module.
 	 *
-	 * The transfer has been handed to the USB stack and its completion callback
-	 * sets tx_flag. A caller arriving before that is refused at the !tx_flag
-	 * check above and its message is dropped -- the correct trade, because a
-	 * diagnostic is best-effort and a camera is not.
+	 * A later send that arrives before completion gets a short bounded wait
+	 * outside a scan (comms_wait_previous_tx) and none during one; past that
+	 * its message is dropped -- the correct trade, because a diagnostic is
+	 * best-effort and a camera is not.
 	 *
-	 * Note: merely SHORTENING the timeout is not sufficient and measured worse.
-	 * The timeout path printf()s, and that printf routes back through this same
+	 * Note: merely SHORTENING a wait is not sufficient and measured worse. The
+	 * timeout path printf()s, and that printf routes back through this same
 	 * send, so a tighter bound just runs the amplification loop faster. On the
 	 * bench a 10 ms bound lost all 8 cameras where the 500 ms bound lost 1 per
 	 * module. The fix has to remove the block and silence the drop paths, not
 	 * rescale them. See #115.
 	 */
-	if (camera_is_streaming()) {
-		send_in_progress = false;
-		return true;
-	}
-
-	// Outside a scan there is no frame deadline: wait for completion as before.
-	uint32_t start_time = get_timestamp_ms();
-
-	while (!tx_flag) {
-		if ((get_timestamp_ms() - start_time) >= TX_TIMEOUT) {
-			// Timeout handling: Log error and break out or reset the flag.
-			// printf before releasing send_in_progress so the message only
-			// buffers instead of re-entering this function.
-			printf("COMM USB TX Timeout\r\n");
-			tx_flag = 1; // reset to idle on timeout
-			USB_NotifyTxFailure();
-			send_in_progress = false;
-			return false;
-		}
-	}
 	send_in_progress = false;
 	return true;
 }
