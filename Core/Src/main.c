@@ -716,12 +716,14 @@ static void MX_IWDG1_Init(void)
   /* USER CODE END IWDG1_Init 0 */
 
   /* USER CODE BEGIN IWDG1_Init 1 */
-
+  /* 250 ms window (#136): LSI 32 kHz / 64 = 500 Hz, reload 124 -> 125 ticks.
+   * The LSI is specified at 29.76-33.6 kHz, so the real window is 238-269 ms.
+   * Every main-loop iteration has to finish inside the short end of that. */
   /* USER CODE END IWDG1_Init 1 */
   hiwdg1.Instance = IWDG1;
-  hiwdg1.Init.Prescaler = IWDG_PRESCALER_128;
+  hiwdg1.Init.Prescaler = IWDG_PRESCALER_64;
   hiwdg1.Init.Window = 4095;
-  hiwdg1.Init.Reload = 4095;
+  hiwdg1.Init.Reload = 124;
   if (HAL_IWDG_Init(&hiwdg1) != HAL_OK)
   {
     Error_Handler();
