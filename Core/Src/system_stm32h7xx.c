@@ -177,42 +177,6 @@
  * bootloader runs first and reads its own RTC backup-register magic, so this is
  * compiled out and SystemInit boots straight into the slot image. */
 #if defined(BARE_METAL_BUILD)
-/* The ROM loader scans its UART interfaces as well as USB, and on this board
- * PB15 -- USART1_RX for the ROM -- is camera 4's UART TX line (cam_array[4],
- * USART1). With camera 4 unpowered that line sits low; the ROM takes the low
- * line for a host on USART1, commits to its UART protocol and waits for the
- * 0x7F auto-baud byte forever. USB DFU still works (interrupt driven), but the
- * DFU leave request is never acted on, so after every bare-metal update the
- * module dropped off USB until it was power-cycled. Seen on the bench
- * 2026-10-15: core parked in the ROM's USART1 ABRF poll, USART1 framing error
- * latched, PB15 low; PB15 follows camera 4's rail (CAM_PWR_5, PD3).
- *
- * So power camera 4 before entering the ROM and wait for its TX to idle high.
- * Registers only: SysTick and HAL are already torn down here. */
-#define ROM_DFU_CAM4_PWR_PIN     3U            /* PD3, CAM_PWR_5 */
-#define ROM_DFU_UART_RX_PIN      15U           /* PB15, USART1_RX */
-#define ROM_DFU_LINE_WAIT_LOOPS  4000000U      /* ~0.25 s at 64 MHz HSI */
-#define ROM_DFU_SETTLE_LOOPS     400000U       /* ~25 ms once the line is high */
-
-static void RomDfu_IdleUartLineHigh(void)
-{
-    RCC->AHB4ENR |= RCC_AHB4ENR_GPIOBEN | RCC_AHB4ENR_GPIODEN;
-    (void)RCC->AHB4ENR;
-
-    GPIOD->BSRR = (1UL << ROM_DFU_CAM4_PWR_PIN);
-    GPIOD->MODER = (GPIOD->MODER & ~(3UL << (ROM_DFU_CAM4_PWR_PIN * 2U)))
-                 | (1UL << (ROM_DFU_CAM4_PWR_PIN * 2U));
-
-    for (volatile uint32_t n = 0U; n < ROM_DFU_LINE_WAIT_LOOPS; n++) {
-        if ((GPIOB->IDR & (1UL << ROM_DFU_UART_RX_PIN)) != 0U) {
-            break;
-        }
-    }
-    /* Let the camera FPGA finish configuring before the ROM starts looking. */
-    for (volatile uint32_t n = 0U; n < ROM_DFU_SETTLE_LOOPS; n++) {
-    }
-}
-
 void CheckBootloaderFlag(void) {
     if (*((uint32_t *)0x38000000) == 0xDEADBEEF) {
         *((uint32_t *)0x38000000) = 0; // Clear flag
@@ -249,9 +213,6 @@ void CheckBootloaderFlag(void) {
             SCB_DisableDCache();
             SCB_DisableICache();
         #endif
-
-        // 6. Keep the ROM loader off its USART1 interface (see above).
-        RomDfu_IdleUartLineHigh();
 
         // Set up the jump to System Memory (0x1FF09800 for H743)
         // Corrected Base Address: 0x1FF09800
