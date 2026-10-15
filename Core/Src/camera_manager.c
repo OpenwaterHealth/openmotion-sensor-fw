@@ -1435,7 +1435,9 @@ _Bool get_single_histogram(uint8_t cam_id, uint8_t* data, uint16_t* data_len)
     // Copy data into the provided buffer
     memcpy(data, cam->pRecieveHistoBuffer, cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
     *data_len = cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH;
-    event_bits = 0x00;
+    __disable_irq();
+    event_bits &= (uint8_t)~(1u << cam_id);
+    __enable_irq();
     return true;
 }
 
@@ -1481,7 +1483,7 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	 * within 5 s of its ~11.93 h wrap is unreachable → infinite loop (#73). */
 	uint32_t timeout = HAL_GetTick() + 5000;
 
-	while(!event_bits) {
+	while ((event_bits & (uint8_t)(1u << cam_id)) == 0u) {
 	    if ((int32_t)(HAL_GetTick() - timeout) >= 0) {
 	        printf("HISTO receive timeout!\r\n");
 	        if(cam->useUsart) {
@@ -1757,9 +1759,13 @@ _Bool send_data(void) {
 	} else {
 		/* Freeze one immutable view of this outgoing packet. Planning, buffer
 		 * mutation, send/drop, and DMA re-arm all use this same snapshot. */
+		/* Clear only the streaming cameras' flags. A one-shot capture
+		 * (capture_single_histogram / get_single_histogram) uses the same
+		 * flags for a camera that is not streaming; clearing them all here
+		 * made that capture fail whenever an FSIN source was running. */
 		__disable_irq();
 		histo_packet_ready_bits = event_bits & event_bits_enabled;
-		event_bits = 0x00;
+		event_bits &= (uint8_t)~event_bits_enabled;
 		__enable_irq();
 	}
 	histo_fault_prepare(dflags);
