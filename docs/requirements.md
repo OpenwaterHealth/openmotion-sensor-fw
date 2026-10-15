@@ -199,8 +199,8 @@ All command and response traffic on the COMMS interface uses a fixed binary pack
 | `OW_FPGA_ENTER_SRAM_PROG` | 0x15 | Enter SRAM programming mode |
 | `OW_FPGA_EXIT_SRAM_PROG` | 0x16 | Exit SRAM programming mode |
 | `OW_FPGA_ERASE_SRAM` | 0x17 | Erase FPGA SRAM |
-| `OW_FPGA_PROG_SRAM` | 0x18 | Program FPGA SRAM (`reserved=0`: use stored bitstream, `reserved=1`: use full program flow) |
-| `OW_FPGA_BITSTREAM` | 0x19 | Transfer bitstream data block to MCU buffer; `reserved=1` finalizes with CRC check |
+| `OW_FPGA_PROG_SRAM` | 0x18 | `reserved=1`: confirm the FPGA booted its NVCM design (error if it did not). Other values: program SRAM from the host-uploaded bitstream, Debug builds only (`OW_ERROR` in Release) |
+| `OW_FPGA_BITSTREAM` | 0x19 | Transfer bitstream data block to MCU buffer; `reserved=1` finalizes with CRC check. Debug builds only (`OW_ERROR` in Release) |
 | `OW_FPGA_USERCODE` | 0x1D | Read FPGA user code register |
 | `OW_FPGA_STATUS` | 0x1E | Read FPGA status register |
 | `OW_FPGA_RESET` | 0x1F | Hard reset FPGA/camera |
@@ -208,6 +208,8 @@ All command and response traffic on the COMMS interface uses a fixed binary pack
 | `OW_HISTO` | 0x1B | Histogram trigger (reserved for future use) |
 
 #### Bitstream Transfer Protocol
+
+Debug builds only (`FPGA_HOST_UPLOAD`): a bench check of a bitstream before it is burned to NVCM.
 
 1. Host sends multiple `OW_FPGA_BITSTREAM` packets with `reserved=0`, `addr` incrementing.
 2. First block (`addr=0`) clears the 200 KB bitstream buffer in D1 SRAM.
@@ -367,9 +369,9 @@ This prevents spurious frame-sync pulses during power state transitions.
 
 ### 7.2 FPGA Programming
 
-- Bitstream stored in Bank 2 flash at `ADDR_FLASH_SECTOR_5_BANK2` (0x081A0000).
-- Maximum bitstream size: 200 KB.
-- SRAM programming sequence:
+- The camera FPGAs are factory-programmed (NVCM) and boot on their own. Bring-up only confirms the boot: CRESETB is pulsed, and 100 ms later the booted design must be driving the camera's bus pins (`OW_FPGA_PROG_SRAM` reserved 1).
+- The firmware does not load a bitstream from MCU flash. A camera that does not boot from NVCM fails bring-up.
+- Debug builds can also program SRAM from a host-uploaded bitstream (max 200 KB):
   1. Enter SRAM programming mode (`fpga_enter_sram_prog_mode`).
   2. Erase SRAM (`fpga_erase_sram`).
   3. Program SRAM with bitstream (`fpga_program_sram`).
@@ -550,10 +552,10 @@ On boot, the firmware reads RCC reset-cause flags and logs:
 |---|---|---|---|
 | Bank 1, Sector 0–7 | 0x0800_0000 | 8 × 128 KB | Application firmware |
 | Bank 2, Sector 0–4 | 0x0810_0000 | 5 × 128 KB | Available |
-| Bank 2, Sector 5 | 0x081A_0000 | 128 KB | FPGA bitstream storage |
+| Bank 2, Sector 5 | 0x081A_0000 | 128 KB | FPGA bitstream (merged into bare-metal images; not read by the firmware) |
 | Bank 2, Sector 6 | 0x081C_0000 | 128 KB | Available |
 | Bank 2, Sector 7 | 0x081E_0000 | 128 KB | Persistent user configuration |
-| D1 SRAM | (`.RAM_D1` section) | 200 KB | Bitstream receive buffer |
+| D1 SRAM | (`.RAM_D1` section) | 200 KB | Bitstream receive buffer (Debug builds only) |
 
 ---
 
