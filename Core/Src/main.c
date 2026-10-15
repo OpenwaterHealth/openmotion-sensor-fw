@@ -122,8 +122,11 @@ DMA_HandleTypeDef hdma_memtomem_dma2_stream1;
 
 uint8_t rxBuffer[COMMAND_MAX_SIZE]  __attribute__((aligned(4)));
 uint8_t txBuffer[COMMAND_MAX_SIZE];
+#if FPGA_HOST_UPLOAD
+/* Host-uploaded camera bitstream (Debug builds only, #136). */
 uint32_t bitstream_len;
 __attribute__((section(".RAM_D1"))) uint8_t bitstream_buffer[MAX_BITSTREAM_SIZE]; // 160KB buffer
+#endif
 
 volatile uint8_t event_bits = 0x00;         // holds the event bits to be flipped
 volatile uint8_t event_bits_enabled = 0x00; // holds the event bits for the cameras to be enabled
@@ -195,6 +198,30 @@ static void imu_service(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/*
+ * IWDG1 has a 250 ms window (MX_IWDG1_Init, #136). The main loop feeds it once
+ * per pass, so any single fixed wait or bounded hardware operation that can
+ * run longer than that has to feed it as it goes: delay_ms_fed() cuts a wait
+ * into slices with a refresh between them. Only bounded waits may feed; a
+ * loop that can spin forever must not, or it would hide the hang the watchdog
+ * is there to catch.
+ */
+void watchdog_feed(void)
+{
+  HAL_IWDG_Refresh(&hiwdg1);
+}
+
+void delay_ms_fed(uint32_t ms)
+{
+  while (ms > 0U) {
+    uint32_t slice = (ms > 50U) ? 50U : ms;
+    HAL_IWDG_Refresh(&hiwdg1);
+    delay_ms(slice);
+    ms -= slice;
+  }
+  HAL_IWDG_Refresh(&hiwdg1);
+}
+
 /*
  * Clear the custom secure bootloader's failsafe boot counter (RTC->BKP6R).
  * The bootloader increments BKP6R on every launch attempt; after
@@ -358,6 +385,11 @@ int main(void)
   MX_IWDG1_Init();
   MX_RAMECC_Init();
   /* USER CODE BEGIN 2 */
+#if DEBUG_ENABLED
+  /* Stop IWDG1 while the core is halted by a debugger. With the 250 ms window
+   * (#136) a breakpoint would otherwise reset the module almost at once. */
+  __HAL_DBGMCU_FREEZE_IWDG1();
+#endif
 #if (DEBUG_ENABLED == 0) && !defined(BARE_METAL_BUILD)
   /* Debug port stays closed (PTR-2026-1-5 CON-02, CVE-1191). The secure bootloader
    * reconfigures PA13/PA14 (SWDIO/SWCLK) as plain inputs before launching us (DAP
@@ -394,7 +426,7 @@ int main(void)
 
   printf("\033c");
   fflush(stdout);
-  delay_ms(500);
+  delay_ms_fed(500);
   printf("Openwater open-MOTION Aggregator\r\n\r\n");
   printf("FW: %s (%s)\r\nDate: %s\r\n",
        FW_VERSION_STRING,
@@ -427,19 +459,21 @@ int main(void)
   // test i2c
   PrintI2CSpeed(&hi2c1);
   // I2C_scan(&hi2c1, NULL, 0, true);
-  delay_ms(100);
+  delay_ms_fed(100);
   X02C1B_FSIN_EXT_disable();
   GPIO_SetOutput(FSIN_EN_GPIO_Port, FSIN_EN_Pin, GPIO_PIN_RESET); // disable fsin output
 
   if (ICM_WHOAMI() == ICM20948_EXPECTED_ID)
   {
+	/* ICM_Init() carries ~185 ms of fixed waits: feed right before it. */
+	watchdog_feed();
 	if(ICM_Init() != HAL_OK){
 		printf("Failed to initialize IMU\r\n\n");
 	}
 	else
 	{
 		printf("IMU detected\r\n");
-	    delay_ms(100);
+	    delay_ms_fed(100);
 	    if(verbose_on) ICM_DumpRegisters();
 	}
   }
@@ -448,7 +482,7 @@ int main(void)
     printf("IMU NOT detected\r\n\n");
   }
 
-  delay_ms(10);
+  delay_ms_fed(10);
 
   HAL_GPIO_WritePin(USB_RESET_GPIO_Port, USB_RESET_Pin, GPIO_PIN_SET);
 
@@ -465,9 +499,9 @@ int main(void)
   // Select default camera
   TCA9548A_SelectChannel(&hi2c1, 0x70, get_active_cam()->i2c_target);
 
-  delay_ms(250);
+  delay_ms_fed(250);
   MX_USB_DEVICE_Init();
-  delay_ms(1000);
+  delay_ms_fed(1000);
   //GPIO_SetHiZ(GPIOA, GPIO_PIN_2);
 
   comms_host_start();
@@ -2305,11 +2339,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     HAL_RNG_DeInit(&hrng);
     HAL_CRC_DeInit(&hcrc);
     
-    MX_USB_DEVICE_DeInit();
-    delay_ms(300);
-    // Reset the board
+    /* Record the reason before the wait: the wait runs in this ISR, where
+     * nothing else feeds IWDG1, and a mark left until after it would be lost
+     * to a watchdog reset as "unexpected" (#136, #137). */
     system_monitor_mark_shutdown(_enter_dfu ? SYSMON_SHUTDOWN_HOST_DFU
                                             : SYSMON_SHUTDOWN_HOST_RESET);
+    MX_USB_DEVICE_DeInit();
+    delay_ms_fed(300);
+    // Reset the board
     NVIC_SystemReset();
 
   }

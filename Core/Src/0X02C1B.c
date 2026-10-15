@@ -127,7 +127,7 @@ int X02C1B_configure_sensor(CameraDevice *cam) {
 		return ret;
 	}
 
-	delay_ms(100);
+	delay_ms_fed(100);
     ret = X02C1B_write_array(cam->pI2c, X02C1B_SENSOR_CONFIG, ARRAY_SIZE(X02C1B_SENSOR_CONFIG));
     if (ret < 0) {
         printf("Camera %d Sensor configuration failed\r\n", cam->id+1);
@@ -173,13 +173,13 @@ int X02C1B_configure_sensor(CameraDevice *cam) {
         printf("Camera %d RAW mode: BLC/DC-BLC/dither/OTP-DPC off\r\n", cam->id+1);
     }
 
-	delay_ms(100);
+	delay_ms_fed(100);
     return 0;
 }
 
 int X02C1B_set_test_pattern(CameraDevice *cam, uint8_t test_pattern)
 {
-    delay_ms(100);
+    delay_ms_fed(100);
     int ret = 0;
     switch (test_pattern) {
         case 0:

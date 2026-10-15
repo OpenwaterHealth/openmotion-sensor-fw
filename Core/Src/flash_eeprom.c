@@ -6,6 +6,7 @@
  */
 
 #include "flash_eeprom.h"
+#include "main.h"   /* watchdog_feed() */
 
 
 /**
@@ -164,12 +165,27 @@ HAL_StatusTypeDef Flash_Read_Bytes(uint32_t address,
     return HAL_OK;
 }
 
+/* Same cap as the HAL's FLASH_TIMEOUT_VALUE, which is private to the HAL. */
+#define FLASH_ERASE_TIMEOUT_MS 50000U
+
+/* Wait for the bank's current flash operation to finish, feeding the
+ * watchdog every 10 ms, for at most FLASH_ERASE_TIMEOUT_MS. */
+static HAL_StatusTypeDef flash_wait_fed(uint32_t bank)
+{
+    uint32_t t0 = HAL_GetTick();
+    HAL_StatusTypeDef status;
+
+    do {
+        watchdog_feed();
+        status = FLASH_WaitForLastOperation(10U, bank);
+    } while ((status == HAL_TIMEOUT) && ((HAL_GetTick() - t0) < FLASH_ERASE_TIMEOUT_MS));
+    return status;
+}
+
 /* Function to erase Flash memory */
 HAL_StatusTypeDef Flash_Erase(uint32_t start_address, uint32_t end_address)
 {
     HAL_StatusTypeDef status;
-    FLASH_EraseInitTypeDef erase;
-    uint32_t error;
 
     uint32_t first_sector = GetSector(start_address);
     uint32_t last_sector  = GetSector(end_address);
@@ -187,13 +203,24 @@ HAL_StatusTypeDef Flash_Erase(uint32_t start_address, uint32_t end_address)
     HAL_FLASH_Unlock();
     SCB_DisableICache();
 
-    erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
-    erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-    erase.Banks        = bank;
-    erase.Sector       = first_sector;
-    erase.NbSectors    = (last_sector - first_sector) + 1;
-
-    status = HAL_FLASHEx_Erase(&erase, &error);
+    /* Same register sequence as HAL_FLASHEx_Erase(), but the wait for each
+     * sector feeds the watchdog: a 128 KB sector erase takes ~1-2 s, far
+     * past the 250 ms IWDG window (#136). The flash controller bounds the
+     * erase, and FLASH_ERASE_TIMEOUT_MS still caps the wait. */
+    status = flash_wait_fed(bank);
+    for (uint32_t sector = first_sector; (sector <= last_sector) && (status == HAL_OK); sector++)
+    {
+        FLASH_Erase_Sector(sector, bank, FLASH_VOLTAGE_RANGE_3);
+        status = flash_wait_fed(bank);
+        if (bank == FLASH_BANK_1)
+        {
+            FLASH->CR1 &= (~(FLASH_CR_SER | FLASH_CR_SNB));
+        }
+        else
+        {
+            FLASH->CR2 &= (~(FLASH_CR_SER | FLASH_CR_SNB));
+        }
+    }
 
     HAL_FLASH_Lock();
     SCB_EnableICache();

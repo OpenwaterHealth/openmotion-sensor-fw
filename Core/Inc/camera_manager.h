@@ -151,7 +151,9 @@ void Camera_USART_RxCpltCallback_Handler(USART_HandleTypeDef *husart);
 void Camera_SPI_RxCpltCallback_Handler(SPI_HandleTypeDef *hspi);
 uint32_t read_status_fpga(uint8_t cam_id);
 uint32_t read_usercode_fpga(uint8_t cam_id);
+#if FPGA_HOST_UPLOAD
 _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len, _Bool force_update);
+#endif
 
 void fill_frame_buffers(void);
 void print_active_cameras(void);

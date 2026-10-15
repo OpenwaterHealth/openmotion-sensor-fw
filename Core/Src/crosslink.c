@@ -18,7 +18,9 @@
 #include <stdint.h>
 
 #define I2C_ADDRESS 0x40  // Replace with your FPGA's I2C address
-#define BITSTREAM_CHUNK_SIZE 8192
+/* One sequential I2C frame of a host-uploaded bitstream: 4096 B is ~100 ms on
+ * the bus, so feeding the 250 ms watchdog once per chunk keeps margin (#136). */
+#define BITSTREAM_CHUNK_SIZE 4096
 #define CMD_INITIATE 0xC0
 #define CMD_ISSUE 0x74
 #define CMD_ENABLE_SRAM 0xC6
@@ -39,9 +41,10 @@ static uint8_t expected_idcode[] = {0x01, 0x2C, 0x00, 0x43};
 static unsigned char write_buf[4];
 static unsigned char read_buf[4];
 
-static const uint8_t max_attempts = 3;
+#if FPGA_HOST_UPLOAD
 extern uint8_t bitstream_buffer[];
 extern uint32_t bitstream_len;
+#endif
 
 
 int xi2c_write_bytes(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *data, uint16_t length) {
@@ -85,6 +88,9 @@ int xi2c_write_and_read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *w
     return HAL_OK;
 }
 
+#if FPGA_HOST_UPLOAD
+/* Host-upload only (Debug builds, #136): streams the bitstream as one I2C
+ * transaction, which takes seconds, so the watchdog is fed per chunk. */
 static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, const uint8_t *cmd, int cmd_len, const uint8_t *data, size_t data_len) {
 	HAL_StatusTypeDef ret;
     size_t offset = 0;
@@ -124,6 +130,7 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
         // Reset completion flags
         txComplete = 0;
         i2cError = 0;
+        watchdog_feed();
 
         // Transmit the current chunk
         ret = HAL_I2C_Master_Seq_Transmit_IT(hi2c, DevAddress << 1, pData, datalen, frame_flag);
@@ -145,6 +152,7 @@ static HAL_StatusTypeDef xi2c_write_long(I2C_HandleTypeDef *hi2c, uint16_t DevAd
 
     return HAL_OK;
 }
+#endif /* FPGA_HOST_UPLOAD */
 
 int fpga_send_activation(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
 {
@@ -252,7 +260,7 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
     /* 1. Hold config port in SLAVE mode: CRESETB low, activation key, CRESETB
      *    high.  Sending the key while/around the CRESETB transition declares the
      *    slave port active so the device enters config mode instead of booting
-     *    from NVCM — exactly what fpga_configure() does for SRAM.  This keeps the
+     *    from NVCM — exactly what SRAM programming does.  This keeps the
      *    config I2C port at 0x40 alive throughout and never powers anything. */
     HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);
     delay_ms(1);
@@ -363,7 +371,7 @@ int fpga_nvcm_probe(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
         HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);  /* assert reset */
         delay_ms(5);
         HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);    /* release, NO activation key */
-        delay_ms(150);                                       /* allow full auto-boot */
+        delay_ms_fed(150);                                   /* allow full auto-boot */
 
         out->boot_probe_done = 1;
         out->boot_0x40_responds =
@@ -393,6 +401,7 @@ int fpga_erase_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress)
     return 0;
 }
 
+#if FPGA_HOST_UPLOAD
 int fpga_program_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len)
 {
     if(verbose_on) { printf("Program SRAM\r\n"); }
@@ -417,106 +426,7 @@ int fpga_program_sram(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, bool rom_bit
 
     return 0;
 }
-
-
-int fpga_configure(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
-	int ret_status = 0;
-	uint8_t attempt = 0;
-	_Bool idcode_match = false;
-
-	if(verbose_on) { printf("Starting FPGA configuration...\r\n"); }
-
-    // Set GPIO HIGH
-    HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
-    delay_ms(250);
-
-    // Set GPIO LOW
-    HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);
-    delay_ms(250);
-
-    while (attempt < max_attempts && !idcode_match) {
-        attempt++;
-		HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
-		delay_ms(100);
-
-		// Set GPIO LOW
-		HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);
-		delay_ms(1000);
-
-		// Activation Key
-		xi2c_write_bytes(hi2c, DevAddress, activation_key, 5);
-		HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
-		delay_ms(10);
-
-		// IDCODE
-		memset(read_buf, 0, 4);
-		memcpy(write_buf, (uint8_t[]){0xE0,0x00,0x00,0x00}, 4);
-		xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-		if(verbose_on) { print_hex_buf("IDCODE", read_buf, 4); }
-
-	    // Check if IDCODE matches expected
-	    if (memcmp(read_buf, expected_idcode, 4) == 0) {
-	        idcode_match = true;
-	        break;
-	    }
-    }
-
-    if (!idcode_match) {
-        printf("ERROR: Failed to match IDCODE after %d attempts.\r\n", max_attempts);
-        // Optionally return or handle error
-        return HAL_ERROR;
-    } else {
-        if(verbose_on) { printf("IDCODE matched successfully.\r\n"); }
-        // Proceed with the next steps
-    }
-
-    // Enable SRAM
-    memcpy(write_buf, (uint8_t[]){0xC6,0x00,0x00,0x00}, 4);
-    xi2c_write_bytes(hi2c, DevAddress, write_buf, 4);
-    delay_ms(1);
-
-    // Erase SRAM
-    memcpy(write_buf, (uint8_t[]){0x0E,0x00,0x00,0x00}, 4);
-    xi2c_write_bytes(hi2c, DevAddress, write_buf, 4);
-    delay_ms(5000);
-
-    // Read Status
-    memset(read_buf, 0, 4);
-    memcpy(write_buf, (uint8_t[]){0x3C,0x00,0x00,0x00}, 4);
-    xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-    if(verbose_on) { print_hex_buf("Erase Status", read_buf, 4); }
-
-    // Program Command
-    memcpy(write_buf, (uint8_t[]){0x46,0x00,0x00,0x00}, 4);
-    xi2c_write_bytes(hi2c, DevAddress, write_buf, 4);
-    delay_ms(1);
-
-    // Send Bitstream
-    memcpy(write_buf, (uint8_t[]){0x7A,0x00,0x00,0x00}, 4);
-    xi2c_write_long(hi2c, DevAddress, write_buf, 4, (uint8_t*)ADDR_CAMERA_BITSTREAM, (size_t)163489);
-    delay_ms(1);
-
-    // USERCODE (optional)
-    memset(read_buf, 0, 4);
-    memcpy(write_buf, (uint8_t[]){0xC0,0x00,0x00,0x00}, 4);
-    xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-    if(verbose_on) { print_hex_buf("User Register", read_buf, 4); }
-
-    // Final Status
-    memset(read_buf, 0, 4);
-    memcpy(write_buf, (uint8_t[]){0x3C,0x00,0x00,0x00}, 4);
-    xi2c_write_and_read(hi2c, DevAddress, write_buf, 4, read_buf, 4);
-    if(verbose_on) { print_hex_buf("Program Status", read_buf, 4); }
-
-    if(read_buf[2] != 0x0F) { ret_status = 1; }
-
-    // Exit Program Mode
-    memcpy(write_buf, (uint8_t[]){0x26,0x00,0x00,0x00}, 4);
-    xi2c_write_bytes(hi2c, DevAddress, write_buf, 4);
-
-    if(verbose_on) { printf("FPGA configuration complete.\r\n"); }
-    return ret_status;
-}
+#endif /* FPGA_HOST_UPLOAD */
 
 // Callback implementations
 // cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL

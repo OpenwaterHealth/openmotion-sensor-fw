@@ -218,7 +218,7 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
 	delay_ms(5);
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
-	delay_ms(100);
+	delay_ms_fed(100);
 
 	bool clk_low  = HAL_GPIO_ReadPin(cam->detect_clk_port, cam->detect_clk_pin) == GPIO_PIN_RESET;
 	bool data_low = HAL_GPIO_ReadPin(cam->detect_data_port, cam->detect_data_pin) == GPIO_PIN_RESET;
@@ -242,7 +242,7 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 		/* The booted design drives this camera's bus clock; edges seen while
 		 * the pins were re-attached can leave the USART receiver bit-shifted
 		 * (every histogram bin reads multiplied by a power of two). Same
-		 * reset the SRAM programming path requires after fpga_configure(). */
+		 * reset the SRAM programming path requires after an SRAM load. */
 		if (cam->useUsart && cam->pUart != NULL) {
 			cam->pUart->Instance->CR1 &= ~USART_CR1_UE;
 			cam->pUart->Instance->CR1 |= USART_CR1_UE;
@@ -703,8 +703,10 @@ _Bool reset_camera(uint8_t cam_id)
     HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
     delay_ms(5);
 
+    /* CRESETB stays low: the FPGA is held in reset until the next program
+     * command's NVCM probe pulses and releases it. Nothing needs the 1 s
+     * wait that used to follow here (8 s for a full mask, #136). */
     HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-    delay_ms(1000);
 
     cam->isConfigured = false;
     cam->isProgrammed = false;
@@ -961,6 +963,10 @@ uint32_t read_usercode_fpga(uint8_t cam_id)
 
 static void camera_recovery_complete(CameraDevice *cam);
 
+#if FPGA_HOST_UPLOAD
+/* Host-upload SRAM programming (OW_FPGA_BITSTREAM + OW_FPGA_PROG_SRAM
+ * reserved != 1): a bench tool for checking a bitstream before it is burned
+ * to NVCM. Debug builds only (#136, FPGA_HOST_UPLOAD in CMakeLists.txt). */
 _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len, _Bool force_update)
 {
 	printf("C%d: programming...", cam_id+1);
@@ -1002,6 +1008,7 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 	printf("done\r\n");
 	return true;
 }
+#endif /* FPGA_HOST_UPLOAD */
 
 /* A successful FPGA bring-up is the last firmware-owned step of death
  * recovery (the host's config + stream-enable commands follow on their
@@ -1041,34 +1048,13 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 		cam->isProgrammed = false;
 	}
 
-	if(TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK)
-	{
-		printf("failed to select Camera %d channel\r\n", cam_id+1);
-		return false;
-	}
-
-	if(fpga_configure(cam->pI2c, cam->device_address, cam->cresetb_port, cam->cresetb_pin) == 1)
-	{
-		printf("Program FPGA Camera %d Failed\r\n", cam_id+1);
-
-		cam->isProgrammed = false;
-		return false;
-	} else {
-		cam->isProgrammed = true;
-		camera_recovery_complete(cam);
-	}
-
-	// If the selected camera is one that uses USART, 
-	// reset the USART to ensure it is in a known state
-	// !! This is required for the USART to work properly after FPGA programming !!
-	if(cam->useUsart)
-	{
-		cam->pUart->Instance->CR1 &= ~USART_CR1_UE; // Disable USART
-		cam->pUart->Instance->CR1 |= USART_CR1_UE;
-	}
-	// printf("done\r\n");
-
-	return true;
+	/* No NVCM boot: fail. The flash SRAM fallback that used to load a
+	 * bitstream from MCU flash here is gone (#136): it held the main loop for
+	 * ~10 s, and bootloader-slot images don't carry that bitstream. A camera
+	 * whose NVCM burn failed can't be used on this firmware. */
+	printf("C%d: FPGA did not boot from NVCM\r\n", cam_id+1);
+	cam->isProgrammed = false;
+	return false;
 }
 /* -------- END FPGA FUNCTIONS -------- */
 
@@ -1498,6 +1484,7 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	    	ret = false;
 	        break;
 	    }
+	    watchdog_feed();  /* bounded by the 5 s timeout above (#136) */
 	    delay_ms(1);
 	}
 

@@ -386,10 +386,12 @@ static void process_sensor_command(UartPacket *uartResp, UartPacket cmd)
 	}
 }
 
+#if FPGA_HOST_UPLOAD
 extern uint8_t bitstream_buffer[];
 extern uint32_t bitstream_len;
 
 static uint8_t* ptrBitstream;
+#endif
 
 static void I2C_DisableEnableReset(I2C_HandleTypeDef *hi2c)
 {
@@ -536,7 +538,11 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
 	        	if(cmd.reserved == 1) {
 	        		func_ret = program_fpga(i, false);
 	        	} else {
+#if FPGA_HOST_UPLOAD
 	        		func_ret = program_sram_fpga(i, true, 0, 0, false);
+#endif
+	        		/* Host-upload SRAM programming is in Debug builds only
+	        		 * (#136); elsewhere func_ret stays false (OW_ERROR). */
 	        	}
 	    		if(!func_ret)
 	    		{
@@ -559,6 +565,10 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
 	case OW_FPGA_BITSTREAM:
 		VERBOSE_CMD("[CMD] OW_FPGA_BITSTREAM addr=0x%02X reserved=%u len=%u\r\n", cmd.addr, cmd.reserved, (unsigned)cmd.data_len);
 		uartResp->command = OW_FPGA_BITSTREAM;
+#if !FPGA_HOST_UPLOAD
+		/* Host-upload SRAM programming is in Debug builds only (#136). */
+		uartResp->packet_type = OW_ERROR;
+#else
 		uartResp->packet_type = OW_RESP;
 		if(cmd.reserved == 0){
 			if(cmd.addr == 0){
@@ -579,6 +589,7 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
     			VERBOSE_CMD("Failed crc check\r\n");
 			}
 		}
+#endif /* FPGA_HOST_UPLOAD */
 		break;
 	case OW_FPGA_STATUS:
 		VERBOSE_CMD("[CMD] OW_FPGA_STATUS addr=0x%02X\r\n", cmd.addr);
