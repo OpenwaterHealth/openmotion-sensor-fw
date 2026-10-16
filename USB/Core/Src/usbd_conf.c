@@ -260,6 +260,9 @@ void HAL_PCD_ResetCallback(PCD_HandleTypeDef *hpcd)
 {
   USBD_SpeedTypeDef speed = USBD_SPEED_FULL;
 
+  /* A bus reset can end a suspend without a resume interrupt. */
+  __HAL_PCD_UNGATE_PHYCLOCK(hpcd);
+
   if ( hpcd->Init.speed == PCD_SPEED_HIGH)
   {
     speed = USBD_SPEED_HIGH;
@@ -317,7 +320,9 @@ void HAL_PCD_ResumeCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
   /* USER CODE BEGIN 3 */
-
+  /* The suspend callback stops the ULPI PHY clock; restart it or the PHY
+   * stays suspended while the stack thinks the bus is live. */
+  __HAL_PCD_UNGATE_PHYCLOCK(hpcd);
   /* USER CODE END 3 */
   USBD_LL_Resume((USBD_HandleTypeDef*)hpcd->pData);
 }
