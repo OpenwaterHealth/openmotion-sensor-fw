@@ -88,7 +88,7 @@ The firmware:
 
 ### 3.1 USB Composite Device (Primary Host Interface)
 
-The firmware enumerates as a USB composite device (`COMMS_HISTO_IMU(HS)`) with three interfaces, each bound to the WinUSB driver on Windows 10/11.
+The firmware enumerates as a USB composite device (`COMMS_HISTO_IMU(HS)`) with three interfaces, each bound to the WinUSB driver on Windows 11.
 
 | Interface | Type | Purpose |
 |---|---|---|
