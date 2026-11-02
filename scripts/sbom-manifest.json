@@ -66,7 +66,7 @@
         },
         {
           "name": "openwater:known-vulnerability-note",
-          "value": "CVE-2026-88369 (example/jsondump.c dump(); the example is not compiled) and CVE-2026-95117 (jsmn issue #249: in non-strict mode a STRING or PRIMITIVE token can get size > 0, and a caller that walks by size reads past the token array; upstream PR #250 changes only the example and was closed unmerged) are recorded against jsmn. Not reachable in this firmware: the only jsmn_parse() caller (JSON_ProcessCommand, Core/Src/if_commands.c) is under #if 0 and jsmn_parse/jsmn_init are discarded at link. See CVA J3"
+          "value": "CVE-2026-88369 (example/jsondump.c dump(); the jsmn examples are not vendored in this repository) and CVE-2026-95117 (jsmn issue #249: in non-strict mode a STRING or PRIMITIVE token can get size > 0, and a caller that walks by size reads past the token array; upstream PR #250 changes only the example and was closed unmerged) are recorded against jsmn. Not fixed in jsmn: the vendored jsmn.c (identical to the console copy) still increments the size of whatever token toksuper points to, without a type check, and this firmware does not define JSMN_STRICT. Not reachable in this firmware: the only jsmn_parse() caller (JSON_ProcessCommand, Core/Src/if_commands.c) is under #if 0 and jsmn_parse/jsmn_init are discarded at link (--gc-sections; motion-sensor-fw.map). Re-enabling that caller would need JSMN_STRICT and a token walk bounded by the parsed token count, as in the console firmware. See CVA J3"
         },
         {
           "name": "openwater:evidence",
