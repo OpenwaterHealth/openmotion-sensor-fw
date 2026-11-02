@@ -66,11 +66,15 @@
         },
         {
           "name": "openwater:known-vulnerability-note",
-          "value": "CVE-2026-88369 is recorded against jsmn; see CVA J3"
+          "value": "CVE-2026-88369 (example/jsondump.c dump(); the example is not compiled) and CVE-2026-95117 (jsmn issue #249: in non-strict mode a STRING or PRIMITIVE token can get size > 0, and a caller that walks by size reads past the token array; upstream PR #250 changes only the example and was closed unmerged) are recorded against jsmn. Not reachable in this firmware: the only jsmn_parse() caller (JSON_ProcessCommand, Core/Src/if_commands.c) is under #if 0 and jsmn_parse/jsmn_init are discarded at link. See CVA J3"
         },
         {
           "name": "openwater:evidence",
           "value": "Core/Src/jsmn.c, Core/Inc/jsmn.h (byte-identical in console and sensor firmware); compared with every upstream revision of jsmn.c/jsmn.h - cf38b7d is the nearest (53 differing lines, the local modifications)"
+        },
+        {
+          "name": "openwater:local-changes",
+          "value": "toksuper guard in the ',' and JSMN_STRICT primitive cases (upstream 824d9a7; CVA O9/R7, 2026-10-08) plus the pre-existing local changes"
         }
       ]
     },
@@ -152,7 +156,7 @@
         "name": "STMicroelectronics"
       },
       "version": "2.11.5",
-      "description": "In-tree copy under USB/Core. usbd_core.c, usbd_ctlreq.c and usbd_ioreq.c are byte-identical to upstream v2.11.4/v2.11.5; usbd_def.h is modified (CLASS_TYPE_IMU/HISTO/COMMS). Does not contain the v2.11.6 endpoint-index fix.",
+      "description": "In-tree copy under USB/Core. usbd_core.c and usbd_ioreq.c are byte-identical to upstream v2.11.4/v2.11.5; usbd_ctlreq.c carries two local changes equivalent to upstream v2.11.6 (endpoint-index bound in USBD_StdEPReq, length-bounded USBD_GetString); usbd_def.h is modified (CLASS_TYPE_IMU/HISTO/COMMS).",
       "scope": "required",
       "licenses": [
         {
@@ -166,6 +170,10 @@
         {
           "name": "openwater:evidence",
           "value": "USB/Core (git blob hashes vs. STMicroelectronics/stm32-mw-usb-device tags)"
+        },
+        {
+          "name": "openwater:local-changes",
+          "value": "2 (USB/Core/LOCAL_CHANGES.md): endpoint-index bound in USBD_StdEPReq and length-bounded USBD_GetString, equivalent to upstream v2.11.6 (CVA O2/R7, 2026-10-08)"
         }
       ]
     },
