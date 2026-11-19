@@ -1,4 +1,9 @@
 # Openwater Open-Motion Sensor Module v1.0.0
+
+## Disclaimer
+
+CAUTION - The system described here has not been evaluated by the FDA and is not designed for the treatment or diagnosis of any disease. It is provided AS-IS, with no warranties. User assumes all liability and responsibility for identifying and mitigating risks associated with using this software.
+
 This repository contains the firmware for the Motion Sensor Module.
 
 # Build & Flash
@@ -23,7 +28,7 @@ The script enters DFU mode through the `omotion` SDK, flashes the merged firmwar
 This device is a USB composite device with three interfaces and we are required to install the Latest WinUSB Driver for COMMS_HISTO_IMU(HS)
 
 ## Driver Utility
-For the Host machine to communicate with the sensor module from user-space, each interface must be bound to the Microsoft WinUSB driver provided by Windows 10/11 (latest in-box version).
+For the Host machine to communicate with the sensor module from user-space, each interface must be bound to the Microsoft WinUSB driver provided by Windows 11 (latest in-box version).
 
 [Download Zadig](https://zadig.akeo.ie/)
 
