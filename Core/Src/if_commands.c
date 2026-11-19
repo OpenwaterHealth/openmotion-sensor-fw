@@ -22,6 +22,7 @@
 #include "motion_config.h"
 #include "sensor_serial.h"
 #include "logging.h"
+#include "system_monitor.h"
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
@@ -79,6 +80,18 @@ static void process_basic_command(UartPacket *uartResp, UartPacket cmd)
 		camera_manager_get_diag_stats(&diag_stats_resp);
 		uartResp->data_len = sizeof(diag_stats_resp);
 		uartResp->data = (uint8_t *)&diag_stats_resp;
+		break;
+	}
+	case OW_CMD_RESET_HISTORY: {
+		/* #137: why the module last went down, plus the persistent reset
+		 * counters. Read-only; printf-independent like OW_CMD_DIAG_STATS. */
+		VERBOSE_CMD("[CMD] OW_CMD_RESET_HISTORY\r\n");
+		uartResp->command = OW_CMD_RESET_HISTORY;
+		uartResp->packet_type = OW_RESP;
+		static sysmon_reset_history_t reset_history_resp;
+		system_monitor_get_reset_history(&reset_history_resp);
+		uartResp->data_len = sizeof(reset_history_resp);
+		uartResp->data = (uint8_t *)&reset_history_resp;
 		break;
 	}
 	case OW_CMD_PING:
@@ -373,10 +386,12 @@ static void process_sensor_command(UartPacket *uartResp, UartPacket cmd)
 	}
 }
 
+#if FPGA_HOST_UPLOAD
 extern uint8_t bitstream_buffer[];
 extern uint32_t bitstream_len;
 
 static uint8_t* ptrBitstream;
+#endif
 
 static void I2C_DisableEnableReset(I2C_HandleTypeDef *hi2c)
 {
@@ -523,7 +538,11 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
 	        	if(cmd.reserved == 1) {
 	        		func_ret = program_fpga(i, false);
 	        	} else {
+#if FPGA_HOST_UPLOAD
 	        		func_ret = program_sram_fpga(i, true, 0, 0, false);
+#endif
+	        		/* Host-upload SRAM programming is in Debug builds only
+	        		 * (#136); elsewhere func_ret stays false (OW_ERROR). */
 	        	}
 	    		if(!func_ret)
 	    		{
@@ -546,6 +565,10 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
 	case OW_FPGA_BITSTREAM:
 		VERBOSE_CMD("[CMD] OW_FPGA_BITSTREAM addr=0x%02X reserved=%u len=%u\r\n", cmd.addr, cmd.reserved, (unsigned)cmd.data_len);
 		uartResp->command = OW_FPGA_BITSTREAM;
+#if !FPGA_HOST_UPLOAD
+		/* Host-upload SRAM programming is in Debug builds only (#136). */
+		uartResp->packet_type = OW_ERROR;
+#else
 		uartResp->packet_type = OW_RESP;
 		if(cmd.reserved == 0){
 			if(cmd.addr == 0){
@@ -566,6 +589,7 @@ static void process_fpga_commands(UartPacket *uartResp, UartPacket cmd)
     			VERBOSE_CMD("Failed crc check\r\n");
 			}
 		}
+#endif /* FPGA_HOST_UPLOAD */
 		break;
 	case OW_FPGA_STATUS:
 		VERBOSE_CMD("[CMD] OW_FPGA_STATUS addr=0x%02X\r\n", cmd.addr);
@@ -769,7 +793,7 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		/* Scan start: clear any leftover frames before arming cameras — a
 		 * backstop to the stop-path drain below. Enable path only. */
 		if (cmd.reserved == 1) {
-			USBD_HISTO_FlushQueue("start");
+			USBD_HISTO_FlushQueue(HISTO_FLUSH_SCAN_START);
 		}
 		uint8_t status = 0;
 		for (uint8_t i = 0; i < 8; i++) {
@@ -787,7 +811,7 @@ static void process_camera_commands(UartPacket *uartResp, UartPacket cmd)
 		 * shrink from here. Disable path only — this is the primary "keep it
 		 * from getting dirty" guard; the start-path flush is just a backstop. */
 		if (cmd.reserved == 0) {
-			USBD_HISTO_FlushQueue("stop");
+			USBD_HISTO_FlushQueue(HISTO_FLUSH_SCAN_STOP);
 		}
 		if(status != cmd.addr) // if the status bits are not true for all the cameras addressed, error
 		{
@@ -1264,7 +1288,6 @@ UartPacket process_if_command(UartPacket cmd)
 	uartReturn.packet_type = OW_RESP;
 	uartReturn.addr = cmd.addr;
 	uartReturn.reserved = cmd.reserved;
-	uartReturn.packet_type = OW_RESP;
 	uartReturn.data_len = 0;
 	uartReturn.data = 0;
 	switch (cmd.packet_type)

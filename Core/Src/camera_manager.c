@@ -10,6 +10,7 @@
 #include "crosslink.h"
 #include "0X02C1B.h"
 #include "camera_telemetry.h"
+#include "histo_fault_inject.h"
 #include "i2c_master.h"
 #include "uart_comms.h"
 #include "utils.h"
@@ -46,11 +47,45 @@ static int _active_cam_idx = 0;
 
 static volatile bool usb_failed = false;
 
-__ALIGN_BEGIN volatile uint8_t frame_buffer[1][CAMERA_COUNT * HISTOGRAM_DATA_SIZE] __ALIGN_END; // Double buffer
+/* #116: per-camera RX double buffer, finally living up to the old comment.
+ * DMA fills pRxBuf[armed] while the send path copies pRxBuf[done]; the re-arm
+ * happens at RX-complete (via PendSV) and never waits on the send path. */
+__ALIGN_BEGIN volatile uint8_t frame_buffer[2][CAMERA_COUNT * HISTOGRAM_DATA_SIZE] __ALIGN_END; // Double buffer
 __ALIGN_BEGIN uint8_t packet_buffer[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;
 __ALIGN_BEGIN uint8_t uncmp_payload[HISTO_JSON_BUFFER_SIZE] __ALIGN_END;  // Staging buffer for compression
 
-static uint8_t _active_buffer = 0; // Index of the buffer currently being written to
+/* #116: per-camera RX buffer-exchange state. Owner rules:
+ *  - armed_idx: written by camera_rx_complete (RX ISR, prio 1) only.
+ *  - done_idx:  written by camera_rx_complete; read by send paths inside the
+ *               copy-announce critical section.
+ *  - copy_idx:  written by the send paths (announce/withdraw around memcpy);
+ *               read by camera_rx_complete to decide drop-vs-publish.
+ *  - rearm_needed: set by camera_rx_complete / camera_rx_error_recover;
+ *               claimed (cleared-then-armed) by camera_rearm_isr (PendSV) and
+ *               camera_rearm_service (main loop).
+ * Invariant: armed_idx != done_idx except transiently inside the RX ISR, and
+ * DMA is never armed into a buffer whose copy_idx announcement is active. */
+#define CAM_BUF_NONE 0xFFu
+typedef struct {
+	volatile uint8_t  armed_idx;      /* buffer DMA owns (is or will be armed into) */
+	volatile uint8_t  done_idx;       /* buffer holding the latest complete frame */
+	volatile uint8_t  copy_idx;       /* buffer the send path is copying, CAM_BUF_NONE if none */
+	volatile bool     rearm_needed;   /* PendSV / retry service must (re)arm reception */
+	volatile uint32_t overwrite_drops;/* frames dropped: consumer stalled mid-copy > 1 frame (this scan) */
+	volatile uint32_t rearm_service_saves; /* re-arms completed by the main-loop retry service (this scan) */
+	uint32_t          next_retry_ms;  /* retry-service backoff deadline (HAL_GetTick timebase) */
+} cam_rx_state_t;
+static cam_rx_state_t cam_rx[CAMERA_COUNT];
+
+/* Pend the deferred re-arm (PendSV, CAMERA_REARM_PENDSV_PRIORITY). PendSV is
+ * free on this bare-metal firmware (no RTOS). It tail-chains after the RX ISR
+ * fully unwinds — required because the H7 HAL invokes the RxCplt callback
+ * BEFORE setting the peripheral state back to READY, so arming directly in
+ * the callback would be refused as BUSY. */
+static inline void camera_pend_rearm(void)
+{
+	SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+}
 volatile uint8_t frame_id = 0;
 extern volatile uint8_t event_bits_enabled; // holds the event bits for the cameras to be enabled
 extern volatile uint8_t event_bits;
@@ -96,6 +131,15 @@ static bool streaming_first_frame = false;
 static uint32_t histo_stall_frame_count = 0;
 static bool histo_stall_tripped = false;
 
+/* #123: one deterministic plan per outgoing histogram packet. The scheduler
+ * is pure state; this file owns buffer mutation, USB suppression, and logs. */
+static histo_fault_injector_t histo_fault_injector;
+static histo_fault_plan_t histo_fault_plan;
+static uint32_t histo_packet_timestamp_ms = 0u;
+static uint32_t histo_fault_scan_flags = 0u;
+static uint8_t histo_packet_ready_bits = 0u;
+static bool histo_fault_disarmed_for_scan = false;
+
 // Camera failure detection
 #define CAMERA_FAILURE_THRESHOLD_CYCLES 3  // Number of consecutive cycles before reporting failure
 static uint8_t camera_failure_counters[CAMERA_COUNT] = {0};  // Track consecutive cycles without event bits
@@ -118,11 +162,12 @@ void camera_manager_get_diag_stats(cam_diag_stats_t *out) {
 	out->cmp_max_time_us = cmp_max_time_us;
 }
 
- __ALIGN_BEGIN __attribute__((section(".sram4"))) volatile uint8_t spi6_buffer[SPI_PACKET_LENGTH] __ALIGN_END;
+/* #116: cam 1 (SPI6) double buffer — must stay in SRAM4, BDMA reaches only D3. */
+ __ALIGN_BEGIN __attribute__((section(".sram4"))) volatile uint8_t spi6_buffer[2][SPI_PACKET_LENGTH] __ALIGN_END;
 
 
 static bool camera_is_present(uint8_t cam_id) {
-	CameraDevice *cam = &cam_array[cam_id];
+	const CameraDevice *cam = &cam_array[cam_id];
 	if (!cam->isPresent) {
 		printf("Camera %d not present\r\n", cam_id + 1);
 		return false;
@@ -173,7 +218,7 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
 	delay_ms(5);
 	HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
-	delay_ms(100);
+	delay_ms_fed(100);
 
 	bool clk_low  = HAL_GPIO_ReadPin(cam->detect_clk_port, cam->detect_clk_pin) == GPIO_PIN_RESET;
 	bool data_low = HAL_GPIO_ReadPin(cam->detect_data_port, cam->detect_data_pin) == GPIO_PIN_RESET;
@@ -197,7 +242,7 @@ static bool fpga_detect_nvcm(CameraDevice *cam)
 		/* The booted design drives this camera's bus clock; edges seen while
 		 * the pins were re-attached can leave the USART receiver bit-shifted
 		 * (every histogram bin reads multiplied by a power of two). Same
-		 * reset the SRAM programming path requires after fpga_configure(). */
+		 * reset the SRAM programming path requires after an SRAM load. */
 		if (cam->useUsart && cam->pUart != NULL) {
 			cam->pUart->Instance->CR1 &= ~USART_CR1_UE;
 			cam->pUart->Instance->CR1 |= USART_CR1_UE;
@@ -467,11 +512,29 @@ void init_camera_sensors() {
 
 
 	for(i=0; i<CAMERA_COUNT; i++){
-		cam_array[i].pRecieveHistoBuffer =(uint8_t *)&frame_buffer[_active_buffer][i * HISTOGRAM_DATA_SIZE];
+		/* #116: per-camera double buffer — slot i of each frame_buffer half. */
+		cam_array[i].pRxBuf[0] = (uint8_t *)&frame_buffer[0][i * HISTOGRAM_DATA_SIZE];
+		cam_array[i].pRxBuf[1] = (uint8_t *)&frame_buffer[1][i * HISTOGRAM_DATA_SIZE];
+		cam_array[i].pRecieveHistoBuffer = cam_array[i].pRxBuf[0];
+		cam_rx[i].armed_idx = 0;
+		cam_rx[i].done_idx = 0;
+		cam_rx[i].copy_idx = CAM_BUF_NONE;
+		cam_rx[i].rearm_needed = false;
+		cam_rx[i].overwrite_drops = 0;
+		cam_rx[i].rearm_service_saves = 0;
+		cam_rx[i].next_retry_ms = 0;
 		init_camera(&cam_array[i]);
 	}
 
-	cam_array[1].pRecieveHistoBuffer = (uint8_t *)spi6_buffer;
+	/* Cam 1 (SPI6) pair lives in SRAM4 — BDMA reaches only D3. */
+	cam_array[1].pRxBuf[0] = (uint8_t *)spi6_buffer[0];
+	cam_array[1].pRxBuf[1] = (uint8_t *)spi6_buffer[1];
+	cam_array[1].pRecieveHistoBuffer = cam_array[1].pRxBuf[0];
+
+	/* #116: PendSV carries the deferred camera re-arm (camera_rearm_isr).
+	 * Above the FSIN/send tier so a stalled send can't block it; below the
+	 * camera RX tier so it tail-chains after the HAL RX ISR unwinds. */
+	HAL_NVIC_SetPriority(PendSV_IRQn, CAMERA_REARM_PENDSV_PRIORITY, 0);
 
 	event_bits = 0x00;
 	event_bits_enabled = 0x00;
@@ -523,7 +586,7 @@ uint8_t get_cameras_present(void) {
 uint8_t get_camera_status(uint8_t cam_id) {
 	uint8_t status_flags = 0x00;
 
-	if (cam_id < 0 || cam_id >= CAMERA_COUNT) {
+	if (cam_id >= CAMERA_COUNT) {
 		printf("Get Camera %d Status Failed\r\n", cam_id + 1);
 		return 0x00;
 	}
@@ -640,8 +703,10 @@ _Bool reset_camera(uint8_t cam_id)
     HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_SET);
     delay_ms(5);
 
+    /* CRESETB stays low: the FPGA is held in reset until the next program
+     * command's NVCM probe pulses and releases it. Nothing needs the 1 s
+     * wait that used to follow here (8 s for a full mask, #136). */
     HAL_GPIO_WritePin(cam->cresetb_port, cam->cresetb_pin, GPIO_PIN_RESET);
-    delay_ms(1000);
 
     cam->isConfigured = false;
     cam->isProgrammed = false;
@@ -898,6 +963,10 @@ uint32_t read_usercode_fpga(uint8_t cam_id)
 
 static void camera_recovery_complete(CameraDevice *cam);
 
+#if FPGA_HOST_UPLOAD
+/* Host-upload SRAM programming (OW_FPGA_BITSTREAM + OW_FPGA_PROG_SRAM
+ * reserved != 1): a bench tool for checking a bitstream before it is burned
+ * to NVCM. Debug builds only (#136, FPGA_HOST_UPLOAD in CMakeLists.txt). */
 _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint32_t Data_Len, _Bool force_update)
 {
 	printf("C%d: programming...", cam_id+1);
@@ -939,6 +1008,7 @@ _Bool program_sram_fpga(uint8_t cam_id, bool rom_bitstream, uint8_t* pData, uint
 	printf("done\r\n");
 	return true;
 }
+#endif /* FPGA_HOST_UPLOAD */
 
 /* A successful FPGA bring-up is the last firmware-owned step of death
  * recovery (the host's config + stream-enable commands follow on their
@@ -978,34 +1048,13 @@ _Bool program_fpga(uint8_t cam_id, _Bool force_update)
 		cam->isProgrammed = false;
 	}
 
-	if(TCA9548A_SelectChannel(&hi2c1, 0x70, cam->i2c_target) != HAL_OK)
-	{
-		printf("failed to select Camera %d channel\r\n", cam_id+1);
-		return false;
-	}
-
-	if(fpga_configure(cam->pI2c, cam->device_address, cam->cresetb_port, cam->cresetb_pin) == 1)
-	{
-		printf("Program FPGA Camera %d Failed\r\n", cam_id+1);
-
-		cam->isProgrammed = false;
-		return false;
-	} else {
-		cam->isProgrammed = true;
-		camera_recovery_complete(cam);
-	}
-
-	// If the selected camera is one that uses USART, 
-	// reset the USART to ensure it is in a known state
-	// !! This is required for the USART to work properly after FPGA programming !!
-	if(cam->useUsart)
-	{
-		cam->pUart->Instance->CR1 &= ~USART_CR1_UE; // Disable USART
-		cam->pUart->Instance->CR1 |= USART_CR1_UE;
-	}
-	// printf("done\r\n");
-
-	return true;
+	/* No NVCM boot: fail. The flash SRAM fallback that used to load a
+	 * bitstream from MCU flash here is gone (#136): it held the main loop for
+	 * ~10 s, and bootloader-slot images don't carry that bitstream. A camera
+	 * whose NVCM burn failed can't be used on this firmware. */
+	printf("C%d: FPGA did not boot from NVCM\r\n", cam_id+1);
+	cam->isProgrammed = false;
+	return false;
 }
 /* -------- END FPGA FUNCTIONS -------- */
 
@@ -1191,10 +1240,7 @@ static void poll_camera_temperatures(void)
         }
 
         // Restore the active camera's I2C channel
-        if (active_cam != NULL)
-        {
-            TCA9548A_SelectChannel(&hi2c1, 0x70, active_cam->i2c_target);
-        }
+        TCA9548A_SelectChannel(&hi2c1, 0x70, active_cam->i2c_target);
     }
 }
 
@@ -1375,7 +1421,9 @@ _Bool get_single_histogram(uint8_t cam_id, uint8_t* data, uint16_t* data_len)
     // Copy data into the provided buffer
     memcpy(data, cam->pRecieveHistoBuffer, cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
     *data_len = cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH;
-    event_bits = 0x00;
+    __disable_irq();
+    event_bits &= (uint8_t)~(1u << cam_id);
+    __enable_irq();
     return true;
 }
 
@@ -1400,7 +1448,11 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	GPIO_SetOutput(FSIN_GPIO_Port, FSIN_Pin, GPIO_PIN_RESET);
 	delay_ms(1);
 
-	memset((uint8_t*)cam->pRecieveHistoBuffer, 0, cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+	/* #116: clear the ARM-target half — that's where this capture will land.
+	 * (camera_rx_complete publishes it to pRecieveHistoBuffer on completion,
+	 * which is what get_single_histogram() reads.) */
+	memset(cam->pRxBuf[cam_rx[cam_id].armed_idx], 0,
+	       cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
 
 	start_data_reception(cam_id);
 
@@ -1417,7 +1469,7 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	 * within 5 s of its ~11.93 h wrap is unreachable → infinite loop (#73). */
 	uint32_t timeout = HAL_GetTick() + 5000;
 
-	while(!event_bits) {
+	while ((event_bits & (uint8_t)(1u << cam_id)) == 0u) {
 	    if ((int32_t)(HAL_GetTick() - timeout) >= 0) {
 	        printf("HISTO receive timeout!\r\n");
 	        if(cam->useUsart) {
@@ -1434,6 +1486,7 @@ _Bool capture_single_histogram(uint8_t cam_id)
 	    	ret = false;
 	        break;
 	    }
+	    watchdog_feed();  /* bounded by the 5 s timeout above (#136) */
 	    delay_ms(1);
 	}
 
@@ -1496,27 +1549,103 @@ static void check_camera_failures(void) {
 	}
 }
 
-/* #75: consume this frame's camera data WITHOUT sending it to the host.
- * Mirrors the event-bit consume + per-camera re-arm that send_histogram_data()
- * would have done (same masking rationale — see the comment there), so the
- * cameras/SPI pipeline keeps flowing and check_camera_failures() stays happy;
- * only the USB HISTO frame is withheld. Short-circuits BEFORE compression, so
- * the #70 cmp budget guard never runs on a suppressed frame. */
+/* #75: consume this frame's camera data WITHOUT sending it to the host, so
+ * the cameras/SPI pipeline keeps flowing and check_camera_failures() stays
+ * happy; only the USB HISTO frame is withheld. Short-circuits BEFORE
+ * compression, so the #70 cmp budget guard never runs on a suppressed frame.
+ * #116 moved re-arm to RX-complete via PendSV; send_data() has already
+ * consumed this packet's event bits before reaching this helper. */
 static _Bool histo_stall_suppress_frame(void) {
-	uint8_t ready_bits;
-	__disable_irq();
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
-		if ((ready_bits & (1u << cam_id)) != 0) {
-			start_data_reception(cam_id);
-		}
-	}
 	return true;  /* pretend success, like DEBUG_FLAG_HISTO_THROTTLE does */
 }
 
+static void histo_fault_read_raw_ids(uint8_t raw_frame_ids[CAMERA_COUNT]) {
+	for (uint8_t camera = 0u; camera < CAMERA_COUNT; ++camera) {
+		uint8_t *buffer = cam_array[camera].pRecieveHistoBuffer;
+		raw_frame_ids[camera] = (buffer == NULL) ? 0u :
+			buffer[HISTO_SIZE_32B * 4 - 1];
+	}
+}
+
+static void histo_fault_apply_frame_ids(uint8_t camera_mask) {
+	for (uint8_t camera = 0u; camera < CAMERA_COUNT; ++camera) {
+		if ((camera_mask & (uint8_t)(1u << camera)) == 0u) {
+			continue;
+		}
+		uint8_t *buffer = cam_array[camera].pRecieveHistoBuffer;
+		if (buffer != NULL) {
+			buffer[HISTO_SIZE_32B * 4 - 1] &= 0x3Fu;
+		}
+	}
+}
+
+static void histo_fault_prepare(uint32_t debug_flags) {
+	histo_packet_timestamp_ms = fsin_timestamp_ms;
+	histo_fault_plan = (histo_fault_plan_t){
+		.mode = histo_fault_injector.mode,
+		.captured_timestamp_ms = fsin_timestamp_ms,
+		.wire_timestamp_ms = fsin_timestamp_ms,
+	};
+	uint32_t requested_flags = debug_flags & DEBUG_FLAG_HIL_FAULT_MASK;
+	if (requested_flags != histo_fault_scan_flags) {
+		/* Never resume stale scheduler state if the request is cleared and then
+		 * reselected. A scan boundary is the only place that re-arms it. */
+		histo_fault_disarmed_for_scan = true;
+	}
+	bool active_mode =
+		histo_fault_injector.mode >= HISTO_FAULT_FID_SINGLE &&
+		histo_fault_injector.mode <= HISTO_FAULT_PACKET_DROP;
+	if (!active_mode || histo_fault_disarmed_for_scan ||
+			histo_packet_ready_bits == 0u) {
+		/* Normal/Release fast path. A mid-scan clear or mode change disarms
+		 * the latched plan for the rest of the scan. Calls with no ready packet
+		 * do not advance or consume a scheduled injection. */
+		return;
+	}
+
+	uint8_t raw_frame_ids[CAMERA_COUNT] = {0};
+	histo_fault_read_raw_ids(raw_frame_ids);
+	histo_fault_plan = histo_fault_injector_plan(
+		&histo_fault_injector, histo_packet_ready_bits, raw_frame_ids,
+		fsin_timestamp_ms);
+	histo_packet_timestamp_ms = histo_fault_plan.wire_timestamp_ms;
+
+	if (!histo_fault_plan.applied) {
+		return;
+	}
+	if (histo_fault_plan.corrupt_camera_mask != 0u) {
+		uint8_t first_camera = 0u;
+		while ((histo_fault_plan.corrupt_camera_mask &
+				(uint8_t)(1u << first_camera)) == 0u) {
+			++first_camera;
+		}
+		uint8_t raw = raw_frame_ids[first_camera];
+		histo_fault_apply_frame_ids(histo_fault_plan.corrupt_camera_mask);
+		printf("HIL INJECT: mode=%s frame=%lu timestamp_ms=%lu "
+		       "camera_mask=0x%02X raw=0x%02X->0x%02X\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms,
+		       histo_fault_plan.corrupt_camera_mask, raw,
+		       (unsigned)(raw & 0x3Fu));
+	} else if (histo_fault_plan.drop_packet) {
+		printf("HIL INJECT: mode=%s frame=%lu captured_timestamp_ms=%lu "
+		       "action=drop_packet\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms);
+	} else {
+		printf("HIL INJECT: mode=%s frame=%lu captured_timestamp_ms=%lu "
+		       "wire_timestamp_ms=%lu\r\n",
+		       histo_fault_mode_name(histo_fault_plan.mode),
+		       (unsigned long)histo_fault_plan.frame_index,
+		       (unsigned long)histo_fault_plan.captured_timestamp_ms,
+		       (unsigned long)histo_fault_plan.wire_timestamp_ms);
+	}
+}
+
 _Bool send_data(void) {
+	uint32_t dflags = logging_get_debug_flags();
 
 	// Take care of statistics
 	if(!streaming_active && event_bits_enabled != 0x00){
@@ -1524,8 +1653,13 @@ _Bool send_data(void) {
 		streaming_start_time = get_timestamp_ms();
 		streaming_active = true;
 		streaming_first_frame = true;
-		/* #68 instrumentation: zero per-camera overrun counts at scan start. */
-		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) { cam_overrun_count[ci] = 0; }
+		/* #68 instrumentation: zero per-camera overrun counts at scan start.
+		 * (#116: same for the buffer-exchange drop/retry counters.) */
+		for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) {
+			cam_overrun_count[ci] = 0;
+			cam_rx[ci].overwrite_drops = 0;
+			cam_rx[ci].rearm_service_saves = 0;
+		}
 		/* #70: zero the compression-guard counters at scan START (not stop, like
 		 * cmp_total_uncompressed/cmp_frame_count etc below) — these are part of
 		 * cam_diag_stats_t (OW_CMD_DIAG_STATS), and a host naturally queries
@@ -1542,6 +1676,26 @@ _Bool send_data(void) {
 		if ((logging_get_debug_flags() & DEBUG_FLAG_HISTO_STALL) != 0u) {
 			printf("DEBUG: histo stall armed, trips at frame %lu\r\n",
 			       (unsigned long)HISTO_STALL_TRIGGER_FRAMES);
+		}
+		histo_fault_injector_reset(&histo_fault_injector, dflags);
+		histo_fault_scan_flags = dflags & DEBUG_FLAG_HIL_FAULT_MASK;
+		histo_fault_disarmed_for_scan = false;
+		histo_fault_plan = (histo_fault_plan_t){0};
+		histo_packet_timestamp_ms = fsin_timestamp_ms;
+		histo_packet_ready_bits = 0u;
+		if (histo_fault_injector.mode == HISTO_FAULT_INVALID_SELECTION) {
+			printf("HIL INJECT refused: select exactly one fault flag "
+			       "(requested=0x%08lX)\r\n",
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		} else if (histo_fault_injector.mode == HISTO_FAULT_DISABLED_RELEASE) {
+			printf("HIL INJECT disabled: fault injection is unavailable in "
+			       "Release firmware (requested=0x%08lX)\r\n",
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
+		} else if (histo_fault_injector.mode != HISTO_FAULT_NONE) {
+			printf("HIL INJECT armed: mode=%s requested=0x%08lX "
+			       "reset=per_scan\r\n",
+			       histo_fault_mode_name(histo_fault_injector.mode),
+			       (unsigned long)(dflags & DEBUG_FLAG_HIL_FAULT_MASK));
 		}
 	}
 
@@ -1567,7 +1721,6 @@ _Bool send_data(void) {
 	check_camera_failures();
 	
 	bool success = false;
-	uint32_t dflags = logging_get_debug_flags();
 	/* #75: DEBUG_FLAG_HISTO_STALL — count frames; past the trigger point,
 	 * suppress the send entirely (all modes: fake, compressed, plain). This
 	 * runs at the common send entry, so it behaves identically whether
@@ -1584,7 +1737,32 @@ _Bool send_data(void) {
 			       (unsigned long)histo_stall_frame_count);
 		}
 	}
-	if (histo_stall_this_frame) {
+	/* Fake buffers must be stamped before planning so the logged raw ID is
+	 * exactly the byte that will go on the wire. Real camera DMA already did
+	 * this before setting event_bits. */
+	if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+		fill_frame_buffers();
+		histo_packet_ready_bits = event_bits_enabled;
+	} else {
+		/* Freeze one immutable view of this outgoing packet. Planning, buffer
+		 * mutation, send/drop, and DMA re-arm all use this same snapshot. */
+		/* Clear only the streaming cameras' flags. A one-shot capture
+		 * (capture_single_histogram / get_single_histogram) uses the same
+		 * flags for a camera that is not streaming; clearing them all here
+		 * made that capture fail whenever an FSIN source was running. */
+		__disable_irq();
+		histo_packet_ready_bits = event_bits & event_bits_enabled;
+		event_bits &= (uint8_t)~event_bits_enabled;
+		__enable_irq();
+	}
+	histo_fault_prepare(dflags);
+	if (histo_stall_this_frame || histo_fault_plan.drop_packet) {
+		if (histo_fault_plan.drop_packet &&
+				(dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
+			/* send_fake_data() normally advances this after USB send. Advance
+			 * the hidden packet too so the next visible fake ID has a gap. */
+			frame_id++;
+		}
 		success = histo_stall_suppress_frame();
 	} else if ((dflags & DEBUG_FLAG_FAKE_DATA) != 0u) {
 		success = send_fake_data();
@@ -1603,6 +1781,10 @@ _Bool send_data(void) {
 		total_frames_failed++;
 	}
 	return success;
+}
+
+bool camera_is_streaming(void){
+	return streaming_active;
 }
 
 _Bool check_streaming(void){
@@ -1638,6 +1820,26 @@ _Bool check_streaming(void){
 			       (unsigned long)cam_overrun_count[2], (unsigned long)cam_overrun_count[3],
 			       (unsigned long)cam_overrun_count[4], (unsigned long)cam_overrun_count[5],
 			       (unsigned long)cam_overrun_count[6], (unsigned long)cam_overrun_count[7]);
+			/* #116 instrumentation: frames dropped because the send path was
+			 * stalled mid-copy (camera survived — that's the fix working),
+			 * and re-arms rescued by the main-loop retry service. */
+			{
+				uint32_t drop_total = 0, save_total = 0;
+				for (uint8_t ci = 0; ci < CAMERA_COUNT; ci++) {
+					drop_total += cam_rx[ci].overwrite_drops;
+					save_total += cam_rx[ci].rearm_service_saves;
+				}
+				if (drop_total > 0) {
+					printf("[DIAG] rx stall-drops c1-c8: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+					       (unsigned long)cam_rx[0].overwrite_drops, (unsigned long)cam_rx[1].overwrite_drops,
+					       (unsigned long)cam_rx[2].overwrite_drops, (unsigned long)cam_rx[3].overwrite_drops,
+					       (unsigned long)cam_rx[4].overwrite_drops, (unsigned long)cam_rx[5].overwrite_drops,
+					       (unsigned long)cam_rx[6].overwrite_drops, (unsigned long)cam_rx[7].overwrite_drops);
+				}
+				if (save_total > 0) {
+					printf("[DIAG] rx rearm-service saves: %lu\r\n", (unsigned long)save_total);
+				}
+			}
 			/* #70 instrumentation: compression budget-guard fallback counts this scan. */
 			if (cmp_timeout_count > 0 || cmp_fail_count > 0) {
 				printf("[DIAG] cmp fallback: timeout=%lu overflow=%lu total=%lu\r\n",
@@ -1679,21 +1881,11 @@ _Bool check_streaming(void){
 _Bool send_histogram_data(void) {
 	_Bool status = true;
 	int offset = 0;
-	uint8_t ready_bits = 0;
+	uint8_t ready_bits = histo_packet_ready_bits;
 
 	if(event_bits_enabled == 0x00){
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled: a dead camera's aborted DMA can complete
-	 * on garbage clock edges while its regulator browns out, setting a stale
-	 * event bit. Unmasked, that bit would put its garbage buffer in the
-	 * frame AND re-arm reception below — re-wedging the peripheral in
-	 * BUSY_RX ("camera not READY" on the next scan, field-hit 2026-06-11). */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
@@ -1725,7 +1917,7 @@ _Bool send_histogram_data(void) {
     packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1738,12 +1930,23 @@ _Bool send_histogram_data(void) {
 	// --- Data ---
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
 		if((ready_bits & (0x01 << cam_id)) != 0) {
-			uint32_t *histo_ptr = (uint32_t *)cam_array[cam_id].pRecieveHistoBuffer;
+			/* #116: copy-announce protocol. Atomically snapshot the published
+			 * buffer index and announce the copy; camera_rx_complete() will
+			 * refuse to re-arm DMA into a buffer whose announcement is active
+			 * (it drops the incoming frame instead). The re-arm itself no
+			 * longer lives here — it runs at RX-complete via PendSV, so a
+			 * stall anywhere in this send path can no longer miss it. */
+			cam_rx_state_t *st = &cam_rx[cam_id];
+			__disable_irq();
+			uint8_t src_idx = st->done_idx;
+			st->copy_idx = src_idx;
+			__enable_irq();
 		    packet_buffer[offset++] = HISTO_SOH;
 			packet_buffer[offset++] = cam_id;
-			memcpy(packet_buffer+offset,histo_ptr,HISTO_SIZE_32B*4);
+			memcpy(packet_buffer+offset, cam_array[cam_id].pRxBuf[src_idx], HISTO_SIZE_32B*4);
 			offset += HISTO_SIZE_32B*4;
-			
+			st->copy_idx = CAM_BUF_NONE;
+
 			uint32_t temp_bits;
 			memcpy(&temp_bits, (uint8_t*)&cam_temp[cam_id],4);
 
@@ -1753,9 +1956,6 @@ _Bool send_histogram_data(void) {
 			packet_buffer[offset++] = (uint8_t)((temp_bits >> 24) & 0xFF);
 
 			packet_buffer[offset++] = HISTO_EOH;
-			
-			// Re-arm reception as soon as data is copied
-			start_data_reception(cam_id);
 		}
 	}
 
@@ -1890,18 +2090,11 @@ static _Bool send_uncompressed_histo(const uint8_t *payload, int payload_len) {
 _Bool send_histogram_data_cmp(void) {
 	_Bool status = true;
 	int p_off = 0;   /* offset into uncmp_payload (uncompressed staging) */
-	uint8_t ready_bits = 0;
+	uint8_t ready_bits = histo_packet_ready_bits;
 
 	if (event_bits_enabled == 0x00) {
 		return true;
 	}
-	__disable_irq();
-	/* Mask by event_bits_enabled — same rationale as send_histogram_data():
-	 * never include or re-arm a camera the stall detector disabled. */
-	ready_bits = event_bits & event_bits_enabled;
-	event_bits = 0x00;
-	__enable_irq();
-
 	uint8_t count = 0;
 	bool skip_no_data_log = streaming_first_frame;
 	streaming_first_frame = false;
@@ -1921,7 +2114,7 @@ _Bool send_histogram_data_cmp(void) {
 	/* --- Build uncompressed payload into uncmp_payload --- */
 
 	/* Timestamp (4 bytes) */
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	uncmp_payload[p_off++] = (uint8_t)(timestamp & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	uncmp_payload[p_off++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -1930,11 +2123,17 @@ _Bool send_histogram_data_cmp(void) {
 	/* Per-camera data blocks */
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
 		if ((ready_bits & (0x01 << cam_id)) != 0) {
-			uint32_t *histo_ptr = (uint32_t *)cam_array[cam_id].pRecieveHistoBuffer;
+			/* #116: copy-announce protocol — see send_histogram_data(). */
+			cam_rx_state_t *st = &cam_rx[cam_id];
+			__disable_irq();
+			uint8_t src_idx = st->done_idx;
+			st->copy_idx = src_idx;
+			__enable_irq();
 			uncmp_payload[p_off++] = HISTO_SOH;
 			uncmp_payload[p_off++] = cam_id;
-			memcpy(uncmp_payload + p_off, histo_ptr, HISTO_SIZE_32B * 4);
+			memcpy(uncmp_payload + p_off, cam_array[cam_id].pRxBuf[src_idx], HISTO_SIZE_32B * 4);
 			p_off += HISTO_SIZE_32B * 4;
+			st->copy_idx = CAM_BUF_NONE;
 
 			uint32_t temp_bits;
 			memcpy(&temp_bits, (uint8_t *)&cam_temp[cam_id], 4);
@@ -1944,9 +2143,6 @@ _Bool send_histogram_data_cmp(void) {
 			uncmp_payload[p_off++] = (uint8_t)((temp_bits >> 24) & 0xFF);
 
 			uncmp_payload[p_off++] = HISTO_EOH;
-
-			/* Re-arm reception as soon as data is copied */
-			start_data_reception(cam_id);
 		}
 	}
 
@@ -2045,8 +2241,8 @@ _Bool send_histogram_data_cmp(void) {
 }
 
 _Bool send_fake_data(void) {
-
-	fill_frame_buffers();
+	/* send_data() fills and fault-mutates the fake buffers before dispatch so
+	 * the scheduler sees and logs the exact outgoing frame IDs. */
 
 	_Bool status = true;
 	int offset = 0;
@@ -2075,7 +2271,7 @@ _Bool send_fake_data(void) {
 	packet_buffer[offset++] = (uint8_t)((total_size >> 24) & 0xFF);
 	
 	// --- Timestamp ---
-	uint32_t timestamp = fsin_timestamp_ms;  /* #68: stamped at FSIN, not at (possibly deferred) send time */
+	uint32_t timestamp = histo_packet_timestamp_ms;
 	packet_buffer[offset++] = (uint8_t)(timestamp & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 8) & 0xFF);
 	packet_buffer[offset++] = (uint8_t)((timestamp >> 16) & 0xFF);
@@ -2084,7 +2280,7 @@ _Bool send_fake_data(void) {
 	// --- Data --- (iterate over all cameras so payload length matches header)
 	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; ++cam_id) {
 		if((event_bits_enabled & (0x01 << cam_id)) != 0) {
-			uint32_t *histo_ptr = (uint32_t *) cam_array[cam_id].pRecieveHistoBuffer;
+			const uint32_t *histo_ptr = (const uint32_t *) cam_array[cam_id].pRecieveHistoBuffer;
 			packet_buffer[offset++] = HISTO_SOH;
 			packet_buffer[offset++] = cam_id;
 			memcpy(packet_buffer+offset,histo_ptr,HISTO_SIZE_32B*4);
@@ -2136,6 +2332,9 @@ _Bool start_data_reception(uint8_t cam_id){
 	}
 
 	CameraDevice cam = cam_array[cam_id];
+	/* #116: DMA always fills the armed slot of the double buffer; the send
+	 * path reads the done slot. camera_rx_complete() swaps the two. */
+	uint8_t *rx_target = cam.pRxBuf[cam_rx[cam_id].armed_idx];
 
     // Check if the device is BUSY
     if (cam.useUsart) {
@@ -2155,36 +2354,27 @@ _Bool start_data_reception(uint8_t cam_id){
 	if (cam.useUsart) {
 		if (cam.useDma) {
 			status = HAL_USART_Receive_DMA(cam.pUart,
-					cam.pRecieveHistoBuffer, USART_PACKET_LENGTH);
+					rx_target, USART_PACKET_LENGTH);
 		} else {
 			status = HAL_USART_Receive_IT(cam.pUart,
-					cam.pRecieveHistoBuffer, USART_PACKET_LENGTH);
+					rx_target, USART_PACKET_LENGTH);
 		}
 	} else {
 		if (cam.useDma) {
 			status = HAL_SPI_Receive_DMA(cam.pSpi,
-					cam.pRecieveHistoBuffer, SPI_PACKET_LENGTH);
+					rx_target, SPI_PACKET_LENGTH);
 		} else {
 			status = HAL_SPI_Receive_IT(cam.pSpi,
-					cam.pRecieveHistoBuffer, SPI_PACKET_LENGTH);
+					rx_target, SPI_PACKET_LENGTH);
 		}
 	}
 	if (status != HAL_OK) {
+		/* #116: no abort_data_reception() here anymore — it busy-waits 10 ms,
+		 * and this function now also runs in ISR context (PendSV re-arm).
+		 * A failed arm is no longer terminal either way: the caller flags
+		 * rearm_needed and camera_rearm_service() retries with abort+backoff
+		 * from the main loop until it sticks. */
 		printf("failed to setup receive for Camera %d channel\r\n", cam_id+1);
-		// Check if the device is BUSY
-		if (cam.useUsart) {
-			if (cam.pUart->State == HAL_USART_STATE_BUSY_RX ||
-				cam.pUart->State == HAL_USART_STATE_BUSY_TX_RX) {
-					printf("USART busy\r\n");
-				}
-		} else {
-			if (cam.pSpi->State == HAL_SPI_STATE_BUSY_RX ||
-				cam.pSpi->State == HAL_SPI_STATE_BUSY_TX_RX) {
-				printf("SPI busy\r\n");
-			}
-		}
-		
-		abort_data_reception(cam_id);
 		return false;
 	}
 	if(verbose_on) { printf("done\r\n"); }
@@ -2236,6 +2426,142 @@ _Bool abort_data_reception(uint8_t cam_id){
 	if(verbose_on) { printf("done\r\n"); }
 	return true;
 }
+
+/* ---------------- #116: RX decoupling — buffer exchange + re-arm ---------------- */
+
+/* Retry-service backoff: one frame period. Fast enough that a healthy retry
+ * beats check_camera_failures()' 3-frame stall threshold, slow enough not to
+ * spam abort_data_reception()'s 10 ms settle wait. */
+#define CAMERA_REARM_RETRY_MS 25u
+
+/* Camera RX-complete, called from the DMA/SPI RX ISRs in main.c (prio
+ * CAMERA_RX_IRQ_PRIORITY). Publishes the buffer that just filled and swaps
+ * the DMA target — UNLESS the send path is still mid-copy of the other
+ * buffer (a stall longer than one frame period), in which case the frame
+ * just received is dropped and DMA re-fills the same buffer. Never re-arms
+ * into a buffer the copier owns: the alternative is a torn frame that still
+ * passes CRC (the CRC is computed over whatever bytes were copied), i.e.
+ * silent corruption. A stall costs frames, never a camera, never integrity.
+ *
+ * The actual (re)arm is deferred to PendSV: the H7 HAL calls this callback
+ * BEFORE setting the peripheral state back to READY, so arming here would be
+ * refused as BUSY. PendSV tail-chains after the HAL ISR unwinds, and its
+ * priority still preempts the FSIN/send tier — a stalled send cannot delay
+ * the re-arm (that coupling is the whole bug, see #116). */
+void camera_rx_complete(uint8_t cam_id)
+{
+	if (cam_id >= CAMERA_COUNT) {
+		return;
+	}
+	cam_rx_state_t *st = &cam_rx[cam_id];
+	uint8_t filled = st->armed_idx;
+	uint8_t other  = (uint8_t)(filled ^ 1u);
+
+	if (st->copy_idx == other) {
+		/* Consumer stalled mid-copy of the previous frame: drop the frame
+		 * that just landed, keep DMA on the same buffer, publish nothing. */
+		st->overwrite_drops++;
+	} else {
+		st->done_idx = filled;
+		cam_array[cam_id].pRecieveHistoBuffer = cam_array[cam_id].pRxBuf[filled];
+		__disable_irq();
+		event_bits |= (uint8_t)(1u << cam_id);
+		__enable_irq();
+		st->armed_idx = other;
+	}
+
+	/* Re-arm only cameras armed for streaming. Single-capture and disabled/
+	 * stall-detector-disabled cameras must NOT auto-re-arm — a dead camera's
+	 * garbage completion re-arming itself is the 2026-06-11 BUSY_RX wedge. */
+	if ((event_bits_enabled & (1u << cam_id)) != 0u) {
+		st->rearm_needed = true;
+		camera_pend_rearm();
+	}
+}
+
+/* PendSV body (see PendSV_Handler in stm32h7xx_it.c): perform every pending
+ * re-arm now that the HAL RX ISR has unwound and the peripheral is READY.
+ * On failure the flag stays set and camera_rearm_service() takes over. */
+void camera_rearm_isr(void)
+{
+	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+		cam_rx_state_t *st = &cam_rx[cam_id];
+		if (!st->rearm_needed) {
+			continue;
+		}
+		if ((event_bits_enabled & (1u << cam_id)) == 0u ||
+		    cam_array[cam_id].needs_recovery || !cam_array[cam_id].isPowered) {
+			st->rearm_needed = false;  /* camera left the streaming set */
+			continue;
+		}
+		st->rearm_needed = false;      /* claim before arming (see service) */
+		if (!start_data_reception(cam_id)) {
+			st->rearm_needed = true;   /* hand off to the main-loop retry service */
+			st->next_retry_ms = HAL_GetTick() + CAMERA_REARM_RETRY_MS;
+		}
+	}
+}
+
+/* Error-callback path (HAL_USART/SPI_ErrorCallback in main.c). Replaces the
+ * old in-ISR abort_data_reception()+start_data_reception() one-shot, which
+ * (a) busy-waited 10 ms inside an ISR and (b) was terminal on failure —
+ * after it, every re-arm site was gated on an event bit the camera could
+ * never set again. Now: flag + pend. PendSV usually re-arms within
+ * microseconds (the HAL has already ended the transfer, state READY); if
+ * that fails, the retry service aborts and re-arms until it sticks. */
+void camera_rx_error_recover(uint8_t cam_id)
+{
+	if (cam_id >= CAMERA_COUNT) {
+		return;
+	}
+	if ((event_bits_enabled & (1u << cam_id)) == 0u) {
+		return;  /* not streaming: enable/single-capture paths do their own arming */
+	}
+	cam_rx[cam_id].rearm_needed = true;
+	camera_pend_rearm();
+}
+
+/* Main-loop retry backstop: any arm that failed in PendSV lands here and is
+ * retried — abort (forces the peripheral out of a stuck BUSY/error state,
+ * incl. its 10 ms settle, acceptable in thread context) then arm — every
+ * CAMERA_REARM_RETRY_MS until it succeeds or the camera leaves the
+ * streaming set. Claim protocol vs PendSV: both clear-then-arm, and this
+ * side's claim is IRQ-protected, so a camera is never double-armed. */
+void camera_rearm_service(void)
+{
+	for (uint8_t cam_id = 0; cam_id < CAMERA_COUNT; cam_id++) {
+		cam_rx_state_t *st = &cam_rx[cam_id];
+		if (!st->rearm_needed) {
+			continue;
+		}
+		if ((event_bits_enabled & (1u << cam_id)) == 0u ||
+		    cam_array[cam_id].needs_recovery || !cam_array[cam_id].isPowered) {
+			st->rearm_needed = false;
+			continue;
+		}
+		if ((int32_t)(HAL_GetTick() - st->next_retry_ms) < 0) {
+			continue;  /* backoff (wrap-safe compare) */
+		}
+		__disable_irq();
+		if (!st->rearm_needed) {  /* PendSV claimed it meanwhile */
+			__enable_irq();
+			continue;
+		}
+		st->rearm_needed = false;
+		__enable_irq();
+
+		(void)abort_data_reception(cam_id);
+		if (start_data_reception(cam_id)) {
+			st->rearm_service_saves++;
+			printf("Camera %d: RX re-armed by retry service\r\n", cam_id + 1);
+		} else {
+			st->rearm_needed = true;
+			st->next_retry_ms = HAL_GetTick() + CAMERA_REARM_RETRY_MS;
+		}
+	}
+}
+
+/* ---------------- end #116 RX decoupling ---------------- */
 
 _Bool enable_camera_stream(uint8_t cam_id){
 	// printf("C%d: enable...", cam_id+1);
@@ -2290,7 +2616,16 @@ _Bool enable_camera_stream(uint8_t cam_id){
 	event_bits &= ~(1u << cam_id);
 	__enable_irq();
 
-	/* Flush this camera's receive buffer before arming DMA. The FPGA is
+	/* #116: fresh buffer-exchange state for the new scan. Safe to reset here:
+	 * this camera has no armed DMA (reset_camera_usart above forced READY)
+	 * and its enabled bit is still clear, so no RX/PendSV activity races us. */
+	cam_rx[cam_id].armed_idx = 0;
+	cam_rx[cam_id].done_idx = 0;
+	cam_rx[cam_id].copy_idx = CAM_BUF_NONE;
+	cam_rx[cam_id].rearm_needed = false;
+	cam_rx[cam_id].next_retry_ms = 0;
+
+	/* Flush this camera's receive buffers before arming DMA. The FPGA is
 	 * re-programmed at every scan start (its frame counter resets to 1), but
 	 * the MCU's frame_buffer/spi6_buffer still holds the PREVIOUS scan's last
 	 * DMA'd frame — old FPGA frame_id and timestamp. If a send fires before
@@ -2298,11 +2633,15 @@ _Bool enable_camera_stream(uint8_t cam_id){
 	 * desyncing the host's frame-id unwrap and dark schedule (issue #172:
 	 * left-sensor "stale 255/173 with negative timestamps at scan start").
 	 * Zeroing it makes any premature send an obvious empty frame, not stale
-	 * data. capture_single_histogram() clears the buffer the same way. */
-	if (cam->pRecieveHistoBuffer != NULL) {
-		memset((uint8_t *)cam->pRecieveHistoBuffer, 0,
-			cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+	 * data. capture_single_histogram() clears the buffer the same way.
+	 * (#116: both halves of the double buffer.) */
+	for (uint8_t half = 0; half < 2u; half++) {
+		if (cam->pRxBuf[half] != NULL) {
+			memset(cam->pRxBuf[half], 0,
+				cam->useUsart ? USART_PACKET_LENGTH : SPI_PACKET_LENGTH);
+		}
 	}
+	cam->pRecieveHistoBuffer = cam->pRxBuf[0];
 
 	/* Arm DMA BEFORE stream_on so the receiver is ready when the sensor
 	 * starts clocking data.  Arming after stream_on causes an immediate SPI
@@ -2373,6 +2712,9 @@ _Bool disable_camera_stream(uint8_t cam_id){
 	}
 
 	event_bits_enabled &= ~(1 << cam_id);
+	/* #116: withdraw any pending re-arm — the eligibility gates in
+	 * camera_rearm_isr/service would drop it anyway; this is just hygiene. */
+	cam_rx[cam_id].rearm_needed = false;
 
 	cam->streaming_enabled = false;
 	HAL_GPIO_WritePin(cam->gpio1_port, cam->gpio1_pin, GPIO_PIN_RESET); // Set GPIO1 low
@@ -2388,7 +2730,7 @@ _Bool disable_camera_stream(uint8_t cam_id){
 
 /* -------- BEGIN CAMERA POWER TOGGLE FUNCTIONS -------- */
 _Bool enable_camera_power(uint8_t cam_id){
-	if(cam_id < 0 || cam_id >= CAMERA_COUNT)
+	if(cam_id >= CAMERA_COUNT)
 	{
 		printf("Enable Power for Camera %d Failed\r\n", cam_id+1);
 		return false;
@@ -2424,7 +2766,7 @@ _Bool enable_camera_power(uint8_t cam_id){
 }
 
 _Bool disable_camera_power(uint8_t cam_id){
-	if(cam_id < 0 || cam_id >= CAMERA_COUNT)
+	if(cam_id >= CAMERA_COUNT)
 	{
 		printf("Disable Power for Camera %d Failed\r\n", cam_id+1);
 		return false;
@@ -2458,7 +2800,7 @@ _Bool get_camera_power_status(uint8_t cam_id){
 		return false;
 	}
 
-	CameraDevice *cam = get_camera_byID(cam_id);
+	const CameraDevice *cam = get_camera_byID(cam_id);
 	return cam->isPowered;
 }
 

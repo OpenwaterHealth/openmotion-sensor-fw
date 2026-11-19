@@ -40,7 +40,7 @@ static volatile uint8_t histo_queue_count = 0;
 static USBD_HandleTypeDef *histo_pdev = NULL;
 
 /* Private function prototypes */
-static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length);
+static uint8_t histo_queue_enqueue(const uint8_t *data, uint16_t length);
 static uint8_t histo_queue_dequeue(uint8_t **data, uint16_t *length);
 static uint8_t histo_queue_is_empty(void);
 static uint8_t histo_queue_is_full(void);
@@ -249,7 +249,7 @@ static uint8_t histo_queue_is_full(void)
   return (histo_queue_count >= HISTO_QUEUE_SIZE);
 }
 
-static uint8_t histo_queue_enqueue(uint8_t *data, uint16_t length)
+static uint8_t histo_queue_enqueue(const uint8_t *data, uint16_t length)
 {
   if (histo_queue_is_full() != 0) {
     printf("HISTO enqueue fail: queue full (count=%u size=%u enq=%lu deq=%lu datain=%lu txfail=%lu)\r\n",
@@ -337,6 +337,7 @@ static uint8_t histo_process_queue(void)
   return USBD_HISTO_SetTxBuffer(histo_pdev, data, length);
 }
 
+// cppcheck-suppress constParameterCallback ; USBD_ClassTypeDef.Setup signature is fixed by the ST USB core
 static uint8_t USBD_Histo_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
 {
   // Ignore everything, don't stall
@@ -391,7 +392,7 @@ static uint8_t USBD_Histo_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 /* Last timestamp when a histogram packet was actually sent (for DEBUG_FLAG_HISTO_THROTTLE) */
 static uint32_t histo_last_send_ms = 0;
 
-uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t len, uint8_t ep_idx)
+uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, const uint8_t *data, uint16_t len, uint8_t ep_idx)
 {
   UNUSED(ep_idx);
   
@@ -468,7 +469,7 @@ uint8_t USBD_HISTO_SendData(USBD_HandleTypeDef *pdev, uint8_t *data, uint16_t le
  * cameras, so frame 1 of the new scan is the first packet the host sees.
  * Touches state shared with the frame ISR (USBD_HISTO_SendData) and the
  * USB ISR (USBD_Histo_DataIn), so it runs in a critical section. */
-void USBD_HISTO_FlushQueue(const char *who)
+void USBD_HISTO_FlushQueue(USBD_HISTO_FlushReason reason)
 {
   uint32_t primask = __get_PRIMASK();
   __disable_irq();
@@ -499,7 +500,10 @@ void USBD_HISTO_FlushQueue(const char *who)
    *   ep = a transfer was still in flight
    *   e-d= enq-deq; this should EQUAL q. If e-d != q the count was corrupted by
    *        a cross-ISR race; if e-d == q > 0 the scan honestly left frames unsent. */
-  printf("HISTO flush(%s): q=%u ep=%u e-d=%ld\r\n", who, pending, inflight, gap);
+  printf("HISTO flush(%s): q=%u ep=%u e-d=%ld\r\n",
+         (reason == HISTO_FLUSH_SCAN_START) ? "start" :
+         (reason == HISTO_FLUSH_SCAN_STOP) ? "stop" : "txstuck",
+         pending, inflight, gap);
 }
 
 /* Stuck-TX watchdog. A multi-packet histogram transfer is chained by the
@@ -541,10 +545,10 @@ void USBD_HISTO_CheckTxStuck(void)
   /* FlushQueue clears histo_ep_data/tx bookkeeping under a critical
    * section and prints its own one-line diagnostic, so the endpoint is
    * usable again as soon as this returns. */
-  USBD_HISTO_FlushQueue("txstuck");
+  USBD_HISTO_FlushQueue(HISTO_FLUSH_TX_STUCK);
 }
 
-uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, uint8_t  *pbuff, uint16_t length)
+uint8_t  USBD_HISTO_SetTxBuffer(USBD_HandleTypeDef *pdev, const uint8_t  *pbuff, uint16_t length)
 {
 	uint8_t ret = USBD_OK;
 

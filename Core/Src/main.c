@@ -122,8 +122,11 @@ DMA_HandleTypeDef hdma_memtomem_dma2_stream1;
 
 uint8_t rxBuffer[COMMAND_MAX_SIZE]  __attribute__((aligned(4)));
 uint8_t txBuffer[COMMAND_MAX_SIZE];
+#if FPGA_HOST_UPLOAD
+/* Host-uploaded camera bitstream (Debug builds only, #136). */
 uint32_t bitstream_len;
 __attribute__((section(".RAM_D1"))) uint8_t bitstream_buffer[MAX_BITSTREAM_SIZE]; // 160KB buffer
+#endif
 
 volatile uint8_t event_bits = 0x00;         // holds the event bits to be flipped
 volatile uint8_t event_bits_enabled = 0x00; // holds the event bits for the cameras to be enabled
@@ -195,6 +198,30 @@ static void imu_service(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/*
+ * IWDG1 has a 250 ms window (MX_IWDG1_Init, #136). The main loop feeds it once
+ * per pass, so any single fixed wait or bounded hardware operation that can
+ * run longer than that has to feed it as it goes: delay_ms_fed() cuts a wait
+ * into slices with a refresh between them. Only bounded waits may feed; a
+ * loop that can spin forever must not, or it would hide the hang the watchdog
+ * is there to catch.
+ */
+void watchdog_feed(void)
+{
+  HAL_IWDG_Refresh(&hiwdg1);
+}
+
+void delay_ms_fed(uint32_t ms)
+{
+  while (ms > 0U) {
+    uint32_t slice = (ms > 50U) ? 50U : ms;
+    HAL_IWDG_Refresh(&hiwdg1);
+    delay_ms(slice);
+    ms -= slice;
+  }
+  HAL_IWDG_Refresh(&hiwdg1);
+}
+
 /*
  * Clear the custom secure bootloader's failsafe boot counter (RTC->BKP6R).
  * The bootloader increments BKP6R on every launch attempt; after
@@ -294,7 +321,7 @@ static void PrintI2CSpeed(I2C_HandleTypeDef *hi2c)
   uint32_t scl_freq = i2c_clk_freq / ((presc + 1) * (scll + 1 + sclh + 1));
 
   // Print I2C speed
-  printf("I2C Speed: %ld Hz\r\n", scl_freq); // Print the I2C speed in kHz
+  printf("I2C Speed: %lu Hz\r\n", scl_freq); // Print the I2C speed in kHz
 }
 
 /* USER CODE END 0 */
@@ -358,6 +385,29 @@ int main(void)
   MX_IWDG1_Init();
   MX_RAMECC_Init();
   /* USER CODE BEGIN 2 */
+#if DEBUG_ENABLED
+  /* Stop IWDG1 while the core is halted by a debugger. With the 250 ms window
+   * (#136) a breakpoint would otherwise reset the module almost at once. */
+  __HAL_DBGMCU_FREEZE_IWDG1();
+#endif
+#if (DEBUG_ENABLED == 0) && !defined(BARE_METAL_BUILD)
+  /* Debug port stays closed (PTR-2026-1-5 CON-02, CVE-1191). The secure bootloader
+   * reconfigures PA13/PA14 (SWDIO/SWCLK) as plain inputs before launching us (DAP
+   * lock). Nothing in this application uses PA13/PA14, but assert the state here
+   * too so that a bootloader without the lock, or a future GPIO change, can never
+   * leave the probe interface live on a Release unit. Analog mode: no input
+   * buffer, no pull, lowest leakage. Debug builds keep SWD for development;
+   * bare-metal builds have no bootloader in front of them and are not fielded.
+   * Same change as openmotion-console-fw (ECO secure-boot 1.2.0, section 4). */
+  {
+    GPIO_InitTypeDef swd = {0};
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    swd.Pin  = GPIO_PIN_13 | GPIO_PIN_14;
+    swd.Mode = GPIO_MODE_ANALOG;
+    swd.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &swd);
+  }
+#endif
   
   if (HAL_TIM_Base_Start(&htim5) != HAL_OK)
   {
@@ -376,7 +426,7 @@ int main(void)
 
   printf("\033c");
   fflush(stdout);
-  delay_ms(500);
+  delay_ms_fed(500);
   printf("Openwater open-MOTION Aggregator\r\n\r\n");
   printf("FW: %s (%s)\r\nDate: %s\r\n",
        FW_VERSION_STRING,
@@ -409,19 +459,21 @@ int main(void)
   // test i2c
   PrintI2CSpeed(&hi2c1);
   // I2C_scan(&hi2c1, NULL, 0, true);
-  delay_ms(100);
+  delay_ms_fed(100);
   X02C1B_FSIN_EXT_disable();
   GPIO_SetOutput(FSIN_EN_GPIO_Port, FSIN_EN_Pin, GPIO_PIN_RESET); // disable fsin output
 
   if (ICM_WHOAMI() == ICM20948_EXPECTED_ID)
   {
+	/* ICM_Init() carries ~185 ms of fixed waits: feed right before it. */
+	watchdog_feed();
 	if(ICM_Init() != HAL_OK){
 		printf("Failed to initialize IMU\r\n\n");
 	}
 	else
 	{
 		printf("IMU detected\r\n");
-	    delay_ms(100);
+	    delay_ms_fed(100);
 	    if(verbose_on) ICM_DumpRegisters();
 	}
   }
@@ -430,7 +482,7 @@ int main(void)
     printf("IMU NOT detected\r\n\n");
   }
 
-  delay_ms(10);
+  delay_ms_fed(10);
 
   HAL_GPIO_WritePin(USB_RESET_GPIO_Port, USB_RESET_Pin, GPIO_PIN_SET);
 
@@ -447,9 +499,9 @@ int main(void)
   // Select default camera
   TCA9548A_SelectChannel(&hi2c1, 0x70, get_active_cam()->i2c_target);
 
-  delay_ms(250);
+  delay_ms_fed(250);
   MX_USB_DEVICE_Init();
-  delay_ms(1000);
+  delay_ms_fed(1000);
   //GPIO_SetHiZ(GPIOA, GPIO_PIN_2);
 
   comms_host_start();
@@ -472,6 +524,7 @@ int main(void)
   	comms_host_check_received(); // check comms
     imu_service();           /* Sample the ICM if the 200 Hz timer ticked */
     camera_i2c_service();    /* Camera-bus work deferred from the frame ISRs (temp poll, mux disables) */
+    camera_rearm_service();  /* #116: retry any camera RX arm that failed in PendSV (abort+backoff) */
     logging_pump();          /* Flush USB log data buffered from ISR context */
     check_streaming();
     USBD_HISTO_CheckTxStuck(); /* Recover the HISTO EP if an armed transfer stalls (dead host reader) */
@@ -663,12 +716,14 @@ static void MX_IWDG1_Init(void)
   /* USER CODE END IWDG1_Init 0 */
 
   /* USER CODE BEGIN IWDG1_Init 1 */
-
+  /* 250 ms window (#136): LSI 32 kHz / 64 = 500 Hz, reload 124 -> 125 ticks.
+   * The LSI is specified at 29.76-33.6 kHz, so the real window is 238-269 ms.
+   * Every main-loop iteration has to finish inside the short end of that. */
   /* USER CODE END IWDG1_Init 1 */
   hiwdg1.Instance = IWDG1;
-  hiwdg1.Init.Prescaler = IWDG_PRESCALER_128;
+  hiwdg1.Init.Prescaler = IWDG_PRESCALER_64;
   hiwdg1.Init.Window = 4095;
-  hiwdg1.Init.Reload = 4095;
+  hiwdg1.Init.Reload = 124;
   if (HAL_IWDG_Init(&hiwdg1) != HAL_OK)
   {
     Error_Handler();
@@ -1634,6 +1689,9 @@ static void MX_DMA_Init(void)
   }
 
   /* DMA interrupt init */
+  /* #116: DMA1_Stream2-7 + DMA2_Stream0 carry camera RX completions (SPI2/3/4
+   * RX, USART2/1/3/6 RX) — CAMERA_RX_IRQ_PRIORITY tier, see common.h.
+   * DMA1_Stream0/1 are UART4 logging RX/TX and stay at 0 (short ISRs). */
   /* DMA1_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
@@ -1641,25 +1699,25 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA1_Stream2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
   /* DMA1_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
   /* DMA1_Stream4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
   /* DMA1_Stream5_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
   /* DMA1_Stream6_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
   /* DMA1_Stream7_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, CAMERA_RX_IRQ_PRIORITY, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -1788,6 +1846,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 }
@@ -1872,11 +1931,14 @@ void HAL_USART_ErrorCallback(USART_HandleTypeDef *husart)
   /* Attempt graceful recovery for any known camera USART peripheral.
    * Same fix as HAL_SPI_ErrorCallback: non-overrun errors (framing, noise,
    * DMA) previously fell through to Error_Handler() and halted the MCU.
-   * Any error on a known camera USART is recoverable via abort+restart. */
+   * #116: recovery is now flag + PendSV re-arm instead of an in-ISR
+   * abort_data_reception() (which busy-waited 10 ms in ISR context) +
+   * one-shot start (which was terminal on failure). If the PendSV arm
+   * fails, camera_rearm_service() retries from the main loop until it
+   * sticks — a failed re-arm is no longer permanent. */
   if (cam_id >= 0)
   {
-    abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    camera_rx_error_recover((uint8_t)cam_id);
     return;
   }
 
@@ -1980,11 +2042,11 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
    *   Error_Handler() entered from interrupt context →
    *   wait_for_usb_queues_to_finish() blocks (USB ISR can't run) →
    *   __disable_irq() → MCU completely dark.
-   * Now any error on a known camera SPI triggers abort+restart instead. */
+   * #116: recovery is now flag + PendSV re-arm with a main-loop retry
+   * backstop — see the USART error callback above for the rationale. */
   if (cam_id >= 0)
   {
-    abort_data_reception((uint8_t)cam_id);
-    start_data_reception((uint8_t)cam_id);
+    camera_rx_error_recover((uint8_t)cam_id);
     return;
   }
 
@@ -1993,54 +2055,56 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 }
 
 
-void set_event_bit_atomic(uint32_t bit) {
-  __disable_irq();
-  event_bits |= bit;
-  __enable_irq();
-}
+/* #116: RX completions run the buffer-exchange protocol in camera_manager.c
+ * (publish the filled half, swap the DMA target, pend the PendSV re-arm)
+ * instead of just setting an event bit and leaving the re-arm to the send
+ * path. Instance -> cam_id mapping matches the old BIT_n assignments. */
 
 // Interrupt handler for SPI reception
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
   if (hspi->Instance == SPI2)
   {
-    set_event_bit_atomic(BIT_6);
+    camera_rx_complete(6);
   }
   else if (hspi->Instance == SPI3)
   {
-    set_event_bit_atomic(BIT_5);
+    camera_rx_complete(5);
   }
   else if (hspi->Instance == SPI4)
   {
-    set_event_bit_atomic(BIT_7);
+    camera_rx_complete(7);
   }
   else if (hspi->Instance == SPI6)
   {
-    set_event_bit_atomic(BIT_1);
+    camera_rx_complete(1);
   }
 }
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_USART_RxCpltCallback(USART_HandleTypeDef *husart)
 {
   if (husart->Instance == USART1)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_4);
+  {
+    camera_rx_complete(4);
   }
   else if (husart->Instance == USART2)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_0);
+  {
+    camera_rx_complete(0);
   }
   else if (husart->Instance == USART3)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_2);
+  {
+    camera_rx_complete(2);
   }
   else if (husart->Instance == USART6)
-  { // Check if the interrupt is for USART2
-    set_event_bit_atomic(BIT_3);
+  {
+    camera_rx_complete(3);
   }
 
 }
 
+// cppcheck-suppress constParameterPointer ; HAL weak callback signature is fixed by the STM32 HAL
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM4) // Call data sender (internal FSIN))
@@ -2277,8 +2341,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     HAL_RNG_DeInit(&hrng);
     HAL_CRC_DeInit(&hcrc);
     
+    /* Record the reason before the wait: the wait runs in this ISR, where
+     * nothing else feeds IWDG1, and a mark left until after it would be lost
+     * to a watchdog reset as "unexpected" (#136, #137). */
+    system_monitor_mark_shutdown(_enter_dfu ? SYSMON_SHUTDOWN_HOST_DFU
+                                            : SYSMON_SHUTDOWN_HOST_RESET);
     MX_USB_DEVICE_DeInit();
-    delay_ms(300);
+    delay_ms_fed(300);
     // Reset the board
     NVIC_SystemReset();
 
@@ -2297,7 +2366,10 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
 
-  uint32_t *stack_ptr;
+  /* #137: first, so the next boot reports it even if the prints below hang. */
+  system_monitor_mark_shutdown(SYSMON_SHUTDOWN_ERROR_HANDLER);
+
+  const uint32_t *stack_ptr;
 
   HAL_GPIO_TogglePin(ERROR_LED_GPIO_Port, ERROR_LED_Pin);
   printf(">>> HARD FAULT <<<\r\n");
@@ -2337,6 +2409,7 @@ void Error_Handler(void)
   * @param  line: assert_param error line source number
   * @retval None
   */
+// cppcheck-suppress constParameterPointer ; assert_failed signature is fixed by stm32h7xx_hal_conf.h
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */

@@ -109,6 +109,36 @@ if(BARE_METAL)
     target_compile_definitions(stm32cubemx INTERFACE BARE_METAL_BUILD=1)
 endif()
 
+# Debug output: printf compiles into Debug and out of Release, so production
+# images don't carry the log strings (#139). debug_printf.h is force-included
+# into the application's C files. -DDEBUG_LOG=ON keeps logs in Release.
+if(NOT DEFINED DEBUG_LOG)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(DEBUG_LOG ON)
+    else()
+        set(DEBUG_LOG OFF)
+    endif()
+endif()
+if(DEBUG_LOG)
+    target_compile_definitions(stm32cubemx INTERFACE DEBUG_ENABLED=1)
+else()
+    target_compile_definitions(stm32cubemx INTERFACE DEBUG_ENABLED=0)
+endif()
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+    "$<$<COMPILE_LANGUAGE:C>:SHELL:-include ${CMAKE_SOURCE_DIR}/Core/Inc/debug_printf.h>")
+message(STATUS "Debug output : ${DEBUG_LOG}")
+
+# Host-upload camera FPGA programming (OW_FPGA_BITSTREAM + OW_FPGA_PROG_SRAM
+# reserved != 1): a bench tool for checking a bitstream before it is burned to
+# NVCM. Debug images carry it; rc / production (Release) images never do
+# (#136). Tied to the build type, not to DEBUG_LOG, so a Release built with
+# logs still leaves it out.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(stm32cubemx INTERFACE FPGA_HOST_UPLOAD=1)
+else()
+    target_compile_definitions(stm32cubemx INTERFACE FPGA_HOST_UPLOAD=0)
+endif()
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -125,6 +155,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/camera_manager.c
     Core/Src/camera_telemetry.c
     Core/Src/crosslink.c
+    Core/Src/histo_fault_inject.c
     Core/Src/histo_fake.c
     Core/Src/i2c_protocol.c
     Core/Src/i2c_master.c

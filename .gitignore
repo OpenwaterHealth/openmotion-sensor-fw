@@ -64,3 +64,5 @@ platform.json
 # Superpowers working files (plans/specs are scratch; keep architecture docs tracked)
 docs/superpowers/plans/
 docs/superpowers/specs/
+# Generated at build time by scripts/gen_sbom.py (never commit)
+sbom.cdx.json

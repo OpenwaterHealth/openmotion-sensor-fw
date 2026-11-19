@@ -162,10 +162,14 @@ SECTIONS
   /* Persistent across soft/IWDG reset; not zeroed by startup */
   .noinit (NOLOAD) :
   {
-    . = ALIGN(4);
+    /* 8-byte aligned at both ends: the startup ECC seed (64-bit stores)
+       skips [__noinit_start__, __noinit_end__) so it survives a warm reset. */
+    . = ALIGN(8);
+    __noinit_start__ = .;
     *(.noinit)
     *(.noinit*)
-    . = ALIGN(4);
+    . = ALIGN(8);
+    __noinit_end__ = .;
   } >RAM_D1
 
   /* User_heap_stack section, used to check that there is enough RAM left */

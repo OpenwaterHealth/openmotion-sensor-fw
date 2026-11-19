@@ -109,7 +109,7 @@ Note: the parent CLAUDE.md historically claimed 384 KB for the FPGA region — t
 | `Core/Src/if_commands.c` | Command dispatcher — handlers in `app_handle_uartframe()`. |
 | `Core/Src/camera_manager.c` | 8-camera orchestration, histogram streaming. SPI6 read from FPGA → `frame_buffer` → USB HISTO. |
 | `Core/Src/0X02C1B.c` | OX02C1B image-sensor register config (the file is named after the part). |
-| `Core/Src/crosslink.c` | Lattice CrossLink FPGA — I2C activation, IDCODE check, SRAM erase/program, status verify. Bitstream size hardcoded as `163489`. |
+| `Core/Src/crosslink.c` | Lattice CrossLink FPGA — I2C activation, IDCODE check, NVCM probe, status verify; SRAM program from a host-uploaded bitstream in Debug builds only. |
 | `Core/Src/ICM20948.c` | 6-DOF IMU + magnetometer driver. |
 | `Core/Src/uart_comms.c` | UART packet framing with CRC-16. |
 | `Core/Src/flash_eeprom.c` | Persistent config storage at `0x081FE000`. |
@@ -127,27 +127,24 @@ Note: the parent CLAUDE.md historically claimed 384 KB for the FPGA region — t
 
 ## FPGA + camera flow (`crosslink.c`)
 
-FPGA is at I2C address `0x40`. Bring-up sequence (in `crosslink.c`):
+FPGA is at I2C address `0x40`. The camera FPGAs are factory-programmed (NVCM) and boot on their own. `OW_FPGA_PROG_SRAM` reserved 1 (the SDK's `program_fpga()`) only confirms that: the NVCM probe in `camera_manager.c` pulses CRESETB, waits 100 ms and checks that the booted design drives the camera's bus pins. A camera that does not boot from NVCM fails the command. Since #136 there is no fallback that loads a bitstream from MCU flash into SRAM (it held the main loop ~10 s), and the firmware never reads the bitstream region at `0x081A0000`. A camera whose NVCM burn failed partway is therefore unusable on this firmware.
 
-1. Write 5-byte activation key.
-2. Read IDCODE via `0xE0`, expect `{0x01, 0x2C, 0x00, 0x43}`. Retry up to 3 times.
-3. Enable SRAM mode (`0xC6`, 1 ms delay).
-4. Erase SRAM (`0x0E`, **5 second delay**).
-5. Program SRAM (`0x46`, then stream the bitstream over I2C with 0x7A framing).
-6. Verify status (`0x3C`, check bit 2).
-7. Exit program mode (`0x26`).
+Host-upload SRAM programming (`OW_FPGA_BITSTREAM` + `OW_FPGA_PROG_SRAM` reserved != 1, the bench check of a bitstream before an NVCM burn) is compiled into **Debug builds only** (`FPGA_HOST_UPLOAD`, `CMakeLists.txt`). Release (rc / production) images answer those commands with `OW_ERROR`.
 
 Histogram path: FPGA computes 1024-bin histograms from MIPI CSI-2 cameras → SPI6 → `spi6_buffer` in SRAM4 → `frame_buffer` (`camera_manager.c`) → USB HISTO endpoint.
 
 ## Gotchas
 
-- **`crosslink.c` hardcodes the bitstream size** (`163489` bytes). If `openmotion-camera-fpga` ships a larger bitstream, programming will misalign and corrupt adjacent flash. Update the `163489` constant in `crosslink.c` and verify against `memory_map.h` boundaries.
+- **The watchdog window is 250 ms (#136).** The main loop feeds IWDG1 once per pass (238 ms worst case across the LSI tolerance). Any bounded wait or hardware operation that can run longer must feed it as it goes: `delay_ms_fed()` for fixed waits, `watchdog_feed()` inside a bounded polling loop (`main.h`). Never feed inside a loop that can spin forever; that hides the hang the watchdog exists to catch. Fed today: boot waits, the host reset/DFU path, camera configure/test-pattern settles, the NVCM probes, the single-histogram frame wait and the flash sector erase.
 - **Build fails hard when offline.** No cached bitstream fallback — pre-place `fpga/openmotion-camera-fpga.bin` before configuring if you're flying.
 - **I2C bus is single-threaded.** 8 cameras + FPGA all share one bus through the FPGA mux. No mutex / semaphore in `camera_manager.c`. Concurrent commands → deadlock.
 - **USB packet send is fire-and-forget.** `camera_manager.c` has a TODO "handle the case where the packet fails to send better." Currently a failed USB TX silently drops the frame, no retry.
 - **Camera enumeration is not a real probe.** `if_commands.c` sets `isPresent = true` for any powered slot (TODO: "due to a bug in the scan camera sensors…"). Don't trust `isPresent` for camera health.
 - **Debug flags can mask real sensor issues.** `DEBUG_FLAG_FAKE_DATA` injects synthetic histograms; `DEBUG_FLAG_HISTO_SPARSE` throttles to 15 s; `DEBUG_FLAG_HISTO_THROTTLE` throttles to 5 s. Check the active flags before diagnosing "no data."
 - **DFU works, but the jump-to-app hangs.** `OW_CMD_DFU` (`if_commands.c`) enters the bootloader fine; the ROM's jump back to the app is what's unreliable — always finish a deploy with a power cycle. See Deployment.
+- **`printf` does nothing in Release.** CMake force-includes `Core/Inc/debug_printf.h` into every application C file. When `DEBUG_ENABLED` is 0 (Release, so every rc/final tag), that header redefines `printf` as a call the compiler drops, so its format strings never reach the image. Release has no UART or USB logs, and `DEBUG_FLAG_USB_PRINTF` does nothing there. For logs, use a Debug build (`-dev` tags) or configure Release with `-DDEBUG_LOG=ON`. Two rules follow:
+  - Keep `printf` arguments free of side effects; they aren't evaluated in Release.
+  - Never use `printf` for functional output. A string passed into a function that only prints it (instead of straight to `printf`) still ends up in the image.
 
 ## USB classes
 
@@ -206,6 +203,17 @@ Build config is chosen from the trigger:
 - `*-rc.*` or final `X.Y.Z` tag → **Release** (`-Os`).
 - branch push / `workflow_dispatch` → **Debug**.
 
+### Safety & security scan (`.github/workflows/safety-security-scan.yml`)
+
+Port of the console-fw scan; runs on push to `main`/`next` and PRs into them. Four gates, any failure fails the job:
+
+1. **cppcheck** (`warning,style,performance,portability`, fail on any finding) over `Core/Src` + `USB/Class/{COMMS,HISTO,IMU}/Src`. ST/CubeMX + third-party files are suppressed (same boundary as `docs/misra-deviations.md`). The `-D` flags are load-bearing: without `__ALIGN_BEGIN/__ALIGN_END/__ASM` cppcheck silently **skips** `main.c`, `camera_manager.c` and the USB class files; without `uint32_t=unsigned long` it false-flags every `%lu`; and `--platform=unix32` keeps that `long` 32-bit like the target (the LP64 Linux runner otherwise raises `truncLongCastAssignment` that a Windows run never shows).
+2. **lizard** — CCN ≤ 15, ≤ 100 lines. Exceptions in `lizard_whitelist.csv`; its "legacy baseline" section is pay-down-only — never add to it, and delete an entry when that function gets under threshold.
+3. **grype** against `sbom.cdx.json` (HIGH/CRITICAL fails), SARIF → Security tab. The SBOM has no component versions/purls yet, so this gate can't match anything until it's filled in.
+4. SBOM + SARIF archived as `firmware-compliance-report`.
+
+Run gates 1–2 locally before pushing — tools are pip-pinned so results match CI: `pip install cppcheck==1.5.1 lizard==1.23.0` (cppcheck wheel 1.5.1 = Cppcheck 2.17.1; apt's older cppcheck reports a different set), then paste the two `run:` blocks from the workflow. Suppress a finding only for a fixed signature (HAL weak callback, USB class `Setup`, etc.), inline, with the reason: `// cppcheck-suppress <id> ; <why>`.
+
 ## Git workflow
 
 - **Branching:** feature branches off `next`, PR to `next`, `next` → `main` for release. Releases are tagged on `main`.
@@ -219,8 +227,8 @@ Build config is chosen from the trigger:
 |---|---|
 | Add a new command | `Core/Inc/common.h` (enum) → `app_handle_uartframe()` in `Core/Src/if_commands.c` → return via `uartResp`. SDK side: `openmotion-sdk/omotion/MotionSensor.py` + `CommInterface.py`. |
 | Change histogram packet format | `USB_HISTO_MAX_SIZE` in `USB/Class/HISTO/Inc/usbd_histo.h` → `frame_buffer` in `camera_manager.c` → match parser in `openmotion-sdk/omotion/MotionProcessing.py`. |
-| Update FPGA bitstream pin / version | Edit `FPGA_BITSTREAM_URL` in `CMakeLists.txt`, **and** confirm the new bitstream size matches the `163489` constant in `crosslink.c`. Reconfigure to redownload. |
+| Update FPGA bitstream pin / version | Edit `FPGA_BITSTREAM_URL` in `CMakeLists.txt` and reconfigure to redownload. Only bare-metal images merge it, and the firmware no longer reads it (#136): the cameras boot from NVCM. |
 | Flash a sensor | `python scripts/deploy.py --device left` (always with `--power-cycle-cmd`). See Deployment. |
-| Debug a camera that won't enumerate | Don't trust `isPresent` (`if_commands.c`). Set `DEBUG_FLAG_USB_PRINTF` via `OW_CMD_DEBUG_FLAGS`, watch UART for the init sequence, check I2C/SPI health via `OW_IMU_*` / `OW_CAMERA_*`. |
+| Debug a camera that won't enumerate | Don't trust `isPresent` (`if_commands.c`). On a Debug build, set `DEBUG_FLAG_USB_PRINTF` via `OW_CMD_DEBUG_FLAGS`, watch UART for the init sequence, check I2C/SPI health via `OW_IMU_*` / `OW_CAMERA_*`. |
 | Investigate dropped histograms | USB-TX failures are silent (`camera_manager.c`), plus any active `DEBUG_FLAG_HISTO_*` throttles. |
 | Touch persistent config | `Core/Src/flash_eeprom.c` + `motion_config.c`. Respect sector 7 bank 2 boundary at `0x081FE000`. |

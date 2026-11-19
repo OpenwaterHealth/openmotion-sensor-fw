@@ -219,7 +219,7 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 }
 #endif
 
-void reset_slaves(I2C_HandleTypeDef * pI2c)
+void reset_slaves(const I2C_HandleTypeDef * pI2c)
 {
     printf("Reset Slaves..\r\n");
 }

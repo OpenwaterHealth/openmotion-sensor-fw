@@ -1,0 +1,49 @@
+# Lizard cyclomatic-complexity / length whitelist
+#
+# Functions listed here are excluded from the lizard gate in
+# .github/workflows/safety-security-scan.yml (CCN > 15 or length > 100 lines).
+# Each entry must be justified by a documented design decision.
+#
+# Format: one function name per line (lizard also accepts file.c:function).
+#
+# ── Command dispatchers ───────────────────────────────────────────────────────
+# Large switch-based protocol command dispatchers whose CCN is driven by the
+# number of supported commands. Reducing CCN below 15 would need a
+# function-pointer dispatch table, an architectural change deferred to a future
+# refactor. Each case body is simple and individually testable.
+process_basic_command
+process_fpga_commands
+process_camera_commands
+process_factory_command
+#
+# ── CubeMX-generated / linear init ────────────────────────────────────────────
+# Straight-line peripheral / sensor bring-up. Length comes from register and
+# pin tables, not branching (CCN ≤ 13); splitting them adds no testability.
+main
+MX_GPIO_Init
+MX_RAMECC_Init
+init_camera_sensors
+#
+# ── Fault reporting / decode tables ───────────────────────────────────────────
+# One branch per hardware error / reset-cause bit being decoded and logged.
+print_reset_cause
+HAL_USART_ErrorCallback
+HAL_SPI_ErrorCallback
+#
+# ── Legacy baseline (pre-gate, 2026-09-24) — pay down, do not add to ─────────
+# These existed when the gate was introduced (OpenwaterHealth/openmotion-bloodflow-app#534).
+# They are on the histogram / comms / FPGA hot paths and were not refactored
+# blind — each split needs bench validation. Remove an entry when its function
+# is brought under threshold; never add new functions to this section.
+send_data
+send_histogram_data_cmp
+enable_camera_stream
+get_camera_status
+telem_publish
+camera_telemetry_service
+fpga_nvcm_probe
+histo_fault_injector_plan
+comms_host_check_received
+comms_interface_send
+ICM_Init
+X02C1B_configure_sensor

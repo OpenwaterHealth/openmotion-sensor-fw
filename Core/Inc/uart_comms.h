@@ -16,7 +16,7 @@
 
 void comms_host_check_received(void);
 void comms_host_start(void);
-_Bool comms_interface_send(UartPacket* pResp);
+_Bool comms_interface_send(const UartPacket* pResp);
 
 
 #endif /* INC_UART_COMMS_H_ */

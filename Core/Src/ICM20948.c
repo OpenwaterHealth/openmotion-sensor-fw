@@ -43,7 +43,7 @@ static inline HAL_StatusTypeDef ICM_readBytes(uint8_t reg, uint8_t *pData, uint1
     return result;
 }
 
-static HAL_StatusTypeDef ICM_WriteBytes(uint8_t reg, uint8_t *pData, uint16_t size)
+static HAL_StatusTypeDef ICM_WriteBytes(uint8_t reg, const uint8_t *pData, uint16_t size)
 {
     HAL_StatusTypeDef result = HAL_OK;
     int retries = 3;

@@ -72,7 +72,9 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+/* Fixed wait that keeps IWDG1 fed (250 ms window, #136); see main.c. */
+void delay_ms_fed(uint32_t ms);
+void watchdog_feed(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
