@@ -10,6 +10,6 @@ from upstream is listed here and in the SOUP register. Keep this file next to th
 | `Src/usbd_ctlreq.c` `USBD_GetString()` | Bound the UTF-16 copy loop by the clamped `*len`, not only by the source string. | A string descriptor longer than `USBD_MAX_STR_DESC_SIZ` overran the unicode buffer although the length had been clamped. Upstream fixed this in v2.11.6. | CVA 2026-09-28 O2 / R7 |
 
 Both changes are marked `LOCAL CHANGE (Openwater, ...)` in the source and are the same
-as in `openmotion-console-fw` (`Middlewares/ST/STM32_USB_Device_Library/LOCAL_CHANGES.md`).
+as in `openmotion-console-fw` (`Middlewares/ST/STM32_USB_Device_Library/Core/Src/LOCAL_CHANGES.md`).
 Re-apply them, or move to upstream v2.11.6 or later, whenever CubeMX regenerates these
 files.
